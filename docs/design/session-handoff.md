@@ -1,7 +1,7 @@
 ---
 title: memfs — Complete Session Handoff Document
 date: 2026-04-12
-description: Everything needed to continue building memfs and the deja benchmark after session reset
+description: Everything needed to continue building memfs and the para-bench after session reset
 ---
 
 # memfs Session Handoff — 2026-04-12
@@ -76,6 +76,14 @@ turlockmike/memfs/
 ├── LICENSE (MIT)
 └── .gitignore
 ```
+
+### Concepts Not Yet Implemented (From Tiago Review)
+
+**Directory-level weighting:** Directories can have a `weight:` field in their `index.md` frontmatter. All files in that directory get a retrieval boost multiplied by that weight. E.g., `weight: 2.0` in `projects/index.md` means project files are twice as likely to surface in grep. This is NOT hardcoded PARA — each agent defines its own hierarchy semantics. An agent doing code review might weight `recent-prs/` higher. An agent doing research might weight `sources/` higher. The hierarchy is meaningful to retrieval without the system prescribing what it should be. Implementation: in `_get_neighborhood()` or in `grep()`'s scoring, read `index.md` frontmatter for the result's directory and apply the multiplier.
+
+**Three-layer summaries:** `.summary.md` files should contain: exec summary (Layer 4, ~50 tokens), key passages (Layer 2-3, ~150 tokens), source backlink (Layer 1, full content). Recall reads top-down and stops at the resolution that answers the question.
+
+**Synthesis nodes:** Dream should create new files (type: synthesis) that capture patterns across multiple source files. These are the highest-value output of consolidation — emergent understanding that doesn't exist in any single source.
 
 ### Key Design Decisions (with rationale)
 
@@ -188,9 +196,33 @@ Reflective skill that improves the memory graph. Like sleep consolidation.
 
 **Key insight:** The agent IS the judge. memfs provides data (orphans, search patterns, edge strengths). The agent provides judgment.
 
+**Progressive Summarization (added late in session):** Dream generates `.summary.md` files for long sessions/docs with a `source:` frontmatter field pointing back to the full content. Recall reads summaries first (~200 tokens) and only follows the source link when detail is needed (~2000+ tokens). This is Tiago Forte's progressive summarization applied to agent memory — two resolution levels in the same graph. A 5-file context from summaries is ~1000 tokens vs ~8000 at full resolution. Same information density, 1/8 the cost.
+
+### Tiago Forte's Review (End of Session)
+
+Dispatched the tiago-forte agent to review the full architecture. Key feedback:
+
+**1. Progressive summarization needs three layers, not two.**
+Currently: raw source (L1) → exec summary (L4). Missing: bolded/highlighted key passages (L2-3). Fix: `.summary.md` should contain exec summary at top PLUS the ~15% of source content that earned highlighting. Three resolutions: exec summary → key passages → full source.
+
+**2. Dream should synthesize, not just defragment.**
+Moving files and fixing links is maintenance. Real consolidation creates NEW synthesis nodes. If the agent ran 12 searches about auth patterns this week, dream should notice that search cluster and create `auth-patterns.md` that captures the emergent pattern with wikilinks back to sources.
+
+**3. Directory hierarchy is agent-dependent, not PARA-hardcoded.**
+Tiago suggested organizing by actionability (projects/areas/resources/archive). Captain's correction: the folder structure depends on the agent's domain and purpose. The important architectural insight is that **directories themselves can have weightings** — not just individual nodes.
+
+**4. Directory-level weighting (new concept — not yet implemented).**
+A `.memweight` or `weight:` field in `index.md` frontmatter could set a retrieval boost for all files in that directory. E.g., `weight: 2.0` in `projects/index.md` means all files under `projects/` get a 2x boost in grep results. This lets each agent define its own hierarchy semantics without hardcoding any structure. The hierarchy becomes meaningful to retrieval without the system dictating what it should be.
+
+**5. The killer metric for para-bench is the longitudinal delta.**
+Does the gap between recall+dream and raw grep GROW as the session progresses? If dream consolidation works, travelers 7-9 should benefit MORE than travelers 2-3. That compounding curve should be the primary metric.
+
+**6. Benchmark naming may need revision.**
+para-bench implies testing PARA specifically, but we're testing whether skills (recall + dream) improve task performance. Either rename to reflect what we're testing, or add a condition that tests hierarchy organization effects. Deferred to benchmark design phase.
+
 ---
 
-## What's Next: The "deja" Benchmark
+## What's Next: The "para-bench" Benchmark
 
 ### The Problem
 
@@ -198,7 +230,7 @@ Every existing memory benchmark tests RETRIEVAL — "can you find the right file
 
 ### The Benchmark Design
 
-**Name candidates:** deja, memprove, compound, longwork
+**Name candidates:** para-bench, memprove, compound, longwork
 **License:** Should be open (CC-BY 4.0 for data, MIT for code)
 
 A multi-session work simulation. Not 500 independent questions — a sequence of realistic work sessions where later sessions depend on earlier ones.
@@ -302,7 +334,7 @@ If D beats B with fewer tokens, that's the proof: **skills that navigate the mem
 #### Concrete Harness Architecture
 
 ```python
-# deja/harness.py (pseudocode)
+# para-bench/harness.py (pseudocode)
 
 class MemoryCondition:
     """Interface for each experimental condition."""
@@ -408,8 +440,8 @@ These came up throughout the conversation and should guide future work:
 
 ## Immediate Next Steps
 
-### 1. Build the deja benchmark repo
-- Create `turlockmike/deja` (or whatever name is chosen)
+### 1. Build the para-bench repo
+- Create `turlockmike/para-bench` (or whatever name is chosen)
 - Download MemoryArena travel planner data from HuggingFace
 - Build evaluation harness that feeds subtasks sequentially
 - Implement three conditions: no memory, raw grep, recall + dream
@@ -441,4 +473,4 @@ These came up throughout the conversation and should guide future work:
 **Dashboard copy:** `~/workspace/doc/synthesis/mem-cli-design.md`
 **This handoff:** `~/workspace/doc/synthesis/memfs-session-handoff.md`
 
-The repo at https://github.com/turlockmike/memfs has everything. Clone it, run `python3 -m pytest tests/` to verify (127 should pass), and pick up from "build the deja benchmark."
+The repo at https://github.com/turlockmike/memfs has everything. Clone it, run `python3 -m pytest tests/` to verify (127 should pass), and pick up from "build the para-bench."
