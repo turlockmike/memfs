@@ -58,6 +58,27 @@ For each category, the agent makes judgment calls:
 - Does every directory with >3 files have an `index.md`?
 - If not, create one with a description of what the directory contains.
 
+**Synthesize search clusters:**
+- Look at recent queries. Are there 3+ queries that touched overlapping sets of files?
+- If yes, that's a theme the agent is working on. Create a synthesis node:
+  ```markdown
+  ---
+  title: Authentication Patterns
+  type: synthesis
+  sources: ["sessions/auth-audit.md", "projects/api-redesign.md", "resources/oauth-spec.md"]
+  ---
+  # Authentication Patterns
+  Across this week's work, three patterns emerged...
+  - [[sessions/auth-audit]] — found inconsistent token handling
+  - [[projects/api-redesign]] — new API needs OAuth2 PKCE
+  - [[resources/oauth-spec]] — reference spec for PKCE flow
+  ```
+- Synthesis nodes are the highest-value output of dream. They capture emergent understanding that doesn't exist in any single source file.
+
+**Review decaying connections:**
+- Query edge strengths: `SELECT * FROM edges WHERE strength < 0.3 AND strength > 0.05`
+- For each fading connection: is it still relevant? If yes, re-strengthen by adding an explicit `[[link]]`. If no, let it decay naturally.
+
 ### 3. Summarize Sessions (Progressive Summarization)
 
 For each long file created or heavily modified during the session, generate a summary file:
@@ -71,20 +92,28 @@ source: sessions/2026-04-12-kanji-curriculum.md
 type: summary
 ---
 
-## Key Decisions
-- Lessons grouped by radical, not JLPT level
-- SRS intervals: 1d, 3d, 7d, 14d, 30d
-- Each lesson introduces 5 kanji max
+## Summary
+Designed 50 lessons grouped by radical (not JLPT). SRS intervals: 1/3/7/14/30 days. 5 kanji per lesson max. Open question: whether vocab cards include kanji breakdowns.
 
-## Open Questions
-- Should vocabulary cards include kanji breakdowns?
+## Key Passages
+> "After testing both orderings, radical-based grouping had 40% better retention in the first week because students could see the shared components."
+
+> "The 5-kanji limit came from cognitive load research — Cowan's 4±1 chunks. We round up to 5 because each kanji shares a radical with at least one other in the lesson."
 
 ## Connections
 - [[learning/srs-methods]] — interval schedule based on this
 - [[projects/satori]] — implementing this curriculum
+
+## Open Questions
+- Should vocabulary cards include kanji breakdowns?
 ```
 
-The `source:` frontmatter field points back to the full file. The recall skill reads the summary first (~200 tokens). If it needs detail, it follows the source link to the full content (~2000+ tokens).
+Three layers in one file:
+1. **Summary** (~50 tokens) — exec synthesis, read this first
+2. **Key Passages** (~150 tokens) — the 15% of the source that earned highlighting
+3. **source: link** — follow to full content (~2000+ tokens) only when needed
+
+The recall skill reads top-down: summary answers most questions. Key passages provide evidence. Full source is the last resort.
 
 **When to summarize:**
 - Any file over ~500 tokens that was created or heavily modified this session
