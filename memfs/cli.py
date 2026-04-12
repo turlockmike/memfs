@@ -15,6 +15,7 @@ import sys
 from memfs.db import create_db, connect
 from memfs.indexer import index_directory, reindex as do_reindex
 from memfs.search import grep as do_grep
+from memfs.decay import run_decay
 from memfs.watcher import start_watcher, stop_watcher, watcher_status
 
 
@@ -169,6 +170,21 @@ def cmd_watch(args):
     start_watcher(mem_home, db_path, daemon=args.daemon)
 
 
+def cmd_decay(args):
+    mem_home = get_mem_home(args)
+    db_path = get_db_path(mem_home)
+
+    if not os.path.exists(db_path):
+        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
+        sys.exit(1)
+
+    conn = connect(db_path)
+    stats = run_decay(conn, dry_run=args.dry_run)
+    conn.close()
+
+    out({"action": "decay", "dry_run": args.dry_run, **stats})
+
+
 def cmd_reindex(args):
     mem_home = get_mem_home(args)
     db_path = get_db_path(mem_home)
@@ -217,6 +233,10 @@ def main():
     p_watch.add_argument("--stop", action="store_true", help="Stop running daemon")
     p_watch.add_argument("--status", action="store_true", help="Check daemon status")
 
+    # _decay (hidden — for launchd/cron)
+    p_decay = sub.add_parser("_decay", help=argparse.SUPPRESS)
+    p_decay.add_argument("--dry-run", action="store_true")
+
     # reindex
     sub.add_parser("reindex", help="Rebuild index from files")
 
@@ -232,6 +252,7 @@ def main():
         "ls": cmd_ls,
         "status": cmd_status,
         "watch": cmd_watch,
+        "_decay": cmd_decay,
         "reindex": cmd_reindex,
     }
 

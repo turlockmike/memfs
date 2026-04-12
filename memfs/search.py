@@ -1,9 +1,10 @@
 """Search — FTS5 grep with query node tracking and search edge creation."""
 
 import hashlib
+import os
 import re
 import string
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date as date_type
 
 
 def normalize_query(query_text: str) -> str:
@@ -32,8 +33,19 @@ def grep(conn, query: str, limit: int = 20) -> list[dict]:
     """Search via FTS5, create search edges for top-3, return ranked results."""
     now = _now()
 
+    # Extract date from query for temporal boosting (before FTS5 escaping)
+    query_date = _extract_date(query)
+
+    # Strip date patterns from query before FTS5 search
+    clean_query = query
+    for pattern in DATE_PATTERNS:
+        clean_query = pattern.sub("", clean_query)
+    clean_query = clean_query.strip()
+    if not clean_query:
+        clean_query = query  # Fallback if query was entirely a date
+
     # Escape query for FTS5
-    fts_query = _escape_fts5(query)
+    fts_query = _escape_fts5(clean_query)
 
     # FTS5 search with BM25 ranking
     # Column weights: path=1.0, title=5.0, content=1.0
@@ -51,13 +63,32 @@ def grep(conn, query: str, limit: int = 20) -> list[dict]:
 
     results = []
     for i, row in enumerate(rows):
+        score = -row[2]  # bm25 returns negative scores; negate for positive
+
+        # Apply temporal proximity boost if query contains a date
+        if query_date:
+            doc_date_str = conn.execute(
+                "SELECT date_hint, modified_at FROM nodes WHERE path = ?", (row[0],)
+            ).fetchone()
+            if doc_date_str:
+                doc_date = _parse_date(doc_date_str[0]) or _parse_date(doc_date_str[1])
+                if doc_date:
+                    days_diff = abs((query_date - doc_date).days)
+                    temporal_boost = 1.0 / (1.0 + days_diff)
+                    score = score * (1 + temporal_boost)
+
         results.append({
             "path": row[0],
             "title": row[1],
             "rank": i + 1,
-            "score": -row[2],  # bm25 returns negative scores; negate for positive
+            "score": score,
             "snippet": row[3] or "",
         })
+
+    # Re-rank by score after temporal boost
+    results.sort(key=lambda r: r["score"], reverse=True)
+    for i, r in enumerate(results):
+        r["rank"] = i + 1
 
     # Create/update query node
     query_id = normalize_query(query)
@@ -118,6 +149,36 @@ def grep(conn, query: str, limit: int = 20) -> list[dict]:
 
     conn.commit()
     return results
+
+
+DATE_PATTERNS = [
+    re.compile(r"(\d{4}[-/]\d{2}[-/]\d{2})"),          # 2023-04-10 or 2023/04/10
+    re.compile(r"(\d{4}/\d{2}/\d{2}\s*\([A-Za-z]+\))"), # 2023/04/10 (Mon)
+]
+
+
+def _extract_date(query: str) -> date_type | None:
+    """Extract a date reference from a query string."""
+    for pattern in DATE_PATTERNS:
+        match = pattern.search(query)
+        if match:
+            date_str = match.group(1).split("(")[0].strip()
+            return _parse_date(date_str)
+    return None
+
+
+def _parse_date(date_str: str | None) -> date_type | None:
+    """Parse a date string into a date object."""
+    if not date_str:
+        return None
+    date_str = str(date_str).strip().strip('"').split("(")[0].strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _now() -> str:
