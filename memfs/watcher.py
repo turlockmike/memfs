@@ -51,7 +51,7 @@ class MemfsEventHandler(FileSystemEventHandler):
         return is_ignored(rel, self.ignore_patterns)
 
     def _is_md(self, path: str) -> bool:
-        return path.endswith(".md")
+        return path.endswith(".md") or path.endswith(".jsonl")
 
     def _log(self, event: str, path: str, **kwargs):
         print(

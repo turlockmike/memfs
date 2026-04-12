@@ -50,14 +50,15 @@ def index_file(conn, mem_home: str, rel_path: str) -> None:
 
     # Upsert node
     conn.execute(
-        """INSERT INTO nodes (path, title, created_at, modified_at, content_hash, date_hint)
-           VALUES (?, ?, ?, ?, ?, ?)
+        """INSERT INTO nodes (path, title, description, created_at, modified_at, content_hash, date_hint)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(path) DO UPDATE SET
                title=excluded.title,
+               description=excluded.description,
                modified_at=excluded.modified_at,
                content_hash=excluded.content_hash,
                date_hint=excluded.date_hint""",
-        (rel_path, parsed["title"], now, now, parsed["content_hash"], parsed["date_hint"]),
+        (rel_path, parsed["title"], parsed.get("description"), now, now, parsed["content_hash"], parsed["date_hint"]),
     )
 
     # Update FTS — delete old, insert new
@@ -125,7 +126,7 @@ def index_directory(conn, mem_home: str) -> int:
         ]
 
         for filename in filenames:
-            if not filename.endswith(".md"):
+            if not (filename.endswith(".md") or filename.endswith(".jsonl")):
                 continue
             rel_path = os.path.relpath(os.path.join(dirpath, filename), mem_home)
             if is_ignored(rel_path, patterns):

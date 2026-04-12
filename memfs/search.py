@@ -207,21 +207,22 @@ def _get_neighborhood(conn, path: str) -> dict:
     if not directory:
         directory = ""
 
-    # Siblings (other files in the same directory)
+    # Siblings (other files in the same directory) with title + description
     if directory:
         siblings_rows = conn.execute(
-            "SELECT path FROM nodes WHERE path LIKE ? AND path != ? ORDER BY path",
+            "SELECT path, title, description FROM nodes WHERE path LIKE ? AND path != ? ORDER BY path",
             (directory + "/%", path),
         ).fetchall()
         # Only direct children, not nested
-        siblings = [r[0] for r in siblings_rows if os.path.dirname(r[0]) == directory]
+        siblings = [{"path": r[0], "title": r[1], "description": r[2]}
+                     for r in siblings_rows if os.path.dirname(r[0]) == directory]
     else:
         # Root level files
         siblings_rows = conn.execute(
-            "SELECT path FROM nodes WHERE path NOT LIKE '%/%' AND path != ? ORDER BY path",
+            "SELECT path, title, description FROM nodes WHERE path NOT LIKE '%/%' AND path != ? ORDER BY path",
             (path,),
         ).fetchall()
-        siblings = [r[0] for r in siblings_rows]
+        siblings = [{"path": r[0], "title": r[1], "description": r[2]} for r in siblings_rows]
 
     # Directory index.md (if exists)
     index_info = None

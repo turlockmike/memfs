@@ -53,10 +53,14 @@ class TestNeighborhood:
         conn.close()
         kanji = next((r for r in results if r["path"] == "learning/kanji.md"), None)
         assert kanji is not None
-        assert "learning/srs-methods.md" in kanji["siblings"]
-        assert "learning/vocabulary.md" in kanji["siblings"]
+        sibling_paths = [s["path"] for s in kanji["siblings"]]
+        assert "learning/srs-methods.md" in sibling_paths
+        assert "learning/vocabulary.md" in sibling_paths
         # Should not include itself
-        assert "learning/kanji.md" not in kanji["siblings"]
+        assert "learning/kanji.md" not in sibling_paths
+        # Siblings should have title
+        srs = next(s for s in kanji["siblings"] if s["path"] == "learning/srs-methods.md")
+        assert srs["title"] == "SRS Methods"
 
     def test_grep_returns_index(self, structured_db):
         root, db_path = structured_db

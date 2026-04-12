@@ -202,6 +202,35 @@ def cmd_decay(args):
     out({"action": "decay", "dry_run": args.dry_run, **stats})
 
 
+def cmd_skills(args):
+    """List or output bundled skills."""
+    skills_dir = os.path.join(os.path.dirname(__file__), "skills")
+    if args.name:
+        # Output a specific skill
+        skill_path = os.path.join(skills_dir, f"{args.name}.md")
+        if not os.path.exists(skill_path):
+            err({"error": "skill_not_found", "name": args.name,
+                 "available": [f.replace(".md", "") for f in os.listdir(skills_dir) if f.endswith(".md")]})
+            sys.exit(1)
+        with open(skill_path) as f:
+            print(f.read())
+    else:
+        # List all skills
+        for filename in sorted(os.listdir(skills_dir)):
+            if filename.endswith(".md"):
+                name = filename.replace(".md", "")
+                # Read first line after the heading for description
+                with open(os.path.join(skills_dir, filename)) as f:
+                    lines = f.readlines()
+                desc = ""
+                for line in lines[1:]:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        desc = line[:120]
+                        break
+                out({"name": name, "description": desc})
+
+
 def cmd_reindex(args):
     mem_home = get_mem_home(args)
     db_path = get_db_path(mem_home)
@@ -252,6 +281,10 @@ def main():
     p_watch.add_argument("--stop", action="store_true", help="Stop running daemon")
     p_watch.add_argument("--status", action="store_true", help="Check daemon status")
 
+    # skills
+    p_skills = sub.add_parser("skills", help="List or output bundled agent skills")
+    p_skills.add_argument("name", nargs="?", help="Skill name to output (dream, recall)")
+
     # _decay (hidden — for launchd/cron)
     p_decay = sub.add_parser("_decay", help=argparse.SUPPRESS)
     p_decay.add_argument("--dry-run", action="store_true")
@@ -271,6 +304,7 @@ def main():
         "ls": cmd_ls,
         "status": cmd_status,
         "watch": cmd_watch,
+        "skills": cmd_skills,
         "_decay": cmd_decay,
         "reindex": cmd_reindex,
     }

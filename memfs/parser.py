@@ -1,6 +1,7 @@
 """File parsing — frontmatter extraction, link detection, content hashing."""
 
 import hashlib
+import json
 import os
 import re
 from typing import Optional
@@ -9,7 +10,43 @@ import yaml
 
 
 LINK_PATTERN = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
+
+# Text-like keys to extract from JSONL objects
+_TEXT_KEYS = {"msg", "message", "content", "text", "description", "title", "name",
+              "question", "answer", "summary", "body", "comment", "note"}
 HEADING_PATTERN = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+
+
+def _parse_jsonl(filepath: str, raw: str, content_hash: str) -> dict:
+    """Parse a JSONL file — extract text fields from each line for indexing."""
+    title = os.path.splitext(os.path.basename(filepath))[0]
+    text_parts = []
+
+    for line in raw.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                for key in _TEXT_KEYS:
+                    val = obj.get(key)
+                    if isinstance(val, str) and val:
+                        text_parts.append(val)
+        except json.JSONDecodeError:
+            continue
+
+    content = "\n".join(text_parts) if text_parts else raw[:5000]
+
+    return {
+        "title": title,
+        "description": None,
+        "date_hint": None,
+        "content": content,
+        "content_hash": content_hash,
+        "links": [],
+        "frontmatter": {},
+    }
 
 
 def compute_hash(content: str) -> str:
@@ -40,6 +77,11 @@ def parse_file(filepath: str) -> dict:
         raw = f.read()
 
     content_hash = compute_hash(raw)
+
+    # Handle JSONL files — extract text fields from each line
+    if filepath.endswith(".jsonl"):
+        return _parse_jsonl(filepath, raw, content_hash)
+
     frontmatter = {}
     content = raw
 
@@ -62,6 +104,11 @@ def parse_file(filepath: str) -> dict:
     if not title:
         title = os.path.splitext(os.path.basename(filepath))[0]
 
+    # Extract description (capped at 200 chars)
+    description: Optional[str] = frontmatter.get("description")
+    if description:
+        description = str(description)[:200]
+
     # Extract date hint
     date_hint: Optional[str] = None
     date_val = frontmatter.get("date")
@@ -73,6 +120,7 @@ def parse_file(filepath: str) -> dict:
 
     return {
         "title": title,
+        "description": description,
         "date_hint": date_hint,
         "content": content,
         "content_hash": content_hash,

@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS nodes (
     path          TEXT PRIMARY KEY,
     title         TEXT,
+    description   TEXT,
     created_at    TEXT NOT NULL,
     modified_at   TEXT NOT NULL,
     content_hash  TEXT NOT NULL,
