@@ -1,7 +1,8 @@
-"""LongMemEval benchmark harness — ingest sessions, compute Recall@k / MRR."""
+"""LongMemEval benchmark harness — ingest sessions, compute Recall@k / MRR / QA accuracy."""
 
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 
 from memfs.db import create_db, connect
@@ -130,3 +131,134 @@ def compute_recall(db_path: str, benchmark_data: list[dict], k: int = 5, use_vec
         "total_hits": total_hits,
         "per_question": per_question,
     }
+
+
+# --- QA Evaluation ---
+
+def _call_llm(prompt: str, model: str = "sonnet", backend: str = "claude") -> str:
+    """Call an LLM. Supports 'claude' (CLI) and 'ollama' backends.
+
+    For ollama, model should be the ollama model name (e.g., 'gemma4', 'qwen3').
+    Ollama server expected at 192.168.4.30:11434 (Captain's tower).
+    """
+    if backend == "ollama":
+        import urllib.request
+        import json as json_mod
+        url = "http://192.168.4.30:11434/api/generate"
+        payload = json_mod.dumps({
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json_mod.loads(resp.read())
+        return data.get("response", "").strip()
+    else:
+        # Claude CLI
+        result = subprocess.run(
+            ["claude", "-p", "--model", model, "--output-format", "text"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"LLM call failed: {result.stderr}")
+        return result.stdout.strip()
+
+
+def generate_hypothesis(
+    db_path: str,
+    entry: dict,
+    k: int = 5,
+    use_vectors: bool = False,
+    model: str = "sonnet",
+    backend: str = "claude",
+) -> dict:
+    """Generate an answer hypothesis for a benchmark question.
+
+    Retrieves relevant sessions via memfs grep, builds a prompt with context,
+    and asks the LLM to answer the question.
+    """
+    conn = connect(db_path)
+    question = entry["question"]
+    question_date = entry.get("question_date", "")
+
+    # Retrieve relevant sessions
+    results = grep(conn, question, limit=k, use_vectors=use_vectors)
+
+    # Read the actual file content for top results
+    contexts = []
+    mem_home = os.path.dirname(os.path.dirname(db_path))  # .mem/memory.db -> mem_home
+    for r in results:
+        filepath = os.path.join(mem_home, r["path"])
+        if os.path.exists(filepath):
+            with open(filepath, encoding="utf-8") as f:
+                contexts.append(f"--- {r['path']} ---\n{f.read()}")
+
+    conn.close()
+
+    context_text = "\n\n".join(contexts) if contexts else "(No relevant history found)"
+
+    prompt = f"""I will give you several past chat sessions between you and a user.
+Please answer the question based on the relevant chat history.
+If the information is not in the provided history, say "I don't have that information."
+
+Past Chat Sessions:
+{context_text}
+
+Current Date: {question_date}
+Question: {question}
+Answer:"""
+
+    hypothesis = _call_llm(prompt, model=model, backend=backend)
+
+    return {
+        "question_id": entry["question_id"],
+        "hypothesis": hypothesis,
+        "retrieved_paths": [r["path"] for r in results],
+    }
+
+
+def score_hypothesis(
+    question: str,
+    answer: str,
+    hypothesis: str,
+    question_type: str,
+    model: str = "sonnet",
+    backend: str = "claude",
+) -> bool:
+    """Score a hypothesis against the ground truth using LLM-as-judge.
+
+    Returns True if the hypothesis is correct.
+    """
+    # Task-specific evaluation prompts (adapted from LongMemEval)
+    if question_type == "temporal-reasoning":
+        prompt = f"""Question: {question}
+Ground truth answer: {answer}
+Model response: {hypothesis}
+
+Does the model response contain the correct answer? For date/time questions, accept off-by-one errors. Answer yes or no only."""
+    elif question_type == "knowledge-update":
+        prompt = f"""Question: {question}
+Ground truth answer (the latest/most recent answer): {answer}
+Model response: {hypothesis}
+
+Does the model response contain the correct, most up-to-date answer? It's acceptable if the response also mentions older information as long as the latest answer is present. Answer yes or no only."""
+    elif question_type == "single-session-preference":
+        prompt = f"""Question: {question}
+Ground truth answer: {answer}
+Model response: {hypothesis}
+
+Does the model response correctly reflect the user's preference or personalization request? The response doesn't need to be identical, just correctly personalized. Answer yes or no only."""
+    else:
+        prompt = f"""Question: {question}
+Ground truth answer: {answer}
+Model response: {hypothesis}
+
+Does the model response contain the correct answer or an equivalent response? Answer yes or no only."""
+
+    response = _call_llm(prompt, model=model, backend=backend)
+    return response.strip().lower().startswith("yes")
