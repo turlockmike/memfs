@@ -70,7 +70,7 @@ def ingest_benchmark(benchmark_path: str, eval_root: str) -> int:
     return count
 
 
-def compute_recall(db_path: str, benchmark_data: list[dict], k: int = 5) -> dict:
+def compute_recall(db_path: str, benchmark_data: list[dict], k: int = 5, use_vectors: bool = False) -> dict:
     """Compute Recall@k, MRR, and Precision@k for the benchmark.
 
     For each question, runs `memfs grep` with the question text and checks
@@ -87,7 +87,7 @@ def compute_recall(db_path: str, benchmark_data: list[dict], k: int = 5) -> dict
         answer_ids = set(entry.get("answer_session_ids", []))
 
         # Search
-        results = grep(conn, question, limit=k)
+        results = grep(conn, question, limit=k, use_vectors=use_vectors)
         result_paths = [r["path"] for r in results]
 
         # Check if any answer session is in results

@@ -29,7 +29,7 @@ def _escape_fts5(query: str) -> str:
     return escaped
 
 
-def grep(conn, query: str, limit: int = 20) -> list[dict]:
+def grep(conn, query: str, limit: int = 20, use_vectors: bool = False) -> list[dict]:
     """Search via FTS5, create search edges for top-3, return ranked results."""
     now = _now()
 
@@ -58,7 +58,7 @@ def grep(conn, query: str, limit: int = 20) -> list[dict]:
         (fts_query, limit),
     ).fetchall()
 
-    if not rows:
+    if not rows and not use_vectors:
         return []
 
     results = []
@@ -85,8 +85,54 @@ def grep(conn, query: str, limit: int = 20) -> list[dict]:
             "snippet": row[3] or "",
         })
 
-    # Re-rank by score after temporal boost
+    # RRF fusion with vector search if enabled
+    if use_vectors:
+        try:
+            from memfs.embeddings import cosine_search
+            vec_results = cosine_search(conn, query, top_k=limit)
+            if vec_results:
+                # Build RRF scores: 1/(k+rank) for each result set
+                K = 60  # Standard RRF constant
+                rrf_scores = {}
+
+                # FTS5 results
+                for i, r in enumerate(results):
+                    rrf_scores[r["path"]] = {"fts_rank": i + 1, "vec_rank": None,
+                                              "title": r["title"], "snippet": r["snippet"]}
+                    rrf_scores[r["path"]]["score"] = 1.0 / (K + i + 1)
+
+                # Vector results
+                for i, (path, sim) in enumerate(vec_results):
+                    if path in rrf_scores:
+                        rrf_scores[path]["score"] += 1.0 / (K + i + 1)
+                        rrf_scores[path]["vec_rank"] = i + 1
+                    else:
+                        title_row = conn.execute(
+                            "SELECT title FROM nodes WHERE path = ?", (path,)
+                        ).fetchone()
+                        rrf_scores[path] = {
+                            "fts_rank": None, "vec_rank": i + 1,
+                            "title": title_row[0] if title_row else path,
+                            "snippet": "",
+                            "score": 1.0 / (K + i + 1),
+                        }
+
+                # Rebuild results from RRF scores
+                results = []
+                for path, info in rrf_scores.items():
+                    results.append({
+                        "path": path,
+                        "title": info["title"],
+                        "rank": 0,  # Will be set below
+                        "score": info["score"],
+                        "snippet": info["snippet"],
+                    })
+        except ImportError:
+            pass  # sentence-transformers not installed — FTS5 only
+
+    # Re-rank by score after temporal boost / RRF fusion
     results.sort(key=lambda r: r["score"], reverse=True)
+    results = results[:limit]
     for i, r in enumerate(results):
         r["rank"] = i + 1
 

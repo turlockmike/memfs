@@ -64,7 +64,10 @@ def cmd_grep(args):
         sys.exit(1)
 
     conn = connect(db_path)
-    results = do_grep(conn, args.query, limit=args.limit)
+    # Auto-detect if vectors are available
+    has_vectors = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] > 0
+    use_vectors = has_vectors and not args.no_vectors
+    results = do_grep(conn, args.query, limit=args.limit, use_vectors=use_vectors)
     conn.close()
 
     for r in results:
@@ -218,6 +221,7 @@ def main():
     p_grep = sub.add_parser("grep", help="Search memory (agent's primary command)")
     p_grep.add_argument("query", help="Search query")
     p_grep.add_argument("--limit", type=int, default=20, help="Max results")
+    p_grep.add_argument("--no-vectors", action="store_true", help="Disable vector search")
 
     # ls
     p_ls = sub.add_parser("ls", help="List indexed files")
