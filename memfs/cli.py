@@ -15,6 +15,7 @@ import sys
 from memfs.db import create_db, connect
 from memfs.indexer import index_directory, reindex as do_reindex
 from memfs.search import grep as do_grep
+from memfs.watcher import start_watcher, stop_watcher, watcher_status
 
 
 def out(obj):
@@ -147,6 +148,27 @@ def cmd_status(args):
     })
 
 
+def cmd_watch(args):
+    mem_home = get_mem_home(args)
+    db_path = get_db_path(mem_home)
+
+    if not os.path.exists(db_path):
+        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
+        sys.exit(1)
+
+    if args.stop:
+        stopped = stop_watcher(mem_home)
+        out({"action": "watch_stop", "stopped": stopped})
+        return
+
+    if args.status:
+        status = watcher_status(mem_home)
+        out(status)
+        return
+
+    start_watcher(mem_home, db_path, daemon=args.daemon)
+
+
 def cmd_reindex(args):
     mem_home = get_mem_home(args)
     db_path = get_db_path(mem_home)
@@ -189,6 +211,12 @@ def main():
     # status
     sub.add_parser("status", help="Show index statistics")
 
+    # watch
+    p_watch = sub.add_parser("watch", help="Start filesystem watcher daemon")
+    p_watch.add_argument("--daemon", action="store_true", help="Run in background")
+    p_watch.add_argument("--stop", action="store_true", help="Stop running daemon")
+    p_watch.add_argument("--status", action="store_true", help="Check daemon status")
+
     # reindex
     sub.add_parser("reindex", help="Rebuild index from files")
 
@@ -203,6 +231,7 @@ def main():
         "grep": cmd_grep,
         "ls": cmd_ls,
         "status": cmd_status,
+        "watch": cmd_watch,
         "reindex": cmd_reindex,
     }
 
