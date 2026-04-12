@@ -15,9 +15,25 @@ def normalize_query(query_text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _escape_fts5(query: str) -> str:
+    """Escape a query string for FTS5 MATCH syntax.
+
+    Wraps each token in double quotes to treat them as literals,
+    preventing FTS5 syntax errors from special characters like ? * + - etc.
+    """
+    tokens = query.split()
+    if not tokens:
+        return '""'
+    escaped = " ".join(f'"{t}"' for t in tokens)
+    return escaped
+
+
 def grep(conn, query: str, limit: int = 20) -> list[dict]:
     """Search via FTS5, create search edges for top-3, return ranked results."""
     now = _now()
+
+    # Escape query for FTS5
+    fts_query = _escape_fts5(query)
 
     # FTS5 search with BM25 ranking
     # Column weights: path=1.0, title=5.0, content=1.0
@@ -27,7 +43,7 @@ def grep(conn, query: str, limit: int = 20) -> list[dict]:
            WHERE fts MATCH ?
            ORDER BY bm25(fts, 1.0, 5.0, 1.0)
            LIMIT ?""",
-        (query, limit),
+        (fts_query, limit),
     ).fetchall()
 
     if not rows:
