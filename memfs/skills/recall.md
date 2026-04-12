@@ -46,22 +46,29 @@ If something important links TO the result, that linking file might provide broa
 memfs grep "<refined query>" | jq 'select(.directory == "learning")'
 ```
 
-### 4. Build Context Window
+### 4. Build Context Window (Summary-First)
 
-Assemble the retrieved files into a context block, ordered by relevance:
+For each file to include, check if a `.summary.md` exists or if the file has `type: summary` in frontmatter. **Always prefer the summary.** Only read the full source if the summary doesn't contain enough detail for the task.
 
 ```
 [Context from memory]
 
-## learning/kanji.md (Kanji Study)
-<file content>
+## learning/kanji.md (Kanji Study) [summary]
+Key Decisions: Lessons grouped by radical, SRS intervals 1d/3d/7d/14d/30d, 5 kanji per lesson
+Connections: [[srs-methods]], [[projects/satori]]
+(full source: sessions/2026-04-12-kanji-curriculum.md)
 
 ## learning/srs-methods.md (SRS Methods)
-<file content — read because it's a sibling and relevant>
+<file content — short file, no summary needed>
 
-## projects/satori.md (Satori App)
-<file content — read because kanji.md links to it>
+## projects/satori.md (Satori App) [summary]
+Kanji curriculum app, Next.js + IndexedDB, pre-computed curriculum
+(full source: projects/satori-full.md)
 ```
+
+This keeps the context window compact. A 5-file context built from summaries might be ~1000 tokens. The same 5 files at full resolution might be ~8000 tokens. The agent gets the same information density at 1/8 the cost.
+
+**When to read the full source:** If the task requires specific details not in the summary (exact code, precise numbers, full conversation transcript), follow the `source:` link and read the original.
 
 ### 5. Wake-Up Mode (Session Start)
 

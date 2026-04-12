@@ -58,7 +58,49 @@ For each category, the agent makes judgment calls:
 - Does every directory with >3 files have an `index.md`?
 - If not, create one with a description of what the directory contains.
 
-### 3. Record What Changed
+### 3. Summarize Sessions (Progressive Summarization)
+
+For each long file created or heavily modified during the session, generate a summary file:
+
+```markdown
+---
+title: "Session: Kanji Curriculum Design"
+date: 2026-04-12
+description: Designed the first 50 lessons of the kanji curriculum with SRS intervals
+source: sessions/2026-04-12-kanji-curriculum.md
+type: summary
+---
+
+## Key Decisions
+- Lessons grouped by radical, not JLPT level
+- SRS intervals: 1d, 3d, 7d, 14d, 30d
+- Each lesson introduces 5 kanji max
+
+## Open Questions
+- Should vocabulary cards include kanji breakdowns?
+
+## Connections
+- [[learning/srs-methods]] — interval schedule based on this
+- [[projects/satori]] — implementing this curriculum
+```
+
+The `source:` frontmatter field points back to the full file. The recall skill reads the summary first (~200 tokens). If it needs detail, it follows the source link to the full content (~2000+ tokens).
+
+**When to summarize:**
+- Any file over ~500 tokens that was created or heavily modified this session
+- Meeting notes, long research captures, verbose logs, session transcripts
+- NOT short files, config files, or files that are already concise
+
+**Where summaries live:**
+```
+sessions/
+├── 2026-04-12-kanji-curriculum.md          # full source (truth)
+├── 2026-04-12-kanji-curriculum.summary.md  # dream-generated summary
+```
+
+This is Tiago Forte's progressive summarization: raw → summarized. The full source stays untouched. The summary is a new file with a backlink. The memory graph now has two resolutions — summaries for fast scanning, full sources for deep dives.
+
+### 4. Record What Changed
 
 Write a brief consolidation log:
 ```markdown
@@ -68,15 +110,21 @@ date: 2026-04-12
 ---
 ## Memory Consolidation
 
+- Summarized 3 session files (saved ~4000 tokens on future recall)
 - Added 3 links between learning/ files
 - Split projects/big-project.md into architecture.md and implementation.md
 - Archived 2 orphan files (old meeting scratch notes)
 - Created index.md for tools/ directory
-- Moved kanji-reference.md from root to learning/
 ```
 
 ## Output
-The skill modifies memory files directly (normal file I/O — the watcher handles indexing). It produces a consolidation log as its output.
+The skill modifies memory files directly (normal file I/O — the watcher handles indexing). It produces:
+1. **Summary files** for long sessions (with `source:` backlink to full content)
+2. New `[[links]]` between related files
+3. Reorganized files (moved, split, merged)
+4. A consolidation log
 
 ## Key Principle
 The agent IS the judge. It reads the files, decides what connections make sense, and makes the changes. memfs provides the data (orphans, search patterns, edge strengths); the agent provides the judgment.
+
+The recall skill automatically prefers summaries over full sources — reading the graph at the resolution the task requires. Only when the summary isn't enough does it follow the `source:` link to the full content.
