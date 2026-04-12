@@ -81,6 +81,18 @@ turlockmike/memfs/
 
 **Directory-level weighting:** Directories can have a `weight:` field in their `index.md` frontmatter. All files in that directory get a retrieval boost multiplied by that weight. E.g., `weight: 2.0` in `projects/index.md` means project files are twice as likely to surface in grep. This is NOT hardcoded PARA — each agent defines its own hierarchy semantics. An agent doing code review might weight `recent-prs/` higher. An agent doing research might weight `sources/` higher. The hierarchy is meaningful to retrieval without the system prescribing what it should be. Implementation: in `_get_neighborhood()` or in `grep()`'s scoring, read `index.md` frontmatter for the result's directory and apply the multiplier.
 
+**Tiago Forte's actual search model (validates our design):**
+His stated model is **folders + tags + search** — a "hybrid hierarchical-network model." Folders (PARA) gather related material. Tags create cross-cutting pathways. Search is the fallback. He explicitly rejects the idea that search replaces organization, citing Blair & Maron's study: full-text search on a 40k-document database achieved only 20% recall. His explanation: folder browsing uses spatial/procedural memory (natural), while search demands declarative recall of exact words (taxing). You need both.
+
+This maps directly to memfs:
+- **Folders** → file directories with optional weighting
+- **Tags** (cross-cutting network) → `[[wikilinks]]` — link edges that cut across the hierarchy
+- **Search** (fallback) → `memfs grep` — FTS5 + vectors
+
+Our neighborhood context (directory, siblings, index.md, links) gives the agent the spatial browsing layer ON TOP of search results. The agent gets "here's the file" AND "here's where you are in the hierarchy, here's what's nearby." That's Tiago's hybrid model operationalized for agents.
+
+His position on tags: use them for status/lifecycle ("active, reviewed, in-progress") not taxonomy. In memfs terms, that maps to `type:` frontmatter (summary, synthesis) and directory weighting — answering "is this relevant to my current need?" rather than "what category is this?"
+
 **Three-layer summaries:** `.summary.md` files should contain: exec summary (Layer 4, ~50 tokens), key passages (Layer 2-3, ~150 tokens), source backlink (Layer 1, full content). Recall reads top-down and stops at the resolution that answers the question.
 
 **Synthesis nodes:** Dream should create new files (type: synthesis) that capture patterns across multiple source files. These are the highest-value output of consolidation — emergent understanding that doesn't exist in any single source.
