@@ -84,6 +84,20 @@ def cmd_ls(args):
 
     conn = connect(db_path)
 
+    # Orphans mode
+    if args.orphans:
+        rows = conn.execute("""
+            SELECT n.path, n.title, n.search_count FROM nodes n
+            WHERE n.path NOT IN (SELECT DISTINCT target FROM edges)
+              AND n.path NOT IN (SELECT DISTINCT source FROM edges WHERE type='link')
+              AND n.search_count = 0
+            ORDER BY n.path
+        """).fetchall()
+        for row in rows:
+            out({"path": row[0], "title": row[1], "search_count": row[2], "orphan": True})
+        conn.close()
+        return
+
     # Filter by subdirectory if provided
     subdir = args.subdir
     if subdir:
@@ -227,6 +241,7 @@ def main():
     p_ls = sub.add_parser("ls", help="List indexed files")
     p_ls.add_argument("subdir", nargs="?", default=None, help="Subdirectory to list")
     p_ls.add_argument("--verbose", "-v", action="store_true", help="Show edge counts")
+    p_ls.add_argument("--orphans", action="store_true", help="Show files with no connections and no searches")
 
     # status
     sub.add_parser("status", help="Show index statistics")

@@ -136,6 +136,10 @@ def grep(conn, query: str, limit: int = 20, use_vectors: bool = False) -> list[d
     for i, r in enumerate(results):
         r["rank"] = i + 1
 
+    # Enrich each result with neighborhood context
+    for r in results:
+        r.update(_get_neighborhood(conn, r["path"]))
+
     # Create/update query node
     query_id = normalize_query(query)
     existing = conn.execute(
@@ -195,6 +199,62 @@ def grep(conn, query: str, limit: int = 20, use_vectors: bool = False) -> list[d
 
     conn.commit()
     return results
+
+
+def _get_neighborhood(conn, path: str) -> dict:
+    """Get the neighborhood context for a file: directory, siblings, index, links."""
+    directory = os.path.dirname(path)
+    if not directory:
+        directory = ""
+
+    # Siblings (other files in the same directory)
+    if directory:
+        siblings_rows = conn.execute(
+            "SELECT path FROM nodes WHERE path LIKE ? AND path != ? ORDER BY path",
+            (directory + "/%", path),
+        ).fetchall()
+        # Only direct children, not nested
+        siblings = [r[0] for r in siblings_rows if os.path.dirname(r[0]) == directory]
+    else:
+        # Root level files
+        siblings_rows = conn.execute(
+            "SELECT path FROM nodes WHERE path NOT LIKE '%/%' AND path != ? ORDER BY path",
+            (path,),
+        ).fetchall()
+        siblings = [r[0] for r in siblings_rows]
+
+    # Directory index.md (if exists)
+    index_info = None
+    if directory:
+        index_path = directory + "/index.md"
+        index_row = conn.execute(
+            "SELECT path, title FROM nodes WHERE path = ?", (index_path,)
+        ).fetchone()
+        if index_row:
+            index_info = {"path": index_row[0], "title": index_row[1]}
+
+    # Outgoing links (what this file links to)
+    links_to = [r[0] for r in conn.execute(
+        "SELECT target FROM edges WHERE source = ? AND type = 'link' ORDER BY strength DESC",
+        (path,),
+    ).fetchall()]
+
+    # Incoming links (what files reference this one)
+    linked_from = [r[0] for r in conn.execute(
+        "SELECT source FROM edges WHERE target = ? AND type = 'link' ORDER BY strength DESC",
+        (path,),
+    ).fetchall()]
+
+    result = {
+        "directory": directory or ".",
+        "siblings": siblings[:10],  # Cap to keep output manageable
+        "links_to": links_to,
+        "linked_from": linked_from,
+    }
+    if index_info:
+        result["index"] = index_info
+
+    return result
 
 
 DATE_PATTERNS = [
