@@ -203,13 +203,18 @@ def cmd_decay(args):
 
 
 def cmd_skills(args):
-    """List or output bundled skills."""
+    """List, output, or install bundled skills."""
     skills_dir = os.path.join(os.path.dirname(__file__), "skills")
-    if args.name:
-        # Output a specific skill
-        skill_path = os.path.join(skills_dir, f"{args.name}.md")
+
+    if args.action == "setup":
+        _skills_setup(skills_dir, args)
+        return
+
+    if args.action and args.action not in ("list",):
+        # Treat as a skill name — output it
+        skill_path = os.path.join(skills_dir, f"{args.action}.md")
         if not os.path.exists(skill_path):
-            err({"error": "skill_not_found", "name": args.name,
+            err({"error": "skill_not_found", "name": args.action,
                  "available": [f.replace(".md", "") for f in os.listdir(skills_dir) if f.endswith(".md")]})
             sys.exit(1)
         with open(skill_path) as f:
@@ -219,7 +224,6 @@ def cmd_skills(args):
         for filename in sorted(os.listdir(skills_dir)):
             if filename.endswith(".md"):
                 name = filename.replace(".md", "")
-                # Read first line after the heading for description
                 with open(os.path.join(skills_dir, filename)) as f:
                     lines = f.readlines()
                 desc = ""
@@ -229,6 +233,79 @@ def cmd_skills(args):
                         desc = line[:120]
                         break
                 out({"name": name, "description": desc})
+
+
+def _skills_setup(skills_dir: str, args):
+    """Install skills into the agent framework."""
+    harness = args.harness or _detect_harness()
+
+    if harness == "claude-code":
+        _setup_claude_code(skills_dir)
+    elif harness == "generic":
+        _setup_generic(skills_dir)
+    else:
+        err({"error": "unknown_harness", "harness": harness,
+             "supported": ["claude-code", "generic"]})
+        sys.exit(1)
+
+
+def _detect_harness() -> str:
+    """Detect which agent framework is in use."""
+    # Check for Claude Code
+    claude_dir = os.path.expanduser("~/.claude")
+    if os.path.isdir(claude_dir):
+        return "claude-code"
+    return "generic"
+
+
+def _setup_claude_code(skills_dir: str):
+    """Install skills as Claude Code SKILL.md files."""
+    # Find the project skills directory
+    cwd = os.getcwd()
+    project_skills = os.path.join(cwd, ".claude", "skills")
+    os.makedirs(project_skills, exist_ok=True)
+
+    installed = []
+    for filename in sorted(os.listdir(skills_dir)):
+        if not filename.endswith(".md"):
+            continue
+        name = filename.replace(".md", "")
+        skill_dir = os.path.join(project_skills, f"memfs-{name}")
+        os.makedirs(skill_dir, exist_ok=True)
+        dest = os.path.join(skill_dir, "SKILL.md")
+
+        with open(os.path.join(skills_dir, filename)) as f:
+            content = f.read()
+
+        with open(dest, "w") as f:
+            f.write(content)
+
+        installed.append({"name": f"memfs-{name}", "path": dest})
+        out({"action": "installed", "skill": f"memfs-{name}", "path": dest})
+
+    # Output the system prompt fragment
+    mem_home = os.environ.get("MEM_HOME", "")
+    prompt_fragment = (
+        f"Your memory lives in `{mem_home or '$MEM_HOME'}`. "
+        "Read and write files normally with any tool. "
+        "Use `memfs grep <query>` to search — connections between files "
+        "strengthen when you search for them and weaken over time. "
+        "Use /memfs-recall before tasks needing context. "
+        "Use /memfs-dream at end of sessions to consolidate memory."
+    )
+    out({"action": "setup_complete", "skills_installed": len(installed),
+         "system_prompt": prompt_fragment})
+
+
+def _setup_generic(skills_dir: str):
+    """Output skills to stdout for manual integration."""
+    out({"action": "generic_setup", "instructions": "Copy these skills into your agent framework."})
+    for filename in sorted(os.listdir(skills_dir)):
+        if filename.endswith(".md"):
+            name = filename.replace(".md", "")
+            with open(os.path.join(skills_dir, filename)) as f:
+                content = f.read()
+            out({"skill": f"memfs-{name}", "content": content})
 
 
 def cmd_reindex(args):
@@ -282,8 +359,9 @@ def main():
     p_watch.add_argument("--status", action="store_true", help="Check daemon status")
 
     # skills
-    p_skills = sub.add_parser("skills", help="List or output bundled agent skills")
-    p_skills.add_argument("name", nargs="?", help="Skill name to output (dream, recall)")
+    p_skills = sub.add_parser("skills", help="List, output, or install agent skills")
+    p_skills.add_argument("action", nargs="?", help="setup | list | <skill-name>")
+    p_skills.add_argument("--harness", help="Agent framework (claude-code, generic)")
 
     # _decay (hidden — for launchd/cron)
     p_decay = sub.add_parser("_decay", help=argparse.SUPPRESS)
