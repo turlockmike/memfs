@@ -309,9 +309,54 @@ def cmd_reindex(args):
 
 def cmd_claim(args):
     from memfs.calibration import record_claim
+    mem_home = get_mem_home(args)
+
+    if getattr(args, "auto", False):
+        # Batch mode: read one JSON object per stdin line, record each.
+        # Each object must have: text, confidence. Optional: scope, to.
+        graph = _connect_or_die()
+        try:
+            n_ok = 0
+            n_err = 0
+            for lineno, line in enumerate(sys.stdin, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    err({"error": "bad_json", "lineno": lineno, "detail": str(e)})
+                    n_err += 1
+                    continue
+                try:
+                    claim_id = record_claim(
+                        graph,
+                        text=obj["text"],
+                        confidence=float(obj["confidence"]),
+                        scope=obj.get("scope", args.scope or "general"),
+                        claimed_to=obj.get("to", args.to or "log"),
+                        mem_home=mem_home,
+                    )
+                    out({"action": "claim", "claim_id": claim_id,
+                         "text": obj["text"][:80], "confidence": obj["confidence"]})
+                    n_ok += 1
+                except (KeyError, ValueError, TypeError) as e:
+                    err({"error": "bad_record", "lineno": lineno,
+                         "detail": str(e), "obj": obj})
+                    n_err += 1
+            out({"action": "claim_auto_summary", "ok": n_ok, "errors": n_err})
+        finally:
+            graph.close()
+        return
+
+    # Single-claim mode (legacy)
+    if not args.text or args.confidence is None or not args.scope:
+        err({"error": "missing_args",
+             "hint": "provide --text, --confidence, --scope; or pass --auto and pipe JSON lines"})
+        sys.exit(2)
+
     graph = _connect_or_die()
     try:
-        mem_home = get_mem_home(args)
         claim_id = record_claim(
             graph,
             text=args.text,
@@ -459,11 +504,25 @@ def main():
     sub.add_parser("reindex", help="Rebuild index from files")
 
     # Calibration ledger (M4)
-    p_claim = sub.add_parser("claim", help="Record a verifiable claim")
-    p_claim.add_argument("--text", required=True)
-    p_claim.add_argument("--confidence", type=float, required=True)
-    p_claim.add_argument("--scope", required=True)
-    p_claim.add_argument("--to", default="log")
+    p_claim = sub.add_parser(
+        "claim",
+        help="Record a verifiable claim. "
+             "With --auto, read NDJSON from stdin and batch-insert.",
+    )
+    p_claim.add_argument("--text", default=None,
+                         help="Claim text (required unless --auto)")
+    p_claim.add_argument("--confidence", type=float, default=None,
+                         help="Confidence in [0,1] (required unless --auto)")
+    p_claim.add_argument("--scope", default=None,
+                         help="Scope label (required unless --auto; "
+                              "in --auto mode, used as default)")
+    p_claim.add_argument("--to", default=None,
+                         help="Recipient label (default 'log'; "
+                              "in --auto mode, used as default)")
+    p_claim.add_argument("--auto", action="store_true",
+                         help="Batch mode: read JSON lines from stdin. "
+                              "Each line: {\"text\":..., \"confidence\":..., "
+                              "\"scope\":..., \"to\":...}")
 
     p_verify = sub.add_parser("verify", help="Verify a claim outcome")
     p_verify.add_argument("claim_id")

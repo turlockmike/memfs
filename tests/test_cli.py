@@ -140,3 +140,53 @@ class TestReindexCli:
         )
         status = json.loads(stdout2.strip())
         assert status["nodes"] == 2
+
+
+class TestClaimAuto:
+    def _run_auto(self, stdin_text, tmp_path):
+        cmd = [sys.executable, "-m", "memfs.cli", "claim", "--auto"]
+        env = os.environ.copy()
+        env["MEM_HOME"] = str(tmp_path)
+        result = subprocess.run(
+            cmd, input=stdin_text, capture_output=True, text=True, env=env,
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    def test_auto_batch_inserts_multiple_claims(self, tmp_path):
+        (tmp_path / ".mem").mkdir(exist_ok=True)
+        stdin = "\n".join([
+            json.dumps({"text": "Claim 1", "confidence": 0.7, "scope": "test"}),
+            json.dumps({"text": "Claim 2", "confidence": 0.3, "scope": "test", "to": "mike"}),
+            json.dumps({"text": "Claim 3", "confidence": 0.9, "scope": "test"}),
+        ]) + "\n"
+        stdout, stderr, code = self._run_auto(stdin, tmp_path)
+        assert code == 0, f"stderr: {stderr}"
+        lines = [json.loads(l) for l in stdout.strip().split("\n") if l.strip()]
+        # 3 claim lines + 1 summary line
+        claim_events = [l for l in lines if l.get("action") == "claim"]
+        summaries = [l for l in lines if l.get("action") == "claim_auto_summary"]
+        assert len(claim_events) == 3
+        assert len(summaries) == 1
+        assert summaries[0]["ok"] == 3
+        assert summaries[0]["errors"] == 0
+
+    def test_auto_tolerates_bad_json(self, tmp_path):
+        (tmp_path / ".mem").mkdir(exist_ok=True)
+        stdin = "\n".join([
+            json.dumps({"text": "OK", "confidence": 0.5, "scope": "test"}),
+            "this is not json",
+            json.dumps({"missing": "fields"}),  # no text/confidence
+        ]) + "\n"
+        stdout, stderr, code = self._run_auto(stdin, tmp_path)
+        # Process completes; errors reported but exit code 0
+        assert code == 0
+        lines = [json.loads(l) for l in stdout.strip().split("\n") if l.strip()]
+        summary = [l for l in lines if l.get("action") == "claim_auto_summary"][0]
+        assert summary["ok"] == 1
+        assert summary["errors"] == 2
+
+    def test_missing_args_without_auto_fails(self, tmp_path):
+        stdout, stderr, code = run_memfs(
+            "claim", env={"MEM_HOME": str(tmp_path)}
+        )
+        assert code != 0
