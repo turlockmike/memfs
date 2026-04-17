@@ -418,6 +418,81 @@ def cmd_dream_briefing(args):
         out(c)
 
 
+def cmd_link_suggest(args):
+    """Suggest LINK edges via content similarity (for corpora where
+    authored [[wikilinks]] are sparse and SEARCH traffic is too low for
+    co-search-based candidates). Emits NDJSON link candidates — the same
+    shape the dream briefing emits, so downstream tooling is uniform.
+    """
+    from memfs.dream import find_content_similar_unlinked
+    graph = _connect_or_die()
+    try:
+        candidates = find_content_similar_unlinked(
+            graph,
+            limit=args.limit,
+            min_score=args.min_score,
+            max_score=args.max_score,
+        )
+    finally:
+        graph.close()
+    for c in candidates:
+        out(c)
+
+
+def cmd_link_apply(args):
+    """Materialize LINK edge(s). Single-pair mode (positional args) or
+    batch mode (--from-stdin consumes NDJSON). Idempotent via MERGE.
+
+    In stdin mode, only lines with ``candidate_type == "link"`` are applied;
+    other candidate types (merge/split/orphan/...) are skipped so that a
+    full dream-briefing stream can be piped in without filtering upstream.
+    """
+    from memfs.graph import upsert_link_edge
+    graph = _connect_or_die()
+    applied = 0
+    skipped = 0
+    errors = 0
+    try:
+        if args.from_stdin:
+            for raw in sys.stdin:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    c = json.loads(raw)
+                except json.JSONDecodeError:
+                    errors += 1
+                    err({"error": "bad_json", "line": raw[:80]})
+                    continue
+                if c.get("candidate_type") != "link":
+                    skipped += 1
+                    continue
+                nodes = c.get("nodes") or []
+                if len(nodes) != 2 or not all(isinstance(n, str) for n in nodes):
+                    errors += 1
+                    err({"error": "bad_nodes", "candidate": c})
+                    continue
+                a, b = nodes
+                upsert_link_edge(graph, a, b, strength=args.strength)
+                applied += 1
+                out({"applied": [a, b], "strength": args.strength,
+                     "source": c.get("source"),
+                     "score": c.get("score"),
+                     "cooccur_count": c.get("cooccur_count")})
+        else:
+            if not args.source or not args.target:
+                err({"error": "source_and_target_required",
+                     "hint": "memfs link-apply <src> <tgt> OR --from-stdin"})
+                sys.exit(2)
+            upsert_link_edge(graph, args.source, args.target, strength=args.strength)
+            applied += 1
+            out({"applied": [args.source, args.target], "strength": args.strength})
+    finally:
+        graph.close()
+    # Summary goes to stderr so stdout stays NDJSON-clean for piping
+    err({"summary": {"applied": applied, "skipped": skipped, "errors": errors}})
+
+
 def cmd_freshness_scan(args):
     """Report nodes whose freshness is stale. Auto-refresh is future work."""
     graph = _connect_or_die()
@@ -534,6 +609,29 @@ def main():
     p_cal.add_argument("--window", default="30d", type=_parse_window)
     p_cal.add_argument("--scope", default=None)
 
+    # Link materialization (Apr 17 — bootstrapping empty juxtaposition surface)
+    p_ls = sub.add_parser("link-suggest",
+                          help="Suggest LINK edges via content similarity")
+    p_ls.add_argument("--limit", type=int, default=50,
+                      help="Max candidates to emit (default 50)")
+    p_ls.add_argument("--min-score", type=float, default=0.12,
+                      help="Minimum token-jaccard score (default 0.12)")
+    p_ls.add_argument("--max-score", type=float, default=0.55,
+                      help="Score at/above this is a merge candidate, not a "
+                           "link candidate (default 0.55)")
+
+    p_la = sub.add_parser("link-apply",
+                          help="Materialize LINK edge(s). Single pair or NDJSON on stdin.")
+    p_la.add_argument("source", nargs="?", default=None,
+                      help="Source node path (omitted when --from-stdin)")
+    p_la.add_argument("target", nargs="?", default=None,
+                      help="Target node path (omitted when --from-stdin)")
+    p_la.add_argument("--from-stdin", action="store_true",
+                      help="Read NDJSON link candidates from stdin. "
+                           "Non-'link' candidate types are silently skipped.")
+    p_la.add_argument("--strength", type=float, default=1.0,
+                      help="Edge strength (default 1.0)")
+
     # Freshness (M5)
     sub.add_parser("freshness-scan", help="Report nodes with stale freshness stamps")
 
@@ -575,6 +673,8 @@ def main():
         "freshness-scan": cmd_freshness_scan,
         "ingest-session": cmd_ingest_session,
         "dream-briefing": cmd_dream_briefing,
+        "link-suggest": cmd_link_suggest,
+        "link-apply": cmd_link_apply,
     }
 
     try:

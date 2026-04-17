@@ -225,6 +225,103 @@ def find_dirs_missing_index(mem_home: str, min_files: int = 10) -> list[dict]:
     return out
 
 
+def find_content_similar_unlinked(
+    graph,
+    *,
+    limit: int = 50,
+    min_score: float = 0.12,
+    max_score: float = 0.55,
+) -> list[dict]:
+    """Pairs of nodes with overlapping content tokens but no LINK edge.
+
+    Complements ``find_cosearched_unlinked`` for corpora that don't yet have
+    enough query traffic to surface SEARCH-based link candidates. Uses the
+    same token-overlap machinery as ``find_near_duplicates`` but with a lower
+    threshold (``min_score``); pairs at or above ``max_score`` are rejected
+    because those are handled as ``merge`` candidates elsewhere, not links.
+
+    Bootstraps the juxtaposition surface when authored ``[[wikilinks]]`` are
+    sparse — which is the empirical starting condition (observed 2026-04-17:
+    197 indexed nodes, 0 real LINK edges).
+
+    Exclusions:
+    - ``sessions/`` paths (time-series transcripts, not semantic notes).
+    - Near-duplicates at or above ``max_score`` (those go to merge).
+    - Pairs that already have a LINK edge in either direction.
+    """
+    rows = graph.run(
+        "MATCH (n:Node) "
+        "RETURN n.path AS path, n.title AS title, n.description AS description, "
+        "       n.content AS content, n.layer AS layer"
+    )
+    nodes = [r for r in rows if not (r.get("path") or "").startswith("sessions/")]
+    if len(nodes) < 2:
+        return []
+
+    # Tokenize combined title + description + content head
+    tokens_by_path: dict[str, set[str]] = {}
+    for n in nodes:
+        combined = " ".join([
+            n.get("title") or "",
+            n.get("description") or "",
+            (n.get("content") or "")[:1500],
+        ])
+        tokens_by_path[n["path"]] = _normalized_tokens(combined)
+
+    # Document-frequency filter: keep rare-ish tokens (discriminative).
+    # Tokens appearing in everything (e.g. "mike", "karpathy") are noise;
+    # tokens appearing in only one node can't produce pairs.
+    token_df: dict[str, int] = defaultdict(int)
+    for toks in tokens_by_path.values():
+        for t in toks:
+            token_df[t] += 1
+    max_df = max(3, len(nodes) // 3)  # appears in at most 1/3 of corpus
+    rare_tokens = {t for t, df in token_df.items() if 2 <= df <= max_df}
+
+    # Inverted index on rare tokens only
+    token_to_paths: dict[str, list[str]] = defaultdict(list)
+    for path, toks in tokens_by_path.items():
+        for t in toks:
+            if t in rare_tokens:
+                token_to_paths[t].append(path)
+
+    pair_scores: dict[tuple[str, str], float] = {}
+    for tok, paths in token_to_paths.items():
+        if len(paths) < 2 or len(paths) > 50:
+            continue  # too-common or degenerate token buckets
+        for i in range(len(paths)):
+            for j in range(i + 1, len(paths)):
+                a, b = sorted([paths[i], paths[j]])
+                if (a, b) in pair_scores:
+                    continue
+                score = _jaccard(tokens_by_path[a], tokens_by_path[b])
+                if score < min_score or score >= max_score:
+                    continue
+                pair_scores[(a, b)] = score
+
+    # Highest score first. Oversample then filter already-linked pairs.
+    out: list[dict] = []
+    for (a, b), score in sorted(pair_scores.items(), key=lambda x: -x[1]):
+        if len(out) >= limit:
+            break
+        existing = graph.run_scalar(
+            """MATCH (x:Node {path: $a}),(y:Node {path: $b})
+               RETURN EXISTS( (x)-[:LINK]-(y) ) AS has""",
+            a=a, b=b,
+        )
+        if existing:
+            continue
+        out.append({
+            "candidate_type": "link",
+            "nodes": [a, b],
+            "reason": f"content token jaccard={score:.2f}, no LINK edge",
+            "priority": round(min(0.75, 0.3 + score), 2),
+            "score": round(score, 3),
+            "source": "content_similarity",
+        })
+    return out
+
+
 def find_cosearched_unlinked(graph, min_cooccur: int = 3) -> list[dict]:
     """Pairs of nodes that appear in the same top-3 SEARCH result set for
     N+ distinct queries but have no LINK edge between them."""
@@ -264,6 +361,7 @@ def find_cosearched_unlinked(graph, min_cooccur: int = 3) -> list[dict]:
             "reason": f"co-searched in top-3 across {n} queries, no LINK edge",
             "priority": round(min(0.9, 0.4 + n / 10.0), 2),
             "cooccur_count": n,
+            "source": "cosearch",
         })
     candidates.sort(key=lambda c: -c.get("cooccur_count", 0))
     return candidates
@@ -311,6 +409,7 @@ def run_briefing(graph, *, mem_home: str, args) -> list[dict]:
     candidates.extend(find_bloated_files(mem_home, bloat_lines=bloat_lines, bloat_bytes=bloat_bytes))
     candidates.extend(find_dirs_missing_index(mem_home))
     candidates.extend(find_cosearched_unlinked(graph))
+    candidates.extend(find_content_similar_unlinked(graph))
     candidates.extend(find_stale_facts(graph))
 
     # Highest priority first
