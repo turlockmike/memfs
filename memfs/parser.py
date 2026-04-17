@@ -122,10 +122,19 @@ def parse_file(filepath: str) -> dict:
     layer = frontmatter.get("layer")
     source = frontmatter.get("source")
 
-    # M5: freshness stamps
+    # M5: freshness stamps (coerce yaml datetime → ISO string)
     freshness_verified_at = frontmatter.get("freshness_verified_at")
+    if freshness_verified_at is not None:
+        freshness_verified_at = str(freshness_verified_at)
     freshness_source_url = frontmatter.get("freshness_source_url")
+    if freshness_source_url is not None:
+        freshness_source_url = str(freshness_source_url)
     freshness_stale_after_days = frontmatter.get("freshness_stale_after_days")
+    if freshness_stale_after_days is not None:
+        try:
+            freshness_stale_after_days = int(freshness_stale_after_days)
+        except (TypeError, ValueError):
+            freshness_stale_after_days = None
 
     return {
         "title": title,
