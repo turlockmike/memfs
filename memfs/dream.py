@@ -98,6 +98,15 @@ def find_near_duplicates(graph, limit: int = 10) -> list[dict]:
     """Cheap heuristic: compare every pair of nodes whose title-token overlap
     passes a Jaccard threshold OR whose description is identical. Caps at
     `limit` candidates to avoid quadratic blow-up on huge graphs.
+
+    Exclusions:
+    - Session transcripts (paths starting with ``sessions/``) are time-series
+      records, not semantic notes. They frequently share template-heavy
+      prefixes (wake prompts, Stop-hook error templates) that drive title
+      + content jaccard to 1.0 despite having different session IDs, dates,
+      and actual session content. Merging them would destroy the forward
+      ingest flow. Added 2026-04-17 03:00 CDT after dream briefing flagged
+      10+ false-positive merges from Apr 11–16 stop-hook sessions.
     """
     nodes = graph.run(
         "MATCH (n:Node) "
@@ -107,6 +116,10 @@ def find_near_duplicates(graph, limit: int = 10) -> list[dict]:
     )
     if len(nodes) > 2000:
         nodes = nodes[:2000]  # safety cap
+
+    # Filter out session transcripts — they're time-series, not semantic
+    # duplicates. See docstring.
+    nodes = [n for n in nodes if not (n.get("path") or "").startswith("sessions/")]
 
     # Pre-tokenize titles (cheap) and content heads
     title_tokens = {n["path"]: _normalized_tokens((n.get("title") or "") + " " + (n.get("description") or "")) for n in nodes}
