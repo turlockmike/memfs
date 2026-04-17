@@ -1,10 +1,18 @@
-"""Search — FTS5 grep with query node tracking and search edge creation."""
+"""Search — Neo4j full-text grep with query node tracking and search edge creation.
+
+Preserves v1 behavior: query normalization, date extraction, temporal boost,
+rank-weighted search edge creation, node search tracking, neighborhood enrichment.
+
+Vector/RRF fusion is dropped for M1 (may be reintroduced later).
+"""
 
 import hashlib
 import os
 import re
 import string
-from datetime import datetime, timezone, date as date_type
+from datetime import datetime, timezone, date as date_type, timedelta
+
+from memfs import graph as graph_mod
 
 
 def normalize_query(query_text: str) -> str:
@@ -16,246 +24,20 @@ def normalize_query(query_text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _escape_fts5(query: str) -> str:
-    """Escape a query string for FTS5 MATCH syntax.
+def _escape_lucene(query: str) -> str:
+    """Lightly sanitize a query for Neo4j fulltext (Lucene).
 
-    Wraps each token in double quotes to treat them as literals,
-    preventing FTS5 syntax errors from special characters like ? * + - etc.
+    Lucene special characters: + - && || ! ( ) { } [ ] ^ " ~ * ? : \\ /
+    Strategy: strip punctuation, then use tokens as an OR query to mimic
+    the FTS5 "any token" semantics.
     """
-    tokens = query.split()
+    # Replace Lucene specials with space; keep letters/digits/_
+    sanitized = re.sub(r"[+\-&|!(){}\[\]^\"~*?:\\/]", " ", query)
+    tokens = [t for t in sanitized.split() if t]
     if not tokens:
-        return '""'
-    escaped = " ".join(f'"{t}"' for t in tokens)
-    return escaped
-
-
-def grep(conn, query: str, limit: int = 20, use_vectors: bool = False) -> list[dict]:
-    """Search via FTS5, create search edges for top-3, return ranked results."""
-    now = _now()
-
-    # Extract date from query for temporal boosting (before FTS5 escaping)
-    query_date = _extract_date(query)
-
-    # Strip date patterns from query before FTS5 search
-    clean_query = query
-    for pattern in DATE_PATTERNS:
-        clean_query = pattern.sub("", clean_query)
-    clean_query = clean_query.strip()
-    if not clean_query:
-        clean_query = query  # Fallback if query was entirely a date
-
-    # Escape query for FTS5
-    fts_query = _escape_fts5(clean_query)
-
-    # FTS5 search with BM25 ranking
-    # Column weights: path=1.0, title=5.0, content=1.0
-    rows = conn.execute(
-        """SELECT path, title, rank, snippet(fts, 2, '...', '...', '', 30) as snippet
-           FROM fts
-           WHERE fts MATCH ?
-           ORDER BY bm25(fts, 1.0, 5.0, 1.0)
-           LIMIT ?""",
-        (fts_query, limit),
-    ).fetchall()
-
-    if not rows and not use_vectors:
-        return []
-
-    results = []
-    for i, row in enumerate(rows):
-        score = -row[2]  # bm25 returns negative scores; negate for positive
-
-        # Apply temporal proximity boost if query contains a date
-        if query_date:
-            doc_date_str = conn.execute(
-                "SELECT date_hint, modified_at FROM nodes WHERE path = ?", (row[0],)
-            ).fetchone()
-            if doc_date_str:
-                doc_date = _parse_date(doc_date_str[0]) or _parse_date(doc_date_str[1])
-                if doc_date:
-                    days_diff = abs((query_date - doc_date).days)
-                    temporal_boost = 1.0 / (1.0 + days_diff)
-                    score = score * (1 + temporal_boost)
-
-        results.append({
-            "path": row[0],
-            "title": row[1],
-            "rank": i + 1,
-            "score": score,
-            "snippet": row[3] or "",
-        })
-
-    # RRF fusion with vector search if enabled
-    if use_vectors:
-        try:
-            from memfs.embeddings import cosine_search
-            vec_results = cosine_search(conn, query, top_k=limit)
-            if vec_results:
-                # Build RRF scores: 1/(k+rank) for each result set
-                K = 60  # Standard RRF constant
-                rrf_scores = {}
-
-                # FTS5 results
-                for i, r in enumerate(results):
-                    rrf_scores[r["path"]] = {"fts_rank": i + 1, "vec_rank": None,
-                                              "title": r["title"], "snippet": r["snippet"]}
-                    rrf_scores[r["path"]]["score"] = 1.0 / (K + i + 1)
-
-                # Vector results
-                for i, (path, sim) in enumerate(vec_results):
-                    if path in rrf_scores:
-                        rrf_scores[path]["score"] += 1.0 / (K + i + 1)
-                        rrf_scores[path]["vec_rank"] = i + 1
-                    else:
-                        title_row = conn.execute(
-                            "SELECT title FROM nodes WHERE path = ?", (path,)
-                        ).fetchone()
-                        rrf_scores[path] = {
-                            "fts_rank": None, "vec_rank": i + 1,
-                            "title": title_row[0] if title_row else path,
-                            "snippet": "",
-                            "score": 1.0 / (K + i + 1),
-                        }
-
-                # Rebuild results from RRF scores
-                results = []
-                for path, info in rrf_scores.items():
-                    results.append({
-                        "path": path,
-                        "title": info["title"],
-                        "rank": 0,  # Will be set below
-                        "score": info["score"],
-                        "snippet": info["snippet"],
-                    })
-        except ImportError:
-            pass  # sentence-transformers not installed — FTS5 only
-
-    # Re-rank by score after temporal boost / RRF fusion
-    results.sort(key=lambda r: r["score"], reverse=True)
-    results = results[:limit]
-    for i, r in enumerate(results):
-        r["rank"] = i + 1
-
-    # Enrich each result with neighborhood context
-    for r in results:
-        r.update(_get_neighborhood(conn, r["path"]))
-
-    # Create/update query node
-    query_id = normalize_query(query)
-    existing = conn.execute(
-        "SELECT use_count FROM queries WHERE id = ?", (query_id,)
-    ).fetchone()
-
-    if existing:
-        conn.execute(
-            "UPDATE queries SET last_used = ?, use_count = use_count + 1 WHERE id = ?",
-            (now, query_id),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO queries (id, query_text, created_at, last_used, use_count) VALUES (?, ?, ?, ?, 1)",
-            (query_id, query, now, now),
-        )
-
-    # Create search edges for top 3 results (rank-weighted)
-    rank_weights = [1.0, 0.66, 0.33]
-    for i, result in enumerate(results[:3]):
-        weight = rank_weights[i]
-        target = result["path"]
-
-        # Upsert search edge
-        existing_edge = conn.execute(
-            "SELECT strength, access_count FROM edges WHERE source = ? AND target = ? AND type = 'search'",
-            (query_id, target),
-        ).fetchone()
-
-        if existing_edge:
-            new_strength = min(5.0, existing_edge[0] + weight * 0.1)
-            conn.execute(
-                """UPDATE edges SET strength = ?, last_activated = ?, access_count = access_count + 1
-                   WHERE source = ? AND target = ? AND type = 'search'""",
-                (new_strength, now, query_id, target),
-            )
-        else:
-            conn.execute(
-                """INSERT INTO edges (source, target, type, strength, last_activated, access_count, created_at)
-                   VALUES (?, ?, 'search', ?, ?, 1, ?)""",
-                (query_id, target, weight, now, now),
-            )
-
-        # Update node search tracking
-        conn.execute(
-            "UPDATE nodes SET last_searched = ?, search_count = search_count + 1 WHERE path = ?",
-            (now, target),
-        )
-
-    # Add edge_strength to results
-    for result in results:
-        edge = conn.execute(
-            "SELECT strength FROM edges WHERE source = ? AND target = ? AND type = 'search'",
-            (query_id, result["path"]),
-        ).fetchone()
-        result["edge_strength"] = edge[0] if edge else 0.0
-
-    conn.commit()
-    return results
-
-
-def _get_neighborhood(conn, path: str) -> dict:
-    """Get the neighborhood context for a file: directory, siblings, index, links."""
-    directory = os.path.dirname(path)
-    if not directory:
-        directory = ""
-
-    # Siblings (other files in the same directory) with title + description
-    if directory:
-        siblings_rows = conn.execute(
-            "SELECT path, title, description FROM nodes WHERE path LIKE ? AND path != ? ORDER BY path",
-            (directory + "/%", path),
-        ).fetchall()
-        # Only direct children, not nested
-        siblings = [{"path": r[0], "title": r[1], "description": r[2]}
-                     for r in siblings_rows if os.path.dirname(r[0]) == directory]
-    else:
-        # Root level files
-        siblings_rows = conn.execute(
-            "SELECT path, title, description FROM nodes WHERE path NOT LIKE '%/%' AND path != ? ORDER BY path",
-            (path,),
-        ).fetchall()
-        siblings = [{"path": r[0], "title": r[1], "description": r[2]} for r in siblings_rows]
-
-    # Directory index.md (if exists)
-    index_info = None
-    if directory:
-        index_path = directory + "/index.md"
-        index_row = conn.execute(
-            "SELECT path, title FROM nodes WHERE path = ?", (index_path,)
-        ).fetchone()
-        if index_row:
-            index_info = {"path": index_row[0], "title": index_row[1]}
-
-    # Outgoing links (what this file links to)
-    links_to = [r[0] for r in conn.execute(
-        "SELECT target FROM edges WHERE source = ? AND type = 'link' ORDER BY strength DESC",
-        (path,),
-    ).fetchall()]
-
-    # Incoming links (what files reference this one)
-    linked_from = [r[0] for r in conn.execute(
-        "SELECT source FROM edges WHERE target = ? AND type = 'link' ORDER BY strength DESC",
-        (path,),
-    ).fetchall()]
-
-    result = {
-        "directory": directory or ".",
-        "siblings": siblings[:10],  # Cap to keep output manageable
-        "links_to": links_to,
-        "linked_from": linked_from,
-    }
-    if index_info:
-        result["index"] = index_info
-
-    return result
+        return ""
+    # Each term escaped by wrapping; Lucene defaults to OR when not quoted
+    return " ".join(tokens)
 
 
 DATE_PATTERNS = [
@@ -288,5 +70,120 @@ def _parse_date(date_str: str | None) -> date_type | None:
     return None
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _freshness_status(node: dict) -> str:
+    """Return 'fresh' | 'stale' | 'never_verified' for a node."""
+    verified = node.get("freshness_verified_at")
+    if not verified:
+        return "never_verified"
+    stale_days = node.get("freshness_stale_after_days")
+    if not stale_days:
+        return "fresh"  # verified but no stale window specified
+    try:
+        v_dt = datetime.fromisoformat(str(verified).replace("Z", "+00:00"))
+        if v_dt.tzinfo is None:
+            v_dt = v_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "never_verified"
+    age = datetime.now(timezone.utc) - v_dt
+    if age > timedelta(days=int(stale_days)):
+        return "stale"
+    return "fresh"
+
+
+def grep(graph, query: str, limit: int = 20, layer: int | None = None,
+         fresh_only: bool = False) -> list[dict]:
+    """Neo4j fulltext search, creates search edges for top-3, returns ranked results.
+
+    Parameters
+    ----------
+    graph : memfs.graph.Graph
+    query : search text
+    limit : max results
+    layer : if set, restrict to nodes with this layer
+    fresh_only : if True, drop results whose freshness == 'stale'
+    """
+    # Extract date for temporal boosting (before sanitization strips digits)
+    query_date = _extract_date(query)
+
+    # Strip date patterns from query before search
+    clean_query = query
+    for pattern in DATE_PATTERNS:
+        clean_query = pattern.sub("", clean_query)
+    clean_query = clean_query.strip()
+    if not clean_query:
+        clean_query = query
+
+    lucene_query = _escape_lucene(clean_query)
+    if not lucene_query:
+        return []
+
+    # Over-fetch so we can re-rank after temporal boost
+    raw = graph_mod.fulltext_search(
+        graph, lucene_query, limit=limit * 3, layer=layer,
+    )
+    if not raw:
+        return []
+
+    results = []
+    for i, row in enumerate(raw):
+        score = float(row.get("score") or 0.0)
+
+        # Temporal boost
+        if query_date:
+            doc_date = (
+                _parse_date(row.get("date_hint"))
+                or _parse_date(row.get("modified_at"))
+            )
+            if doc_date:
+                days_diff = abs((query_date - doc_date).days)
+                temporal_boost = 1.0 / (1.0 + days_diff)
+                score = score * (1 + temporal_boost)
+
+        node_like = {
+            "freshness_verified_at": row.get("freshness_verified_at"),
+            "freshness_stale_after_days": row.get("freshness_stale_after_days"),
+        }
+        freshness = _freshness_status(node_like)
+        if fresh_only and freshness == "stale":
+            continue
+
+        results.append({
+            "path": row["path"],
+            "title": row.get("title"),
+            "rank": i + 1,  # will be rewritten after re-rank
+            "score": score,
+            "snippet": (row.get("description") or "")[:200],
+            "layer": row.get("layer"),
+            "freshness": freshness,
+        })
+
+    # Re-rank after temporal boost
+    results.sort(key=lambda r: r["score"], reverse=True)
+    results = results[:limit]
+    for i, r in enumerate(results):
+        r["rank"] = i + 1
+
+    # Enrich with neighborhood
+    for r in results:
+        nbh = graph_mod.neighborhood(graph, r["path"])
+        r.update(nbh)
+
+    # Create / strengthen query node + search edges for top 3
+    query_id = normalize_query(query)
+    graph_mod.upsert_query_node(graph, query_id, query)
+
+    rank_weights = [1.0, 0.66, 0.33]
+    for i, result in enumerate(results[:3]):
+        graph_mod.upsert_search_edge(
+            graph, query_id, result["path"], rank=i + 1,
+            rank_weight=rank_weights[i],
+        )
+        graph_mod.update_node_search_tracking(graph, result["path"])
+
+    # Attach edge_strength
+    for r in results:
+        r["edge_strength"] = graph_mod.get_search_edge_strength(
+            graph, query_id, r["path"],
+        )
+
+    return results

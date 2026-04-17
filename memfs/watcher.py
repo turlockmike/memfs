@@ -1,16 +1,14 @@
-"""Filesystem watcher daemon — keeps .mem/memory.db in sync with file changes."""
+"""Filesystem watcher daemon — keeps Neo4j graph in sync with file changes."""
 
 import json
 import os
 import signal
 import sys
-import time
-from datetime import datetime, timezone
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from memfs.db import connect
+from memfs.graph import connect
 from memfs.indexer import (
     index_file,
     remove_file,
@@ -20,16 +18,14 @@ from memfs.indexer import (
     is_ignored,
     update_node,
 )
-from memfs.paths import normalize_path
 
 
 class MemfsEventHandler(FileSystemEventHandler):
-    """Handles filesystem events and updates the SQLite index."""
+    """Handles filesystem events and updates the Neo4j graph."""
 
-    def __init__(self, mem_home: str, db_path: str):
+    def __init__(self, mem_home: str):
         super().__init__()
         self.mem_home = mem_home
-        self.db_path = db_path
         self._ignore_patterns = None
         self._memignore_mtime = None
 
@@ -63,75 +59,71 @@ class MemfsEventHandler(FileSystemEventHandler):
     # --- Public methods (called directly by tests and by watchdog events) ---
 
     def on_created_file(self, abs_path: str) -> None:
-        """Handle file creation."""
         if not self._is_md(abs_path) or self._should_ignore(abs_path):
             return
         rel = self._rel_path(abs_path)
-        conn = connect(self.db_path)
+        graph = connect()
         try:
-            index_file(conn, self.mem_home, rel)
-            upgraded = upgrade_broken_links(conn, rel)
+            index_file(graph, self.mem_home, rel)
+            upgraded = upgrade_broken_links(graph, rel)
             self._log("created", abs_path, indexed=True, broken_links_upgraded=upgraded)
+            # M4 hook: contradiction detection for layer >= 3 nodes
+            _maybe_detect_contradictions(graph, self.mem_home, rel)
         finally:
-            conn.close()
+            graph.close()
 
     def on_modified_file(self, abs_path: str) -> None:
-        """Handle file modification."""
         if not self._is_md(abs_path) or self._should_ignore(abs_path):
             return
         rel = self._rel_path(abs_path)
-        conn = connect(self.db_path)
+        graph = connect()
         try:
-            changed = update_node(conn, self.mem_home, rel)
+            changed = update_node(graph, self.mem_home, rel)
             if changed:
                 self._log("modified", abs_path, indexed=True)
+                _maybe_detect_contradictions(graph, self.mem_home, rel)
         finally:
-            conn.close()
+            graph.close()
 
     def on_deleted_file(self, abs_path: str) -> None:
-        """Handle file deletion."""
         if not self._is_md(abs_path) or self._should_ignore(abs_path):
             return
         rel = self._rel_path(abs_path)
-        conn = connect(self.db_path)
+        graph = connect()
         try:
-            remove_file(conn, rel)
+            remove_file(graph, rel)
             self._log("deleted", abs_path, indexed=True)
         finally:
-            conn.close()
+            graph.close()
 
     def on_moved_file(self, src_abs: str, dest_abs: str) -> None:
-        """Handle file rename/move."""
         if not self._is_md(src_abs) and not self._is_md(dest_abs):
             return
         if self._should_ignore(dest_abs):
-            # Moved to ignored location — treat as delete
             self.on_deleted_file(src_abs)
             return
 
         old_rel = self._rel_path(src_abs)
         new_rel = self._rel_path(dest_abs)
-        conn = connect(self.db_path)
+        graph = connect()
         try:
-            # Remove old entry and reindex at new path
-            remove_file(conn, old_rel)
+            remove_file(graph, old_rel)
             if os.path.exists(dest_abs):
-                index_file(conn, self.mem_home, new_rel)
-                upgrade_broken_links(conn, new_rel)
+                index_file(graph, self.mem_home, new_rel)
+                upgrade_broken_links(graph, new_rel)
             self._log("moved", dest_abs, from_path=old_rel)
         finally:
-            conn.close()
+            graph.close()
 
     def on_moved_directory(self, src_abs: str, dest_abs: str) -> None:
-        """Handle directory rename — update all paths with old prefix."""
         old_prefix = self._rel_path(src_abs)
         new_prefix = self._rel_path(dest_abs)
-        conn = connect(self.db_path)
+        graph = connect()
         try:
-            rename_path(conn, old_prefix, new_prefix)
+            rename_path(graph, old_prefix, new_prefix)
             self._log("dir_moved", dest_abs, from_path=old_prefix)
         finally:
-            conn.close()
+            graph.close()
 
     # --- Watchdog event dispatch ---
 
@@ -154,14 +146,39 @@ class MemfsEventHandler(FileSystemEventHandler):
             self.on_moved_file(event.src_path, event.dest_path)
 
 
-def start_watcher(mem_home: str, db_path: str, daemon: bool = False) -> None:
+def _maybe_detect_contradictions(graph, mem_home: str, rel_path: str) -> None:
+    """Run contradiction detection for layer >= 3 nodes (M4).
+
+    Imported lazily so M1-era installs without contradiction.py still work.
+    """
+    try:
+        from memfs.contradiction import detect_contradictions
+    except ImportError:
+        return
+    try:
+        conflicts = detect_contradictions(graph, rel_path)
+    except Exception as e:
+        print(
+            json.dumps({"event": "contradiction_error", "path": rel_path, "error": str(e)}),
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    for c in conflicts:
+        print(
+            json.dumps({"event": "conflict", **c}),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def start_watcher(mem_home: str, daemon: bool = False) -> None:
     """Start the filesystem watcher."""
     if daemon:
         pid_file = os.path.join(mem_home, ".mem", "watch.pid")
-        # Fork to background
+        os.makedirs(os.path.dirname(pid_file), exist_ok=True)
         pid = os.fork()
         if pid > 0:
-            # Parent — write PID and exit
             with open(pid_file, "w") as f:
                 f.write(str(pid))
             print(
@@ -169,10 +186,9 @@ def start_watcher(mem_home: str, db_path: str, daemon: bool = False) -> None:
                 flush=True,
             )
             return
-        # Child continues below
         os.setsid()
 
-    handler = MemfsEventHandler(mem_home, db_path)
+    handler = MemfsEventHandler(mem_home)
     observer = Observer()
     observer.schedule(handler, mem_home, recursive=True)
     observer.start()
@@ -200,7 +216,6 @@ def start_watcher(mem_home: str, db_path: str, daemon: bool = False) -> None:
 
 
 def stop_watcher(mem_home: str) -> bool:
-    """Stop a running daemon by PID file. Returns True if stopped."""
     pid_file = os.path.join(mem_home, ".mem", "watch.pid")
     if not os.path.exists(pid_file):
         return False
@@ -216,14 +231,13 @@ def stop_watcher(mem_home: str) -> bool:
 
 
 def watcher_status(mem_home: str) -> dict:
-    """Check if watcher daemon is running."""
     pid_file = os.path.join(mem_home, ".mem", "watch.pid")
     if not os.path.exists(pid_file):
         return {"running": False}
     with open(pid_file) as f:
         pid = int(f.read().strip())
     try:
-        os.kill(pid, 0)  # Check if process exists
+        os.kill(pid, 0)
         return {"running": True, "pid": pid}
     except ProcessLookupError:
         os.unlink(pid_file)

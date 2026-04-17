@@ -429,19 +429,17 @@ def neighborhood(graph: Graph, path: str, max_siblings: int = 10) -> dict:
     # Siblings (direct children of same directory, not nested)
     if directory:
         prefix = directory + "/"
-        # Direct children only — no further slashes after prefix
-        siblings = graph.run(
+        raw = graph.run(
             """MATCH (n:Node)
                WHERE n.path STARTS WITH $prefix
-                 AND NOT n.path CONTAINS $extra
                  AND n.path <> $me
                RETURN n.path AS path, n.title AS title, n.description AS description
-               ORDER BY n.path LIMIT $limit""",
-            prefix=prefix, extra="/", me=path, limit=max_siblings,
+               ORDER BY n.path""",
+            prefix=prefix, me=path,
         )
-        # The CONTAINS check above is imperfect — filter in Python for direct children
+        # Filter in Python for direct children only
         siblings = [
-            s for s in siblings
+            s for s in raw
             if os.path.dirname(s["path"]) == directory
         ][:max_siblings]
     else:

@@ -1,11 +1,16 @@
-"""Indexer — scan directories, index files, maintain edges."""
+"""Indexer — scan directories, index files, maintain edges.
 
+Neo4j-backed. Takes a Graph object (from memfs.graph.connect()).
+"""
+
+import json
 import os
-from datetime import datetime, timezone
+import sys
 from fnmatch import fnmatch
 
 from memfs.parser import parse_file, compute_hash
-from memfs.paths import resolve_link, normalize_path
+from memfs.paths import resolve_link
+from memfs import graph as graph_mod
 
 # Always ignored
 HARDCODED_IGNORES = [".mem", ".mem/*", ".git", ".git/*", "node_modules",
@@ -39,52 +44,105 @@ def is_ignored(rel_path: str, patterns: list[str]) -> bool:
     return False
 
 
-def index_file(conn, mem_home: str, rel_path: str) -> None:
-    """Index a single file into the database."""
+def _validate_layer_provenance(parsed: dict) -> tuple[bool, str | None]:
+    """Validate frontmatter layer/source.
+
+    Returns (ok, error_message). Layer must be 1-5. Layer >= 3 requires
+    a non-empty `source` string.
+    """
+    fm = parsed.get("frontmatter") or {}
+    layer = fm.get("layer")
+    if layer is None:
+        return True, None  # Default layer applies; no validation
+    try:
+        layer_int = int(layer)
+    except (TypeError, ValueError):
+        return False, f"invalid layer {layer!r}: must be integer 1-5"
+    if layer_int < 1 or layer_int > 5:
+        return False, f"invalid layer {layer_int}: must be in range 1-5"
+    if layer_int >= 3:
+        source = fm.get("source")
+        if not source or not isinstance(source, str) or not source.strip():
+            return False, (
+                f"layer {layer_int} requires a non-empty `source` field "
+                "in frontmatter (provenance)"
+            )
+    return True, None
+
+
+def index_file(graph, mem_home: str, rel_path: str) -> bool:
+    """Index a single file into the graph. Returns True if indexed, False if
+    quarantined due to validation failure.
+    """
     abs_path = os.path.join(mem_home, rel_path)
     if not os.path.exists(abs_path):
-        return
+        return False
 
     parsed = parse_file(abs_path)
-    now = _now()
+    fm = parsed.get("frontmatter") or {}
+
+    ok, err_msg = _validate_layer_provenance(parsed)
+    if not ok:
+        # Emit NDJSON error to stderr and refuse to index
+        print(
+            json.dumps({
+                "event": "quarantine",
+                "path": rel_path,
+                "error": err_msg,
+            }),
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+    # Layer + source + freshness fields
+    layer = int(fm["layer"]) if fm.get("layer") is not None else 2
+    source = fm.get("source")
+    if source is not None:
+        source = str(source)
+
+    # Freshness
+    fv = fm.get("freshness_verified_at")
+    if fv is not None:
+        fv = str(fv)
+    fs = fm.get("freshness_source_url")
+    if fs is not None:
+        fs = str(fs)
+    fd = fm.get("freshness_stale_after_days")
+    if fd is not None:
+        try:
+            fd = int(fd)
+        except (TypeError, ValueError):
+            fd = None
 
     # Upsert node
-    conn.execute(
-        """INSERT INTO nodes (path, title, description, created_at, modified_at, content_hash, date_hint)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(path) DO UPDATE SET
-               title=excluded.title,
-               description=excluded.description,
-               modified_at=excluded.modified_at,
-               content_hash=excluded.content_hash,
-               date_hint=excluded.date_hint""",
-        (rel_path, parsed["title"], parsed.get("description"), now, now, parsed["content_hash"], parsed["date_hint"]),
+    graph_mod.upsert_node(
+        graph,
+        rel_path,
+        title=parsed["title"],
+        content_hash=parsed["content_hash"],
+        date_hint=parsed["date_hint"],
+        description=parsed.get("description"),
+        content=parsed["content"],
+        layer=layer,
+        source=source,
+        freshness_verified_at=fv,
+        freshness_source_url=fs,
+        freshness_stale_after_days=fd,
     )
 
-    # Update FTS — delete old, insert new
-    conn.execute("DELETE FROM fts WHERE path = ?", (rel_path,))
-    conn.execute(
-        "INSERT INTO fts (path, title, content) VALUES (?, ?, ?)",
-        (rel_path, parsed["title"], parsed["content"]),
-    )
-
-    # Process links — remove old link edges from this source, add new ones
-    conn.execute("DELETE FROM edges WHERE source = ? AND type = 'link'", (rel_path,))
+    # Process links — clear old link edges, re-add
+    graph_mod.clear_link_edges_from(graph, rel_path)
     for link_target in parsed["links"]:
         resolved = resolve_link(link_target, rel_path, mem_home)
-        # Check if target exists
         target_exists = os.path.exists(os.path.join(mem_home, resolved))
         strength = 1.0 if target_exists else 0.0
-        conn.execute(
-            """INSERT OR REPLACE INTO edges (source, target, type, strength, created_at)
-               VALUES (?, ?, 'link', ?, ?)""",
-            (rel_path, resolved, strength, now),
-        )
+        graph_mod.upsert_link_edge(graph, rel_path, resolved, strength=strength)
 
-    conn.commit()
+    return True
 
 
-def update_node(conn, mem_home: str, rel_path: str) -> bool:
+def update_node(graph, mem_home: str, rel_path: str) -> bool:
     """Update a node if its content has changed. Returns True if updated."""
     abs_path = os.path.join(mem_home, rel_path)
     if not os.path.exists(abs_path):
@@ -93,31 +151,24 @@ def update_node(conn, mem_home: str, rel_path: str) -> bool:
     with open(abs_path, encoding="utf-8") as f:
         current_hash = compute_hash(f.read())
 
-    row = conn.execute(
-        "SELECT content_hash FROM nodes WHERE path = ?", (rel_path,)
-    ).fetchone()
-
-    if row and row[0] == current_hash:
+    existing = graph_mod.get_node(graph, rel_path)
+    if existing and existing.get("content_hash") == current_hash:
         return False  # No change
 
-    # Re-index the file
-    index_file(conn, mem_home, rel_path)
-    return True
+    return index_file(graph, mem_home, rel_path)
 
 
-def index_directory(conn, mem_home: str) -> int:
-    """Index all .md files in a directory tree. Returns count of files indexed."""
+def index_directory(graph, mem_home: str) -> int:
+    """Index all .md/.jsonl files in a directory tree. Returns count indexed."""
     patterns = load_memignore(mem_home)
     count = 0
 
     for dirpath, dirnames, filenames in os.walk(mem_home):
-        # Filter out ignored directories
         rel_dir = os.path.relpath(dirpath, mem_home)
         if rel_dir != "." and is_ignored(rel_dir, patterns):
             dirnames.clear()
             continue
 
-        # Prune ignored subdirs from walk
         dirnames[:] = [
             d for d in dirnames
             if not is_ignored(
@@ -131,61 +182,28 @@ def index_directory(conn, mem_home: str) -> int:
             rel_path = os.path.relpath(os.path.join(dirpath, filename), mem_home)
             if is_ignored(rel_path, patterns):
                 continue
-            index_file(conn, mem_home, rel_path)
-            count += 1
+            if index_file(graph, mem_home, rel_path):
+                count += 1
 
     return count
 
 
-def reindex(conn, mem_home: str) -> int:
-    """Drop all data and reindex from scratch."""
-    conn.execute("DELETE FROM nodes")
-    conn.execute("DELETE FROM edges WHERE type = 'link'")
-    conn.execute("DELETE FROM fts")
-    conn.execute("DELETE FROM embeddings")
-    conn.commit()
-    return index_directory(conn, mem_home)
+def reindex(graph, mem_home: str) -> int:
+    """Drop all node/query/edge data and reindex from scratch. Preserves Claims + Meta."""
+    graph_mod.clear_data(graph)
+    return index_directory(graph, mem_home)
 
 
-def remove_file(conn, rel_path: str) -> None:
+def remove_file(graph, rel_path: str) -> None:
     """Remove a file from the index."""
-    conn.execute("DELETE FROM edges WHERE source = ? OR target = ?", (rel_path, rel_path))
-    conn.execute("DELETE FROM fts WHERE path = ?", (rel_path,))
-    conn.execute("DELETE FROM embeddings WHERE path = ?", (rel_path,))
-    conn.execute("DELETE FROM nodes WHERE path = ?", (rel_path,))
-    conn.commit()
+    graph_mod.remove_node(graph, rel_path)
 
 
-def rename_path(conn, old_prefix: str, new_prefix: str) -> None:
+def rename_path(graph, old_prefix: str, new_prefix: str) -> None:
     """Update all paths matching old_prefix to new_prefix (for directory renames)."""
-    conn.execute(
-        "UPDATE nodes SET path = replace(path, ?, ?) WHERE path LIKE ?",
-        (old_prefix, new_prefix, old_prefix + "%"),
-    )
-    conn.execute(
-        "UPDATE edges SET source = replace(source, ?, ?) WHERE source LIKE ?",
-        (old_prefix, new_prefix, old_prefix + "%"),
-    )
-    conn.execute(
-        "UPDATE edges SET target = replace(target, ?, ?) WHERE target LIKE ?",
-        (old_prefix, new_prefix, old_prefix + "%"),
-    )
-    conn.execute(
-        "UPDATE fts SET path = replace(path, ?, ?) WHERE path LIKE ?",
-        (old_prefix, new_prefix, old_prefix + "%"),
-    )
-    conn.commit()
+    graph_mod.rename_prefix(graph, old_prefix, new_prefix)
 
 
-def upgrade_broken_links(conn, rel_path: str) -> int:
+def upgrade_broken_links(graph, rel_path: str) -> int:
     """When a file is created, upgrade any broken link edges pointing to it."""
-    cursor = conn.execute(
-        "UPDATE edges SET strength = 1.0 WHERE target = ? AND strength = 0",
-        (rel_path,),
-    )
-    conn.commit()
-    return cursor.rowcount
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return graph_mod.upgrade_broken_links(graph, rel_path)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""memfs — Unix-native memory filesystem for LLM agents.
+"""memfs — Unix-native memory filesystem for LLM agents (Neo4j backend).
 
 Agent prompt (3 sentences):
   Your memory lives in $MEM_HOME. Read and write files normally with any tool.
@@ -12,7 +12,7 @@ import json
 import os
 import sys
 
-from memfs.db import create_db, connect
+from memfs.graph import create_db, connect, count_nodes, count_edges, count_queries, get_meta
 from memfs.indexer import index_directory, reindex as do_reindex
 from memfs.search import grep as do_grep
 from memfs.decay import run_decay
@@ -36,39 +36,57 @@ def get_mem_home(args=None):
     return os.environ.get("MEM_HOME", os.getcwd())
 
 
-def get_db_path(mem_home):
-    return os.path.join(mem_home, ".mem", "memory.db")
+def _connect_or_die():
+    """Connect to Neo4j with a helpful error if unreachable."""
+    try:
+        graph = connect()
+        # Force a round-trip so we fail fast if server is down
+        graph.run_scalar("RETURN 1")
+        return graph
+    except Exception as e:
+        err({
+            "error": "neo4j_unreachable",
+            "detail": str(e),
+            "hint": "Start Neo4j: cd ~/apps/memfs && docker compose up -d neo4j",
+        })
+        sys.exit(3)
 
 
 # --- Commands ---
 
 def cmd_init(args):
     mem_home = os.path.abspath(args.dir) if args.dir else os.getcwd()
-    db_path = get_db_path(mem_home)
+    os.makedirs(os.path.join(mem_home, ".mem"), exist_ok=True)
 
-    create_db(db_path)
-    conn = connect(db_path)
-    count = index_directory(conn, mem_home)
-    edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-    conn.close()
+    try:
+        create_db()
+    except Exception as e:
+        err({
+            "error": "neo4j_unreachable",
+            "detail": str(e),
+            "hint": "Start Neo4j: cd ~/apps/memfs && docker compose up -d neo4j",
+        })
+        sys.exit(3)
+
+    graph = _connect_or_die()
+    try:
+        count = index_directory(graph, mem_home)
+        edges = count_edges(graph)
+    finally:
+        graph.close()
 
     out({"action": "init", "mem_home": mem_home, "nodes": count, "edges": edges})
 
 
 def cmd_grep(args):
-    mem_home = get_mem_home(args)
-    db_path = get_db_path(mem_home)
-
-    if not os.path.exists(db_path):
-        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
-        sys.exit(1)
-
-    conn = connect(db_path)
-    # Auto-detect if vectors are available
-    has_vectors = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] > 0
-    use_vectors = has_vectors and not args.no_vectors
-    results = do_grep(conn, args.query, limit=args.limit, use_vectors=use_vectors)
-    conn.close()
+    graph = _connect_or_die()
+    try:
+        results = do_grep(
+            graph, args.query, limit=args.limit,
+            layer=args.layer, fresh_only=args.fresh_only,
+        )
+    finally:
+        graph.close()
 
     for r in results:
         out(r)
@@ -76,103 +94,76 @@ def cmd_grep(args):
 
 def cmd_ls(args):
     mem_home = get_mem_home(args)
-    db_path = get_db_path(mem_home)
+    graph = _connect_or_die()
+    try:
+        if args.orphans:
+            from memfs.graph import get_orphans
+            for row in get_orphans(graph):
+                out({"path": row["path"], "title": row["title"],
+                     "search_count": row["search_count"], "orphan": True})
+            return
 
-    if not os.path.exists(db_path):
-        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
-        sys.exit(1)
+        subdir = args.subdir
+        if subdir:
+            subdir = subdir.rstrip("/")
+            rows = graph.run(
+                "MATCH (n:Node) WHERE n.path STARTS WITH $prefix "
+                "RETURN n.path AS path, n.title AS title, n.layer AS layer "
+                "ORDER BY n.path",
+                prefix=subdir + "/",
+            )
+        else:
+            rows = graph.run(
+                "MATCH (n:Node) RETURN n.path AS path, n.title AS title, n.layer AS layer "
+                "ORDER BY n.path"
+            )
 
-    conn = connect(db_path)
-
-    # Orphans mode
-    if args.orphans:
-        rows = conn.execute("""
-            SELECT n.path, n.title, n.search_count FROM nodes n
-            WHERE n.path NOT IN (SELECT DISTINCT target FROM edges)
-              AND n.path NOT IN (SELECT DISTINCT source FROM edges WHERE type='link')
-              AND n.search_count = 0
-            ORDER BY n.path
-        """).fetchall()
-        for row in rows:
-            out({"path": row[0], "title": row[1], "search_count": row[2], "orphan": True})
-        conn.close()
-        return
-
-    # Filter by subdirectory if provided
-    subdir = args.subdir
-    if subdir:
-        subdir = subdir.rstrip("/")
-        rows = conn.execute(
-            "SELECT path, title FROM nodes WHERE path LIKE ? ORDER BY path",
-            (subdir + "/%",),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT path, title FROM nodes ORDER BY path").fetchall()
-
-    if args.verbose:
-        for row in rows:
-            path = row[0]
-            links_out = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE source = ? AND type = 'link'", (path,)
-            ).fetchone()[0]
-            links_in = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE target = ? AND type = 'link'", (path,)
-            ).fetchone()[0]
-            search_hits = conn.execute(
-                "SELECT search_count FROM nodes WHERE path = ?", (path,)
-            ).fetchone()[0]
-            out({"path": path, "title": row[1], "links_out": links_out,
-                 "links_in": links_in, "search_hits": search_hits or 0})
-    else:
-        for row in rows:
-            out({"path": row[0]})
-
-    conn.close()
+        if args.verbose:
+            for row in rows:
+                path = row["path"]
+                links_out = graph.run_scalar(
+                    "MATCH (:Node {path: $p})-[r:LINK]->() RETURN count(r)", p=path,
+                ) or 0
+                links_in = graph.run_scalar(
+                    "MATCH ()-[r:LINK]->(:Node {path: $p}) RETURN count(r)", p=path,
+                ) or 0
+                search_hits = graph.run_scalar(
+                    "MATCH (n:Node {path: $p}) RETURN coalesce(n.search_count, 0)",
+                    p=path,
+                ) or 0
+                out({"path": path, "title": row["title"], "layer": row["layer"],
+                     "links_out": int(links_out), "links_in": int(links_in),
+                     "search_hits": int(search_hits)})
+        else:
+            for row in rows:
+                out({"path": row["path"]})
+    finally:
+        graph.close()
 
 
 def cmd_status(args):
-    mem_home = get_mem_home(args)
-    db_path = get_db_path(mem_home)
-
-    if not os.path.exists(db_path):
-        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
-        sys.exit(1)
-
-    conn = connect(db_path)
-    nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-    link_edges = conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE type='link'"
-    ).fetchone()[0]
-    search_edges = conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE type='search'"
-    ).fetchone()[0]
-    queries = conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
-
-    last_index = conn.execute(
-        "SELECT value FROM meta WHERE key='last_index'"
-    ).fetchone()
-    last_decay = conn.execute(
-        "SELECT value FROM meta WHERE key='last_decay'"
-    ).fetchone()
-
-    conn.close()
+    graph = _connect_or_die()
+    try:
+        nodes = count_nodes(graph)
+        link_edges = count_edges(graph, type="link")
+        search_edges = count_edges(graph, type="search")
+        queries = count_queries(graph)
+        last_index = get_meta(graph, "last_index")
+        last_decay = get_meta(graph, "last_decay")
+    finally:
+        graph.close()
 
     out({
         "nodes": nodes,
         "edges": {"link": link_edges, "search": search_edges},
         "queries": queries,
-        "last_index": last_index[0] if last_index else None,
-        "last_decay": last_decay[0] if last_decay else None,
+        "last_index": last_index,
+        "last_decay": last_decay,
     })
 
 
 def cmd_watch(args):
     mem_home = get_mem_home(args)
-    db_path = get_db_path(mem_home)
-
-    if not os.path.exists(db_path):
-        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
-        sys.exit(1)
 
     if args.stop:
         stopped = stop_watcher(mem_home)
@@ -184,20 +175,19 @@ def cmd_watch(args):
         out(status)
         return
 
-    start_watcher(mem_home, db_path, daemon=args.daemon)
+    # Sanity: server reachable
+    graph = _connect_or_die()
+    graph.close()
+
+    start_watcher(mem_home, daemon=args.daemon)
 
 
 def cmd_decay(args):
-    mem_home = get_mem_home(args)
-    db_path = get_db_path(mem_home)
-
-    if not os.path.exists(db_path):
-        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
-        sys.exit(1)
-
-    conn = connect(db_path)
-    stats = run_decay(conn, dry_run=args.dry_run)
-    conn.close()
+    graph = _connect_or_die()
+    try:
+        stats = run_decay(graph, dry_run=args.dry_run)
+    finally:
+        graph.close()
 
     out({"action": "decay", "dry_run": args.dry_run, **stats})
 
@@ -206,12 +196,15 @@ def cmd_skills(args):
     """List, output, or install bundled skills."""
     skills_dir = os.path.join(os.path.dirname(__file__), "skills")
 
+    if not os.path.isdir(skills_dir):
+        err({"error": "no_skills_dir", "path": skills_dir})
+        return
+
     if args.action == "setup":
         _skills_setup(skills_dir, args)
         return
 
     if args.action and args.action not in ("list",):
-        # Treat as a skill name — output it
         skill_path = os.path.join(skills_dir, f"{args.action}.md")
         if not os.path.exists(skill_path):
             err({"error": "skill_not_found", "name": args.action,
@@ -220,7 +213,6 @@ def cmd_skills(args):
         with open(skill_path) as f:
             print(f.read())
     else:
-        # List all skills
         for filename in sorted(os.listdir(skills_dir)):
             if filename.endswith(".md"):
                 name = filename.replace(".md", "")
@@ -236,7 +228,6 @@ def cmd_skills(args):
 
 
 def _skills_setup(skills_dir: str, args):
-    """Install skills into the agent framework."""
     harness = args.harness or _detect_harness()
 
     if harness == "claude-code":
@@ -250,8 +241,6 @@ def _skills_setup(skills_dir: str, args):
 
 
 def _detect_harness() -> str:
-    """Detect which agent framework is in use."""
-    # Check for Claude Code
     claude_dir = os.path.expanduser("~/.claude")
     if os.path.isdir(claude_dir):
         return "claude-code"
@@ -259,8 +248,6 @@ def _detect_harness() -> str:
 
 
 def _setup_claude_code(skills_dir: str):
-    """Install skills as Claude Code SKILL.md files."""
-    # Find the project skills directory
     cwd = os.getcwd()
     project_skills = os.path.join(cwd, ".claude", "skills")
     os.makedirs(project_skills, exist_ok=True)
@@ -283,7 +270,6 @@ def _setup_claude_code(skills_dir: str):
         installed.append({"name": f"memfs-{name}", "path": dest})
         out({"action": "installed", "skill": f"memfs-{name}", "path": dest})
 
-    # Output the system prompt fragment
     mem_home = os.environ.get("MEM_HOME", "")
     prompt_fragment = (
         f"Your memory lives in `{mem_home or '$MEM_HOME'}`. "
@@ -298,7 +284,6 @@ def _setup_claude_code(skills_dir: str):
 
 
 def _setup_generic(skills_dir: str):
-    """Output skills to stdout for manual integration."""
     out({"action": "generic_setup", "instructions": "Copy these skills into your agent framework."})
     for filename in sorted(os.listdir(skills_dir)):
         if filename.endswith(".md"):
@@ -310,65 +295,164 @@ def _setup_generic(skills_dir: str):
 
 def cmd_reindex(args):
     mem_home = get_mem_home(args)
-    db_path = get_db_path(mem_home)
-
-    if not os.path.exists(db_path):
-        err({"error": "not_initialized", "hint": f"run memfs init {mem_home}"})
-        sys.exit(1)
-
-    conn = connect(db_path)
-    count = do_reindex(conn, mem_home)
-    edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-    conn.close()
+    graph = _connect_or_die()
+    try:
+        count = do_reindex(graph, mem_home)
+        edges = count_edges(graph)
+    finally:
+        graph.close()
 
     out({"action": "reindex", "nodes": count, "edges": edges})
 
 
+# --- M4 commands (calibration ledger + contradictions) ---
+
+def cmd_claim(args):
+    from memfs.calibration import record_claim
+    graph = _connect_or_die()
+    try:
+        mem_home = get_mem_home(args)
+        claim_id = record_claim(
+            graph,
+            text=args.text,
+            confidence=args.confidence,
+            scope=args.scope,
+            claimed_to=args.to,
+            mem_home=mem_home,
+        )
+    finally:
+        graph.close()
+    out({"action": "claim", "claim_id": claim_id})
+
+
+def cmd_verify(args):
+    from memfs.calibration import verify_claim
+    graph = _connect_or_die()
+    try:
+        mem_home = get_mem_home(args)
+        verify_claim(
+            graph, claim_id=args.claim_id, outcome=args.outcome,
+            note=args.note, mem_home=mem_home,
+        )
+    finally:
+        graph.close()
+    out({"action": "verify", "claim_id": args.claim_id, "outcome": args.outcome})
+
+
+def cmd_calibration(args):
+    from memfs.calibration import calibration_curve
+    graph = _connect_or_die()
+    try:
+        curve = calibration_curve(graph, window_days=args.window, scope=args.scope)
+    finally:
+        graph.close()
+    out(curve)
+
+
+def cmd_freshness_scan(args):
+    """Report nodes whose freshness is stale. Auto-refresh is future work."""
+    graph = _connect_or_die()
+    try:
+        rows = graph.run(
+            "MATCH (n:Node) "
+            "WHERE n.freshness_verified_at IS NOT NULL "
+            "  AND n.freshness_stale_after_days IS NOT NULL "
+            "RETURN n.path AS path, n.title AS title, "
+            "n.freshness_verified_at AS verified_at, "
+            "n.freshness_stale_after_days AS stale_after, "
+            "n.freshness_source_url AS source_url "
+            "ORDER BY n.path"
+        )
+    finally:
+        graph.close()
+
+    from memfs.search import _freshness_status
+    for row in rows:
+        status = _freshness_status({
+            "freshness_verified_at": row.get("verified_at"),
+            "freshness_stale_after_days": row.get("stale_after"),
+        })
+        if status == "stale":
+            out({
+                "path": row["path"],
+                "title": row["title"],
+                "verified_at": row["verified_at"],
+                "stale_after_days": row["stale_after"],
+                "source_url": row.get("source_url"),
+                "status": "stale",
+            })
+
+
 # --- Main ---
+
+def _parse_window(s: str | None) -> int:
+    """Parse '30d' / '7d' / '24h' / integer days."""
+    if not s:
+        return 30
+    s = s.strip()
+    if s.endswith("d"):
+        return int(s[:-1])
+    if s.endswith("h"):
+        return max(1, int(s[:-1]) // 24)
+    return int(s)
+
 
 def main():
     parser = argparse.ArgumentParser(
         prog="memfs",
-        description="Unix-native memory filesystem for LLM agents.",
+        description="Unix-native memory filesystem for LLM agents (Neo4j).",
     )
     sub = parser.add_subparsers(dest="command")
 
-    # init
     p_init = sub.add_parser("init", help="Initialize a memory root")
     p_init.add_argument("dir", nargs="?", default=None, help="Directory to initialize")
 
-    # grep
     p_grep = sub.add_parser("grep", help="Search memory (agent's primary command)")
     p_grep.add_argument("query", help="Search query")
     p_grep.add_argument("--limit", type=int, default=20, help="Max results")
-    p_grep.add_argument("--no-vectors", action="store_true", help="Disable vector search")
+    p_grep.add_argument("--layer", type=int, default=None, help="Filter by layer (1-5)")
+    p_grep.add_argument("--fresh-only", action="store_true", help="Drop stale results")
 
-    # ls
     p_ls = sub.add_parser("ls", help="List indexed files")
     p_ls.add_argument("subdir", nargs="?", default=None, help="Subdirectory to list")
     p_ls.add_argument("--verbose", "-v", action="store_true", help="Show edge counts")
     p_ls.add_argument("--orphans", action="store_true", help="Show files with no connections and no searches")
 
-    # status
     sub.add_parser("status", help="Show index statistics")
 
-    # watch
     p_watch = sub.add_parser("watch", help="Start filesystem watcher daemon")
     p_watch.add_argument("--daemon", action="store_true", help="Run in background")
     p_watch.add_argument("--stop", action="store_true", help="Stop running daemon")
     p_watch.add_argument("--status", action="store_true", help="Check daemon status")
 
-    # skills
     p_skills = sub.add_parser("skills", help="List, output, or install agent skills")
     p_skills.add_argument("action", nargs="?", help="setup | list | <skill-name>")
     p_skills.add_argument("--harness", help="Agent framework (claude-code, generic)")
 
-    # _decay (hidden — for launchd/cron)
     p_decay = sub.add_parser("_decay", help=argparse.SUPPRESS)
     p_decay.add_argument("--dry-run", action="store_true")
 
-    # reindex
     sub.add_parser("reindex", help="Rebuild index from files")
+
+    # Calibration ledger (M4)
+    p_claim = sub.add_parser("claim", help="Record a verifiable claim")
+    p_claim.add_argument("--text", required=True)
+    p_claim.add_argument("--confidence", type=float, required=True)
+    p_claim.add_argument("--scope", required=True)
+    p_claim.add_argument("--to", default="log")
+
+    p_verify = sub.add_parser("verify", help="Verify a claim outcome")
+    p_verify.add_argument("claim_id")
+    p_verify.add_argument("--outcome", required=True,
+                          choices=["correct", "wrong", "partial"])
+    p_verify.add_argument("--note", default=None)
+
+    p_cal = sub.add_parser("calibration", help="Report calibration curve")
+    p_cal.add_argument("--window", default="30d", type=_parse_window)
+    p_cal.add_argument("--scope", default=None)
+
+    # Freshness (M5)
+    sub.add_parser("freshness-scan", help="Report nodes with stale freshness stamps")
 
     args = parser.parse_args()
 
@@ -385,10 +469,16 @@ def main():
         "skills": cmd_skills,
         "_decay": cmd_decay,
         "reindex": cmd_reindex,
+        "claim": cmd_claim,
+        "verify": cmd_verify,
+        "calibration": cmd_calibration,
+        "freshness-scan": cmd_freshness_scan,
     }
 
     try:
         commands[args.command](args)
+    except SystemExit:
+        raise
     except Exception as e:
         err({"error": str(e), "type": type(e).__name__})
         sys.exit(2)

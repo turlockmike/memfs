@@ -1,18 +1,14 @@
-"""Tests for mem grep — FTS5 search, search edges, query nodes."""
+"""Tests for memfs grep — full-text search via Neo4j."""
 
 import pytest
-from memfs.db import create_db, connect
+
 from memfs.indexer import index_file
 from memfs.search import grep, normalize_query
+from memfs.graph import count_queries
 
 
 @pytest.fixture
-def populated_db(tmp_path):
-    """Create a memory root with several files indexed."""
-    root = tmp_path
-    db_path = str(root / ".mem" / "memory.db")
-    create_db(db_path)
-
+def populated_graph(graph, tmp_path):
     files = {
         "kanji.md": "---\ntitle: Kanji Learning\ndate: 2026-04-01\n---\n# Kanji Learning\nStudying kanji with spaced repetition and mnemonics.",
         "satori.md": "---\ntitle: Satori App\ndate: 2026-04-10\n---\n# Satori App\nA kanji curriculum app built with Next.js and IndexedDB. See [[kanji.md]]",
@@ -20,39 +16,29 @@ def populated_db(tmp_path):
         "python.md": "# Python Tips\nUse list comprehensions for readability.",
         "unrelated.md": "# Cooking Recipes\nHow to make pasta carbonara.",
     }
-
-    conn = connect(db_path)
     for name, content in files.items():
-        (root / name).write_text(content)
-        index_file(conn, str(root), name)
-    conn.close()
-
-    return root, db_path
+        (tmp_path / name).write_text(content)
+        index_file(graph, str(tmp_path), name)
+    return graph, tmp_path
 
 
 class TestGrep:
-    def test_finds_matching_file(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "kanji")
-        conn.close()
+    def test_finds_matching_file(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "kanji")
         paths = [r["path"] for r in results]
         assert "kanji.md" in paths
 
-    def test_ranks_title_match_higher(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "kanji")
-        conn.close()
-        # kanji.md has "kanji" in title, should rank higher than satori.md
+    def test_ranks_title_match_higher(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "kanji")
         paths = [r["path"] for r in results]
+        # kanji.md has "kanji" in title, should rank higher than satori.md
         assert paths.index("kanji.md") < paths.index("satori.md")
 
-    def test_returns_ndjson_fields(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "kanji")
-        conn.close()
+    def test_returns_ndjson_fields(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "kanji")
         r = results[0]
         assert "path" in r
         assert "title" in r
@@ -60,75 +46,59 @@ class TestGrep:
         assert "score" in r
         assert "snippet" in r
 
-    def test_no_results_for_nonsense(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "xyzzy_nonexistent_term")
-        conn.close()
+    def test_no_results_for_nonsense(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "xyzzy_nonexistent_term")
         assert len(results) == 0
 
-    def test_limits_results(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "the", limit=2)
-        conn.close()
+    def test_limits_results(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "kanji satori meetings python cooking", limit=2)
         assert len(results) <= 2
 
-    def test_creates_search_edges_for_top_3(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "kanji")
-        # Check search edges were created
-        search_edges = conn.execute(
-            "SELECT target, strength FROM edges WHERE type='search'"
-        ).fetchall()
-        conn.close()
-        assert len(search_edges) <= 3
-        targets = {e[0] for e in search_edges}
-        # Top results should have search edges
-        for i, r in enumerate(results[:3]):
+    def test_creates_search_edges_for_top_3(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "kanji")
+        rows = graph.run(
+            "MATCH (:Query)-[r:SEARCH]->(n:Node) "
+            "RETURN n.path AS path, r.strength AS strength"
+        )
+        edges = list(rows)
+        assert len(edges) <= 3
+        targets = {e["path"] for e in edges}
+        for r in results[:3]:
             assert r["path"] in targets
 
-    def test_creates_query_node(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        grep(conn, "kanji")
-        queries = conn.execute("SELECT * FROM queries").fetchall()
-        conn.close()
-        assert len(queries) == 1
+    def test_creates_query_node(self, populated_graph):
+        graph, _ = populated_graph
+        grep(graph, "kanji")
+        assert count_queries(graph) == 1
 
-    def test_repeated_query_increments_use_count(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        grep(conn, "kanji")
-        grep(conn, "kanji")
-        row = conn.execute("SELECT use_count FROM queries").fetchone()
-        conn.close()
-        assert row[0] == 2
+    def test_repeated_query_increments_use_count(self, populated_graph):
+        graph, _ = populated_graph
+        grep(graph, "kanji")
+        grep(graph, "kanji")
+        count = graph.run_scalar("MATCH (q:Query) RETURN q.use_count")
+        assert count == 2
 
-    def test_updates_search_count_on_nodes(self, populated_db):
-        root, db_path = populated_db
-        conn = connect(db_path)
-        grep(conn, "kanji")
-        row = conn.execute(
-            "SELECT search_count FROM nodes WHERE path='kanji.md'"
-        ).fetchone()
-        conn.close()
-        assert row[0] >= 1
+    def test_updates_search_count_on_nodes(self, populated_graph):
+        graph, _ = populated_graph
+        grep(graph, "kanji")
+        count = graph.run_scalar(
+            "MATCH (n:Node {path: 'kanji.md'}) RETURN n.search_count"
+        )
+        assert count >= 1
 
-    def test_rank_weighted_edge_strength(self, populated_db):
-        """Rank 1 should get stronger edge than rank 3."""
-        root, db_path = populated_db
-        conn = connect(db_path)
-        results = grep(conn, "kanji")
+    def test_rank_weighted_edge_strength(self, populated_graph):
+        graph, _ = populated_graph
+        results = grep(graph, "kanji")
         if len(results) >= 3:
-            edges = conn.execute(
-                "SELECT target, strength FROM edges WHERE type='search' ORDER BY strength DESC"
-            ).fetchall()
-            strengths = [e[1] for e in edges]
-            # Strengths should be monotonically non-increasing
+            rows = graph.run(
+                "MATCH (:Query)-[r:SEARCH]->(n:Node) "
+                "RETURN r.strength AS strength ORDER BY r.strength DESC"
+            )
+            strengths = [r["strength"] for r in rows]
             assert strengths == sorted(strengths, reverse=True)
-        conn.close()
 
 
 class TestNormalizeQuery:

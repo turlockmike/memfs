@@ -1,14 +1,15 @@
 """Power-law decay engine and spacing-effect increments.
 
-Neuroscience-informed: single exponential is the one model forgetting data
-consistently rejects. Power law decays fast early, levels off.
+Neuroscience-informed: power law decays fast early, levels off.
 """
 
 import math
 from datetime import datetime, timezone
 
+from memfs import graph as graph_mod
+
 # Decay parameters
-PRUNE_THRESHOLD = 0.05  # Edges below this get deleted
+PRUNE_THRESHOLD = 0.05  # Edges below this get deleted (search only)
 LINK_FLOOR = 0.5        # Link edges never decay below this
 MAX_STRENGTH = 5.0      # Cap on edge strength
 SCHEMA_MULTIPLIER = 1.5 # Bonus for same-directory edges
@@ -18,8 +19,6 @@ def decayed_strength(strength: float, days_since: float) -> float:
     """Apply power-law decay to an edge strength.
 
     Formula: strength * (1 + 0.1 * days)^-0.5
-
-    Half-life is ~30 days for strength 1.0.
     """
     if days_since <= 0:
         return strength
@@ -27,69 +26,72 @@ def decayed_strength(strength: float, days_since: float) -> float:
 
 
 def spacing_increment(days_gap: float, same_dir: bool = False) -> float:
-    """Compute the spacing-effect increment for a co-access event.
-
-    Per neuroscience: accessing things together repeatedly in the same session
-    gives diminishing returns. Accessing them after a gap is a stronger signal.
-
-    Formula: 0.05 * (1 + log(1 + days_gap)) * schema_multiplier
-    """
+    """Compute the spacing-effect increment for a co-access event."""
     multiplier = SCHEMA_MULTIPLIER if same_dir else 1.0
     return 0.05 * (1 + math.log(1 + days_gap)) * multiplier
 
 
-def run_decay(conn, dry_run: bool = False) -> dict:
+def run_decay(graph, dry_run: bool = False) -> dict:
     """Run power-law decay sweep across all edges.
 
     - Search edges decay fully and get pruned below PRUNE_THRESHOLD.
     - Link edges respect LINK_FLOOR.
-    - Returns stats: {updated, pruned}.
     """
     now = datetime.now(timezone.utc)
-    cursor = conn.execute(
-        "SELECT source, target, type, strength, last_activated FROM edges"
+    now_iso = now.isoformat()
+
+    link_updates: list[tuple[str, str, float, str]] = []
+    search_updates: list[tuple[str, str, float, str]] = []
+    link_prunes: list[tuple[str, str]] = []
+    search_prunes: list[tuple[str, str]] = []
+
+    # We issue two separate queries for LINK and SEARCH to avoid the shared
+    # iterator pattern's awkward "source_qid" thing.
+    link_rows = graph.run(
+        "MATCH (s:Node)-[r:LINK]->(t:Node) "
+        "RETURN s.path AS source, t.path AS target, "
+        "r.strength AS strength, r.last_activated AS last_activated"
+    )
+    search_rows = graph.run(
+        "MATCH (q:Query)-[r:SEARCH]->(t:Node) "
+        "RETURN q.id AS source, t.path AS target, "
+        "r.strength AS strength, r.last_activated AS last_activated"
     )
 
-    to_update = []
-    to_prune = []
+    def _days_since(last_activated):
+        if not last_activated:
+            return 0
+        last_dt = datetime.fromisoformat(str(last_activated))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        return max(0, (now - last_dt).total_seconds() / 86400)
 
-    for row in cursor:
-        source, target, etype, strength, last_activated = row
-        if last_activated:
-            last_dt = datetime.fromisoformat(last_activated)
-            # Ensure timezone-aware comparison
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            days = max(0, (now - last_dt).total_seconds() / 86400)
-        else:
-            days = 0
+    for row in link_rows:
+        days = _days_since(row["last_activated"])
+        strength = float(row["strength"] or 0.0)
+        new_strength = max(decayed_strength(strength, days), LINK_FLOOR)
+        link_updates.append((row["source"], row["target"], new_strength, now_iso))
 
+    for row in search_rows:
+        days = _days_since(row["last_activated"])
+        strength = float(row["strength"] or 0.0)
         new_strength = decayed_strength(strength, days)
-
-        # Apply floor for link edges
-        if etype == "link":
-            new_strength = max(new_strength, LINK_FLOOR)
-
-        if new_strength < PRUNE_THRESHOLD and etype != "link":
-            to_prune.append((source, target, etype))
+        if new_strength < PRUNE_THRESHOLD:
+            search_prunes.append((row["source"], row["target"]))
         else:
-            to_update.append((new_strength, now.isoformat(), source, target, etype))
+            search_updates.append((row["source"], row["target"], new_strength, now_iso))
+
+    updated_count = len(link_updates) + len(search_updates)
+    pruned_count = len(link_prunes) + len(search_prunes)
 
     if not dry_run:
-        conn.executemany(
-            "UPDATE edges SET strength=?, last_activated=? WHERE source=? AND target=? AND type=?",
-            to_update,
+        graph_mod.apply_decay_updates(
+            graph,
+            link_updates=link_updates,
+            search_updates=search_updates,
+            link_prunes=link_prunes,
+            search_prunes=search_prunes,
         )
-        for source, target, etype in to_prune:
-            conn.execute(
-                "DELETE FROM edges WHERE source=? AND target=? AND type=?",
-                (source, target, etype),
-            )
-        # Record last decay time
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?)",
-            (now.isoformat(),),
-        )
-        conn.commit()
+        graph_mod.set_meta(graph, "last_decay", now_iso)
 
-    return {"updated": len(to_update), "pruned": len(to_prune)}
+    return {"updated": updated_count, "pruned": pruned_count}

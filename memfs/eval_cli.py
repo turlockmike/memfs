@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""mem-eval — LongMemEval benchmark harness for memfs.
-
-Usage:
-    mem-eval recall <benchmark.json> --root <dir> [--k 5] [--vectors]
-    mem-eval qa <benchmark.json> --root <dir> --output <hyp.jsonl> [--vectors] [--limit N]
-    mem-eval score <hyp.jsonl> <benchmark.json>
-"""
+"""mem-eval — LongMemEval benchmark harness for memfs (Neo4j)."""
 
 import argparse
 import json
@@ -13,7 +7,6 @@ import os
 import sys
 from collections import defaultdict
 
-from memfs.db import connect
 from memfs.eval import (
     ingest_benchmark,
     compute_recall,
@@ -27,26 +20,15 @@ def out(obj):
 
 
 def cmd_recall(args):
-    """Ingest + compute retrieval metrics."""
     print(f"Ingesting {args.benchmark}...", file=sys.stderr)
     count = ingest_benchmark(args.benchmark, args.root)
     print(f"Ingested {count} sessions", file=sys.stderr)
 
-    if args.vectors:
-        print("Embedding all sessions...", file=sys.stderr)
-        from memfs.embeddings import embed_all
-        conn = connect(os.path.join(args.root, ".mem", "memory.db"))
-        embedded = embed_all(conn, args.root)
-        print(f"Embedded {embedded} files", file=sys.stderr)
-        conn.close()
-
-    db_path = os.path.join(args.root, ".mem", "memory.db")
     with open(args.benchmark) as f:
         data = json.load(f)
 
-    results = compute_recall(db_path, data, k=args.k, use_vectors=args.vectors)
+    results = compute_recall(args.root, data, k=args.k)
 
-    # Summary
     out({
         "recall_at_k": round(results["recall_at_k"], 4),
         "mrr": round(results["mrr"], 4),
@@ -56,7 +38,6 @@ def cmd_recall(args):
         "total": results["total_questions"],
     })
 
-    # Per task type
     by_type = defaultdict(lambda: {"hits": 0, "total": 0})
     for pq in results["per_question"]:
         qt = pq["question_type"]
@@ -70,20 +51,10 @@ def cmd_recall(args):
 
 
 def cmd_qa(args):
-    """Generate hypotheses for all questions."""
     print(f"Ingesting {args.benchmark}...", file=sys.stderr)
     count = ingest_benchmark(args.benchmark, args.root)
     print(f"Ingested {count} sessions", file=sys.stderr)
 
-    if args.vectors:
-        print("Embedding all sessions...", file=sys.stderr)
-        from memfs.embeddings import embed_all
-        conn = connect(os.path.join(args.root, ".mem", "memory.db"))
-        embedded = embed_all(conn, args.root)
-        print(f"Embedded {embedded} files", file=sys.stderr)
-        conn.close()
-
-    db_path = os.path.join(args.root, ".mem", "memory.db")
     with open(args.benchmark) as f:
         data = json.load(f)
 
@@ -92,10 +63,11 @@ def cmd_qa(args):
 
     with open(args.output, "w") as out_f:
         for i, entry in enumerate(data):
-            print(f"[{i+1}/{len(data)}] {entry['question_id']}: {entry['question'][:60]}...", file=sys.stderr)
+            print(f"[{i+1}/{len(data)}] {entry['question_id']}: {entry['question'][:60]}...",
+                  file=sys.stderr)
             try:
                 result = generate_hypothesis(
-                    db_path, entry, k=5, use_vectors=args.vectors,
+                    args.root, entry, k=5,
                     model=args.model, backend=args.backend,
                 )
                 out_f.write(json.dumps(result) + "\n")
@@ -111,7 +83,6 @@ def cmd_qa(args):
 
 
 def cmd_score(args):
-    """Score hypotheses against ground truth."""
     with open(args.hypotheses) as f:
         hypotheses = {json.loads(line)["question_id"]: json.loads(line)
                       for line in f if line.strip()}
@@ -157,7 +128,6 @@ def cmd_score(args):
             "question_type": qt,
         })
 
-    # Summary
     accuracy = correct / total if total > 0 else 0
     print(f"\nOverall accuracy: {accuracy:.4f} ({correct}/{total})", file=sys.stderr)
     for qt, counts in sorted(by_type.items()):
@@ -173,29 +143,42 @@ def main():
     p_recall.add_argument("benchmark", help="Path to LongMemEval JSON")
     p_recall.add_argument("--root", required=True, help="Eval root directory")
     p_recall.add_argument("--k", type=int, default=5, help="Top-k for recall")
-    p_recall.add_argument("--vectors", action="store_true", help="Use vector embeddings")
 
     p_qa = sub.add_parser("qa", help="Generate answer hypotheses")
     p_qa.add_argument("benchmark", help="Path to LongMemEval JSON")
     p_qa.add_argument("--root", required=True, help="Eval root directory")
     p_qa.add_argument("--output", required=True, help="Output JSONL file")
-    p_qa.add_argument("--vectors", action="store_true", help="Use vector embeddings")
     p_qa.add_argument("--limit", type=int, help="Limit number of questions")
-    p_qa.add_argument("--backend", default="claude", choices=["claude", "ollama"], help="LLM backend")
-    p_qa.add_argument("--model", default="sonnet", help="Model name (sonnet for claude, gemma4 for ollama, etc.)")
+    p_qa.add_argument("--backend", default="claude", choices=["claude", "ollama"])
+    p_qa.add_argument("--model", default="sonnet")
 
     p_score = sub.add_parser("score", help="Score hypotheses against ground truth")
     p_score.add_argument("hypotheses", help="Hypotheses JSONL file")
     p_score.add_argument("benchmark", help="Path to LongMemEval JSON")
-    p_score.add_argument("--backend", default="claude", choices=["claude", "ollama"], help="LLM backend for judging")
-    p_score.add_argument("--model", default="sonnet", help="Model name for judging")
+    p_score.add_argument("--backend", default="claude", choices=["claude", "ollama"])
+    p_score.add_argument("--model", default="sonnet")
+
+    # M3 hooks
+    p_tcca = sub.add_parser("tcca", help="Run TCCA-instrumented evaluation")
+    p_tcca.add_argument("benchmark", help="Path to LongMemEval JSON")
+    p_tcca.add_argument("--root", required=True)
+    p_tcca.add_argument("--adapter", default="memfs",
+                        choices=["memfs", "accumulate", "bm25"])
+    p_tcca.add_argument("--output", required=True)
+    p_tcca.add_argument("--limit", type=int)
+    p_tcca.add_argument("--backend", default="claude", choices=["claude", "ollama"])
+    p_tcca.add_argument("--model", default="sonnet")
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    {"recall": cmd_recall, "qa": cmd_qa, "score": cmd_score}[args.command](args)
+    if args.command == "tcca":
+        from memfs.tcca import cmd_tcca
+        cmd_tcca(args)
+    else:
+        {"recall": cmd_recall, "qa": cmd_qa, "score": cmd_score}[args.command](args)
 
 
 if __name__ == "__main__":

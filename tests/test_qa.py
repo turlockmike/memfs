@@ -3,9 +3,8 @@
 import json
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-from memfs.db import create_db, connect
 from memfs.eval import ingest_benchmark, generate_hypothesis, score_hypothesis
 
 
@@ -31,7 +30,8 @@ def sample_benchmark(tmp_path):
 
 
 @pytest.fixture
-def eval_root(tmp_path):
+def eval_root(tmp_path, graph):
+    """eval_root depends on graph fixture for clean DB."""
     root = tmp_path / "eval"
     root.mkdir()
     return root
@@ -40,14 +40,12 @@ def eval_root(tmp_path):
 class TestGenerateHypothesis:
     def test_returns_question_id_and_hypothesis(self, sample_benchmark, eval_root):
         ingest_benchmark(sample_benchmark, str(eval_root))
-        db_path = str(eval_root / ".mem" / "memory.db")
         data = json.loads(open(sample_benchmark).read())
         entry = data[0]
 
-        # Mock the LLM call
         with patch("memfs.eval._call_llm") as mock_llm:
             mock_llm.return_value = "The GPS was not functioning correctly"
-            result = generate_hypothesis(db_path, entry)
+            result = generate_hypothesis(str(eval_root), entry)
 
         assert result["question_id"] == "q1"
         assert "hypothesis" in result
@@ -55,14 +53,12 @@ class TestGenerateHypothesis:
 
     def test_passes_retrieved_context_to_llm(self, sample_benchmark, eval_root):
         ingest_benchmark(sample_benchmark, str(eval_root))
-        db_path = str(eval_root / ".mem" / "memory.db")
         data = json.loads(open(sample_benchmark).read())
         entry = data[0]
 
         with patch("memfs.eval._call_llm") as mock_llm:
             mock_llm.return_value = "GPS not working"
-            generate_hypothesis(db_path, entry)
-            # Check that the LLM was called with context containing session content
+            generate_hypothesis(str(eval_root), entry)
             call_args = mock_llm.call_args[0][0]
             assert "GPS" in call_args or "car" in call_args
 
