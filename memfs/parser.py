@@ -118,6 +118,15 @@ def parse_file(filepath: str) -> dict:
     # Extract links
     links = extract_links(content)
 
+    # M2: Extract layer + source (validation happens in indexer.index_file)
+    layer = frontmatter.get("layer")
+    source = frontmatter.get("source")
+
+    # M5: freshness stamps
+    freshness_verified_at = frontmatter.get("freshness_verified_at")
+    freshness_source_url = frontmatter.get("freshness_source_url")
+    freshness_stale_after_days = frontmatter.get("freshness_stale_after_days")
+
     return {
         "title": title,
         "description": description,
@@ -126,4 +135,9 @@ def parse_file(filepath: str) -> dict:
         "content_hash": content_hash,
         "links": links,
         "frontmatter": frontmatter,
+        "layer": layer,
+        "source": source,
+        "freshness_verified_at": freshness_verified_at,
+        "freshness_source_url": freshness_source_url,
+        "freshness_stale_after_days": freshness_stale_after_days,
     }
