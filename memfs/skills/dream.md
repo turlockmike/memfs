@@ -16,27 +16,41 @@ A reflective skill that reviews how memory was used in a session and improves th
 ## Process
 
 ### 1. Gather Session Activity
+
+On the Neo4j backend, the whole briefing is one command:
+
 ```bash
-# What was searched this session?
-sqlite3 $MEM_HOME/.mem/memory.db "SELECT query_text, use_count FROM queries ORDER BY last_used DESC LIMIT 20"
-
-# What files were found and used?
-sqlite3 $MEM_HOME/.mem/memory.db "SELECT path, search_count, last_searched FROM nodes WHERE last_searched IS NOT NULL ORDER BY last_searched DESC LIMIT 20"
-
-# What files were modified recently? (proxy for "worked on")
-sqlite3 $MEM_HOME/.mem/memory.db "SELECT path, modified_at FROM nodes ORDER BY modified_at DESC LIMIT 20"
-
-# Orphans
-memfs ls --orphans
+memfs dream-briefing              # NDJSON: orphan | merge | split | link | index | stale
+memfs status                      # counts, last decay
+memfs ls --orphans                # just orphans, if you want them isolated
+memfs link-suggest                # NDJSON link candidates from content similarity
+                                  #   (use when SEARCH traffic is too low for
+                                  #    dream's co-search-based link candidates)
 ```
+
+`dream-briefing` already calls `find_content_similar_unlinked` internally, so
+the `"candidate_type":"link"` lines it emits include both co-search and
+content-similarity sources. `link-suggest` is just that slice, standalone.
 
 ### 2. Evaluate and Improve
 
 For each category, the agent makes judgment calls:
 
 **Missing connections:**
-- Read pairs of recently co-searched files. Do they reference related concepts?
-- If yes, add a `[[link]]` from one to the other. The watcher will create the edge.
+- The dream briefing emits `"candidate_type":"link"` entries. Two sources:
+  - `"source":"cosearch"` — pairs co-occurring in top-3 SEARCH results across N+ queries
+  - `"source":"content_similarity"` — pairs with overlapping rare tokens in title+description+content-head
+- For **high-confidence** link candidates (priority ≥ 0.5), pipe straight through:
+  ```bash
+  memfs dream-briefing | jq -c 'select(.candidate_type=="link" and .priority>=0.5)' \
+    | memfs link-apply --from-stdin
+  ```
+  Edges land with `source=<candidate source>` so they persist through file re-indexing.
+- For **lower-confidence** candidates, read the pair, judge, and either
+  - add an authored `[[link]]` in the source file (survives as `source=authored`), or
+  - apply via `memfs link-apply --from-stdin` (survives as graph-derived), or
+  - drop it.
+- `authored` edges are cleared on any file re-index; graph-derived edges are durable.
 
 **Files that should be split:**
 - Any file over ~500 lines or covering 2+ distinct topics?
@@ -76,8 +90,15 @@ For each category, the agent makes judgment calls:
 - Synthesis nodes are the highest-value output of dream. They capture emergent understanding that doesn't exist in any single source file.
 
 **Review decaying connections:**
-- Query edge strengths: `SELECT * FROM edges WHERE strength < 0.3 AND strength > 0.05`
-- For each fading connection: is it still relevant? If yes, re-strengthen by adding an explicit `[[link]]`. If no, let it decay naturally.
+- In Neo4j:
+  ```cypher
+  MATCH ()-[r:LINK]->() WHERE r.strength < 0.3 AND r.strength > 0.05
+  RETURN startNode(r).path, endNode(r).path, r.strength, r.source
+  ORDER BY r.strength ASC
+  ```
+- For each fading connection: is it still relevant? If yes, re-strengthen by
+  adding an explicit `[[link]]` in the source file (authored) or re-applying
+  via `memfs link-apply`. If no, let it decay naturally.
 
 ### 3. Summarize Sessions (Progressive Summarization)
 
