@@ -349,6 +349,30 @@ def cmd_calibration(args):
     out(curve)
 
 
+def cmd_ingest_session(args):
+    """Ingest a Claude Code session jsonl into memfs."""
+    from memfs.ingest import ingest_session
+    mem_home = get_mem_home(args)
+    jsonl_path = os.path.abspath(args.jsonl_path)
+    if not os.path.isfile(jsonl_path):
+        err({"error": "jsonl_not_found", "path": jsonl_path})
+        sys.exit(2)
+    result = ingest_session(jsonl_path, mem_home)
+    out(result)
+
+
+def cmd_dream_briefing(args):
+    """Emit NDJSON candidates for a dream consolidation pass."""
+    from memfs.dream import run_briefing
+    graph = _connect_or_die()
+    try:
+        candidates = run_briefing(graph, mem_home=get_mem_home(args), args=args)
+    finally:
+        graph.close()
+    for c in candidates:
+        out(c)
+
+
 def cmd_freshness_scan(args):
     """Report nodes whose freshness is stale. Auto-refresh is future work."""
     graph = _connect_or_die()
@@ -454,6 +478,23 @@ def main():
     # Freshness (M5)
     sub.add_parser("freshness-scan", help="Report nodes with stale freshness stamps")
 
+    # Session ingestion (Apr 17)
+    p_ingest = sub.add_parser("ingest-session",
+                              help="Ingest a Claude Code session jsonl")
+    p_ingest.add_argument("jsonl_path", help="Path to session .jsonl transcript")
+    p_ingest.add_argument("--dir", default=None, help="MEM_HOME override")
+
+    # Dream briefing (Apr 17)
+    p_dream = sub.add_parser("dream-briefing",
+                             help="Emit NDJSON consolidation candidates")
+    p_dream.add_argument("--dir", default=None, help="MEM_HOME override")
+    p_dream.add_argument("--orphan-days", type=int, default=30,
+                         help="Min age (days) for orphan candidates")
+    p_dream.add_argument("--bloat-lines", type=int, default=500,
+                         help="Line threshold for bloated-file flag")
+    p_dream.add_argument("--bloat-bytes", type=int, default=10240,
+                         help="Byte threshold for bloated-file flag")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -473,6 +514,8 @@ def main():
         "verify": cmd_verify,
         "calibration": cmd_calibration,
         "freshness-scan": cmd_freshness_scan,
+        "ingest-session": cmd_ingest_session,
+        "dream-briefing": cmd_dream_briefing,
     }
 
     try:
