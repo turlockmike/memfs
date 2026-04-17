@@ -295,9 +295,20 @@ def count_queries(graph: Graph) -> int:
 # -------- Link edge operations --------
 
 def clear_link_edges_from(graph: Graph, source_path: str) -> None:
-    """Delete all LINK edges originating from a given node."""
+    """Delete LINK edges originating from a given node.
+
+    Only clears edges created from parsed ``[[wikilinks]]`` in the file itself
+    — i.e. edges whose ``source`` property is either ``"authored"`` or missing
+    (legacy edges predating the property). Edges attributed to dream/link-apply
+    (``source in {"content_similarity", "cosearch", ...}``) survive so that
+    rebuilding a node from its file content doesn't wipe the graph-level
+    structural signal. Authored edges always win: on re-index, old authored
+    edges are dropped and the current file's wikilinks are re-added.
+    """
     graph.run(
-        "MATCH (s:Node {path: $path})-[r:LINK]->() DELETE r",
+        """MATCH (s:Node {path: $path})-[r:LINK]->()
+           WHERE coalesce(r.source, 'authored') = 'authored'
+           DELETE r""",
         path=source_path,
     )
 
@@ -308,18 +319,29 @@ def upsert_link_edge(
     target_path: str,
     *,
     strength: float = 1.0,
+    source: str = "authored",
 ) -> None:
-    """Create or update a LINK edge. Creates a placeholder target node if missing
-    (strength indicates broken vs alive)."""
+    """Create or update a LINK edge. Creates a placeholder target node if
+    missing (``strength`` indicates broken vs alive).
+
+    The ``source`` property distinguishes authored wikilinks ("authored")
+    from graph-derived edges ("content_similarity", "cosearch", ...) so
+    that ``clear_link_edges_from`` can wipe only the authored class on
+    file re-index. An existing edge's source is preserved on re-upsert
+    (ON MATCH does NOT overwrite source) so authored-then-rederived edges
+    stay marked "authored".
+    """
     now = _now()
     graph.run(
         """MERGE (s:Node {path: $src})
            MERGE (t:Node {path: $tgt})
            MERGE (s)-[r:LINK]->(t)
            ON CREATE SET r.strength = $strength, r.created_at = $now,
-                         r.last_activated = $now, r.access_count = 0
+                         r.last_activated = $now, r.access_count = 0,
+                         r.source = $source
            ON MATCH  SET r.strength = $strength""",
         src=source_path, tgt=target_path, strength=strength, now=now,
+        source=source,
     )
 
 

@@ -473,10 +473,14 @@ def cmd_link_apply(args):
                     err({"error": "bad_nodes", "candidate": c})
                     continue
                 a, b = nodes
-                upsert_link_edge(graph, a, b, strength=args.strength)
+                # Carry the candidate's source label onto the edge so that
+                # clear_link_edges_from (file re-index) doesn't wipe it.
+                edge_source = c.get("source") or "dream"
+                upsert_link_edge(graph, a, b, strength=args.strength,
+                                 source=edge_source)
                 applied += 1
                 out({"applied": [a, b], "strength": args.strength,
-                     "source": c.get("source"),
+                     "source": edge_source,
                      "score": c.get("score"),
                      "cooccur_count": c.get("cooccur_count")})
         else:
@@ -484,9 +488,13 @@ def cmd_link_apply(args):
                 err({"error": "source_and_target_required",
                      "hint": "memfs link-apply <src> <tgt> OR --from-stdin"})
                 sys.exit(2)
-            upsert_link_edge(graph, args.source, args.target, strength=args.strength)
+            upsert_link_edge(graph, args.source, args.target,
+                             strength=args.strength,
+                             source=args.link_source)
             applied += 1
-            out({"applied": [args.source, args.target], "strength": args.strength})
+            out({"applied": [args.source, args.target],
+                 "strength": args.strength,
+                 "source": args.link_source})
     finally:
         graph.close()
     # Summary goes to stderr so stdout stays NDJSON-clean for piping
@@ -631,6 +639,12 @@ def main():
                            "Non-'link' candidate types are silently skipped.")
     p_la.add_argument("--strength", type=float, default=1.0,
                       help="Edge strength (default 1.0)")
+    p_la.add_argument("--link-source", default="manual",
+                      help="Edge source label for single-pair mode. "
+                           "Stdin mode carries each candidate's own source "
+                           "('content_similarity' | 'cosearch' | ...). "
+                           "Edges NOT labeled 'authored' survive file "
+                           "re-indexing. (default 'manual')")
 
     # Freshness (M5)
     sub.add_parser("freshness-scan", help="Report nodes with stale freshness stamps")

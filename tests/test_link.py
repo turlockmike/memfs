@@ -225,6 +225,67 @@ def test_link_apply_stdin_handles_bad_json(tmp_path, graph, monkeypatch):
     assert count_edges(graph, "link") == 1
 
 
+def test_dream_link_edges_survive_reindex(tmp_path, graph):
+    """Regression guard: edges created via link-apply must NOT be wiped when
+    the source file is re-indexed. Only authored (content [[wikilink]]) edges
+    are swept by clear_link_edges_from. This is what makes dream-derived
+    structural signal durable.
+    """
+    from memfs.cli import cmd_link_apply
+    from memfs.indexer import index_file
+    from memfs.graph import count_edges
+
+    mh = tmp_path / "mem"; mh.mkdir()
+    mem_home = str(mh)
+    for name in ("a.md", "b.md"):
+        _write(f"{mem_home}/{name}", f"# {name}\n\nbody\n")
+        index_file(graph, mem_home, name)
+
+    class Args:
+        from_stdin = False
+        strength = 1.0
+        source = "a.md"
+        target = "b.md"
+        link_source = "content_similarity"
+
+    cmd_link_apply(Args())
+    assert count_edges(graph, "link") == 1
+
+    # Now re-index a.md. Its file content has no [[wikilinks]], so the old
+    # authored-clear path would wipe the CS-derived edge we just created.
+    # The source-aware clear keeps it.
+    index_file(graph, mem_home, "a.md")
+    assert count_edges(graph, "link") == 1, (
+        "content_similarity edge was wiped by re-index — clear_link_edges_from "
+        "must spare non-authored edges"
+    )
+
+
+def test_authored_edges_still_cleared_on_reindex(tmp_path, graph):
+    """The flip side: authored edges from old content MUST be cleared when
+    the file no longer references them. Otherwise stale wikilinks persist
+    forever.
+    """
+    from memfs.indexer import index_file
+    from memfs.graph import count_edges
+
+    mh = tmp_path / "mem"; mh.mkdir()
+    mem_home = str(mh)
+
+    _write(f"{mem_home}/target.md", "# Target\n\nhello\n")
+    index_file(graph, mem_home, "target.md")
+
+    # v1: links to target
+    _write(f"{mem_home}/src.md", "# Source\n\nsee [[target.md]]\n")
+    index_file(graph, mem_home, "src.md")
+    assert count_edges(graph, "link") == 1
+
+    # v2: removes the link. The authored edge must be cleared.
+    _write(f"{mem_home}/src.md", "# Source\n\nunrelated content\n")
+    index_file(graph, mem_home, "src.md")
+    assert count_edges(graph, "link") == 0
+
+
 def test_link_apply_single_pair(tmp_path, graph):
     from memfs.cli import cmd_link_apply
     from memfs.graph import count_edges
@@ -240,6 +301,7 @@ def test_link_apply_single_pair(tmp_path, graph):
         strength = 0.8
         source = "a.md"
         target = "b.md"
+        link_source = "manual"
 
     cmd_link_apply(Args())
     assert count_edges(graph, "link") == 1
