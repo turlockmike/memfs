@@ -385,12 +385,19 @@ def cmd_verify(args):
 
 
 def cmd_calibration(args):
-    from memfs.calibration import calibration_curve
+    from memfs.calibration import calibration_curve, rebuild_from_ledger
     graph = _connect_or_die()
     try:
+        rebuild_stats = None
+        if getattr(args, "rebuild", False):
+            rebuild_stats = rebuild_from_ledger(
+                graph, mem_home=get_mem_home(args),
+            )
         curve = calibration_curve(graph, window_days=args.window, scope=args.scope)
     finally:
         graph.close()
+    if rebuild_stats is not None:
+        curve["rebuild"] = rebuild_stats
     out(curve)
 
 
@@ -616,6 +623,10 @@ def main():
     p_cal = sub.add_parser("calibration", help="Report calibration curve")
     p_cal.add_argument("--window", default="30d", type=_parse_window)
     p_cal.add_argument("--scope", default=None)
+    p_cal.add_argument("--rebuild", action="store_true",
+                       help="Replay JSONL ledger into Neo4j before querying. "
+                            "Use after a DB reset or when the cache drifts "
+                            "from the durable ledger.")
 
     # Link materialization (Apr 17 — bootstrapping empty juxtaposition surface)
     p_ls = sub.add_parser("link-suggest",

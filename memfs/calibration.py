@@ -165,3 +165,89 @@ def calibration_curve(graph, *, window_days: int = 30,
         "expected_calibration_error": round(ece, 4),
         "curve": curve,
     }
+
+
+def rebuild_from_ledger(graph, *, mem_home: str) -> dict:
+    """Replay the JSONL ledger to rebuild Claim nodes in Neo4j.
+
+    JSONL is the durable record (append-only, survives DB wipes). Neo4j
+    is the queryable cache. When they drift (observed Apr 17 after the
+    conftest wipe incident), this replays the ledger forward to restore
+    the cache.
+
+    Idempotent: claims use MERGE on id. Verifies SET only if verified_at
+    is null or differs, preserving the first verification.
+
+    Returns counts: {claims_seen, claims_written, verifies_seen,
+    verifies_applied, verifies_skipped_no_claim}.
+    """
+    path = _ledger_path(mem_home)
+    if not os.path.exists(path):
+        return {"claims_seen": 0, "claims_written": 0,
+                "verifies_seen": 0, "verifies_applied": 0,
+                "verifies_skipped_no_claim": 0}
+
+    stats = {"claims_seen": 0, "claims_written": 0,
+             "verifies_seen": 0, "verifies_applied": 0,
+             "verifies_skipped_no_claim": 0}
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = rec.get("event")
+
+            if event == "claim":
+                stats["claims_seen"] += 1
+                cid = rec.get("id")
+                if not cid:
+                    continue
+                # MERGE idempotently on id; first-writer-wins on fields
+                graph.run(
+                    """MERGE (c:Claim {id: $id})
+                       ON CREATE SET c.text = $text, c.confidence = $conf,
+                                     c.scope = $scope, c.claimed_at = $claimed_at,
+                                     c.claimed_to = $to, c.outcome = 'unverified',
+                                     c.verified_at = null
+                       ON MATCH SET c.text = coalesce(c.text, $text),
+                                    c.confidence = coalesce(c.confidence, $conf),
+                                    c.scope = coalesce(c.scope, $scope),
+                                    c.claimed_at = coalesce(c.claimed_at, $claimed_at),
+                                    c.claimed_to = coalesce(c.claimed_to, $to)""",
+                    id=cid,
+                    text=rec.get("text", ""),
+                    conf=float(rec.get("confidence", 0.0)),
+                    scope=rec.get("scope", ""),
+                    claimed_at=rec.get("claimed_at", ""),
+                    to=rec.get("claimed_to", "log"),
+                )
+                stats["claims_written"] += 1
+
+            elif event == "verify":
+                stats["verifies_seen"] += 1
+                cid = rec.get("id")
+                if not cid:
+                    continue
+                result = list(graph.run(
+                    """MATCH (c:Claim {id: $id})
+                       SET c.verified_at = coalesce(c.verified_at, $va),
+                           c.outcome = CASE
+                             WHEN c.outcome = 'unverified' OR c.outcome IS NULL
+                             THEN $outcome ELSE c.outcome END,
+                           c.note = coalesce(c.note, $note)
+                       RETURN c.id AS id""",
+                    id=cid, va=rec.get("verified_at", ""),
+                    outcome=rec.get("outcome", "unverified"),
+                    note=rec.get("note"),
+                ))
+                if result:
+                    stats["verifies_applied"] += 1
+                else:
+                    stats["verifies_skipped_no_claim"] += 1
+
+    return stats

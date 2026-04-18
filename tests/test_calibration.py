@@ -5,7 +5,7 @@ import os
 import pytest
 
 from memfs.calibration import (
-    record_claim, verify_claim, calibration_curve,
+    record_claim, verify_claim, calibration_curve, rebuild_from_ledger,
 )
 
 
@@ -143,3 +143,105 @@ class TestCalibrationCurve:
         s2 = calibration_curve(graph, window_days=30, scope="s2")
         assert s2["total_verified"] == 1
         assert s2["total_correct"] == 0
+
+
+class TestRebuildFromLedger:
+    """Guards against the Apr 17 Neo4j wipe: JSONL is durable, Neo4j is cache."""
+
+    def test_rebuild_empty_ledger(self, graph, tmp_path):
+        stats = rebuild_from_ledger(graph, mem_home=str(tmp_path))
+        assert stats["claims_seen"] == 0
+        assert stats["verifies_seen"] == 0
+
+    def test_rebuild_restores_claims_after_db_wipe(self, graph, tmp_path):
+        # Record a claim + verify via normal API (writes to both ledger and DB)
+        cid = record_claim(graph, text="X is true", confidence=0.9,
+                           scope="factual", mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="correct",
+                     mem_home=str(tmp_path))
+
+        # Simulate a DB wipe — JSONL survives (Apr 17 conftest incident)
+        graph.run("MATCH (c:Claim) DETACH DELETE c")
+        assert graph.run_one("MATCH (c:Claim) RETURN count(c) AS n")["n"] == 0
+
+        # Replay from the durable ledger
+        stats = rebuild_from_ledger(graph, mem_home=str(tmp_path))
+        assert stats["claims_written"] == 1
+        assert stats["verifies_applied"] == 1
+        assert stats["verifies_skipped_no_claim"] == 0
+
+        # Claim is back and verified — calibration query works again
+        curve = calibration_curve(graph, window_days=30)
+        assert curve["total_verified"] == 1
+        assert curve["total_correct"] == 1
+
+    def test_rebuild_is_idempotent(self, graph, tmp_path):
+        cid = record_claim(graph, text="Y", confidence=0.8, scope="s",
+                           mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="wrong",
+                     mem_home=str(tmp_path))
+
+        s1 = rebuild_from_ledger(graph, mem_home=str(tmp_path))
+        s2 = rebuild_from_ledger(graph, mem_home=str(tmp_path))
+
+        # Ledger events are processed both times (seen counts match), but the
+        # final DB state is the same — MERGE on id keeps it a single Claim.
+        assert s1 == s2
+        n = graph.run_one("MATCH (c:Claim {id: $id}) RETURN count(c) AS n",
+                          id=cid)["n"]
+        assert n == 1
+
+    def test_rebuild_preserves_first_verification(self, graph, tmp_path):
+        """Later verify events don't overwrite an earlier outcome."""
+        cid = record_claim(graph, text="Z", confidence=0.9, scope="s",
+                           mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="correct",
+                     mem_home=str(tmp_path))
+
+        # Manually append a spurious second verify event to the ledger
+        import json
+        ledger = tmp_path / ".mem" / "calibration.jsonl"
+        with open(ledger, "a") as f:
+            f.write(json.dumps({
+                "event": "verify", "id": cid, "outcome": "wrong",
+                "verified_at": "2099-01-01T00:00:00+00:00",
+            }) + "\n")
+
+        graph.run("MATCH (c:Claim) DETACH DELETE c")
+        rebuild_from_ledger(graph, mem_home=str(tmp_path))
+
+        row = graph.run_one(
+            "MATCH (c:Claim {id: $id}) RETURN c.outcome AS o", id=cid,
+        )
+        # First verify wins (coalesce semantics); later one is ignored.
+        assert row["o"] == "correct"
+
+    def test_rebuild_skips_verify_for_unknown_claim(self, graph, tmp_path):
+        """A verify event with no matching claim should be counted as skipped."""
+        import json
+        ledger_dir = tmp_path / ".mem"
+        ledger_dir.mkdir(exist_ok=True)
+        with open(ledger_dir / "calibration.jsonl", "w") as f:
+            f.write(json.dumps({
+                "event": "verify", "id": "ghost-id", "outcome": "correct",
+                "verified_at": "2026-04-17T00:00:00+00:00",
+            }) + "\n")
+
+        stats = rebuild_from_ledger(graph, mem_home=str(tmp_path))
+        assert stats["verifies_seen"] == 1
+        assert stats["verifies_applied"] == 0
+        assert stats["verifies_skipped_no_claim"] == 1
+
+    def test_rebuild_tolerates_malformed_lines(self, graph, tmp_path):
+        """Garbage lines in ledger are skipped, not crash."""
+        ledger_dir = tmp_path / ".mem"
+        ledger_dir.mkdir(exist_ok=True)
+        with open(ledger_dir / "calibration.jsonl", "w") as f:
+            f.write("not json\n")
+            f.write('{"event":"claim","id":"a","confidence":0.5,"scope":"s"}\n')
+            f.write("\n")  # empty line
+            f.write('{"event":"claim"}\n')  # missing id
+
+        stats = rebuild_from_ledger(graph, mem_home=str(tmp_path))
+        # Only the one well-formed claim-with-id succeeds
+        assert stats["claims_written"] == 1
