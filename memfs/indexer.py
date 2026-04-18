@@ -12,9 +12,24 @@ from memfs.parser import parse_file, compute_hash
 from memfs.paths import resolve_link
 from memfs import graph as graph_mod
 
-# Always ignored
-HARDCODED_IGNORES = [".mem", ".mem/*", ".git", ".git/*", "node_modules",
-                     "node_modules/*", "*.log", "*.tmp"]
+# Always ignored — VCS, dependency dirs, build caches, runtime temp files.
+# Python ecosystem entries added 2026-04-18 after the first access-report
+# surfaced `.pytest_cache/README.md` as dead-weight indexing noise in the
+# Karpathy corpus (evals/finance-forecaster/.pytest_cache/README.md had a
+# Node entry competing in full-text search with no real content signal).
+HARDCODED_IGNORES = [
+    ".mem", ".mem/*",
+    ".git", ".git/*",
+    "node_modules", "node_modules/*",
+    ".venv", ".venv/*",
+    "__pycache__", "__pycache__/*",
+    ".pytest_cache", ".pytest_cache/*",
+    ".mypy_cache", ".mypy_cache/*",
+    ".ruff_cache", ".ruff_cache/*",
+    "*.egg-info", "*.egg-info/*",
+    "*.pyc", "*.pyo",
+    "*.log", "*.tmp",
+]
 
 
 def load_memignore(mem_home: str) -> list[str]:

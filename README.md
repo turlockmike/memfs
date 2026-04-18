@@ -131,6 +131,36 @@ All output is NDJSON (one JSON object per line):
 {"nodes": 142, "edges": {"link": 87, "search": 310}, "queries": 45}
 ```
 
+## Testing
+
+Tests are destructive — each test wipes all `:Node`, `:Query`, `:Claim`, and
+`:Access` nodes in the target Neo4j instance. Running them against a
+production memfs graph will destroy data. This happened three times in
+24 hours on 2026-04-17/18 before the guards below were in place.
+
+Two guards protect against it:
+
+1. **Explicit opt-in.** Tests skip unless `MEMFS_TEST_ALLOW_WIPE=1` is set.
+2. **Node-count circuit breaker.** Tests skip if the target DB has more
+   than `MEMFS_TEST_MAX_EXISTING_NODES` (default 20) `:Node` nodes —
+   anything bigger is assumed to be production.
+
+The right way to run the suite is against a dedicated ephemeral DB:
+
+```bash
+# One-time: bring up test Neo4j on 7688 (prod is on 7687)
+docker compose -f docker-compose.test.yml up -d
+
+# Run tests
+MEMFS_NEO4J_URI=bolt://localhost:7688 \
+MEMFS_TEST_ALLOW_WIPE=1 \
+pytest
+```
+
+The test container uses no volume — every `down` wipes, every `up` is
+fresh. Don't bypass the circuit breaker by raising
+`MEMFS_TEST_MAX_EXISTING_NODES` — stand up the test DB instead.
+
 ## Documentation
 
 - [Design Document](docs/design/mem-cli-design.md) — full architecture, schema, decay model, implementation plan

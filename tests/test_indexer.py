@@ -111,6 +111,31 @@ class TestIndexDirectory:
         paths = [n["path"] for n in graph.run("MATCH (n:Node) RETURN n.path AS path")]
         assert all(not p.startswith(".mem") for p in paths)
 
+    def test_skips_python_ecosystem_junk(self, graph, tmp_path):
+        """Regression: .pytest_cache/README.md was ending up in the karpathy
+        corpus until the Apr 18 HARDCODED_IGNORES expansion. Also covers the
+        other Python cache directories added at the same time."""
+        (tmp_path / "real.md").write_text("# Real content")
+        for junk_dir in (".pytest_cache", "__pycache__", ".mypy_cache",
+                         ".ruff_cache", ".venv", "foo.egg-info"):
+            os.makedirs(tmp_path / junk_dir)
+            (tmp_path / junk_dir / "README.md").write_text(
+                f"# Should not index — {junk_dir}"
+            )
+        # File-level ignore
+        (tmp_path / "compiled.pyc").write_text("bytecode")
+        index_directory(graph, str(tmp_path))
+        paths = [n["path"] for n in graph.run(
+            "MATCH (n:Node) RETURN n.path AS path"
+        )]
+        assert "real.md" in paths
+        for junk in (".pytest_cache", "__pycache__", ".mypy_cache",
+                     ".ruff_cache", ".venv", "foo.egg-info"):
+            assert not any(p.startswith(junk) for p in paths), (
+                f"{junk} leaked into index: {paths}"
+            )
+        assert "compiled.pyc" not in paths
+
 
 class TestReindex:
     def test_rebuilds_from_scratch(self, graph, tmp_path):
