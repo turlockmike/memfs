@@ -3,7 +3,7 @@
 import pytest
 
 from memfs.indexer import index_file
-from memfs.contradiction import detect_contradictions
+from memfs.contradiction import detect_contradictions, scan_corpus
 
 
 class TestDetection:
@@ -118,3 +118,117 @@ class TestWatcherIntegration:
         assert any('"event": "conflict"' in l for l in lines) or any(
             '"event":"conflict"' in l for l in lines
         )
+
+
+class TestScanCorpus:
+    """Batch-scan entry point — the path reindex uses (watcher bypass).
+
+    Motivation: viable-memory S2 absorption requires contradiction detection
+    to run not just incrementally (watcher) but also across the full corpus
+    on demand (post-reindex, scheduled sweep, manual audit).
+    """
+
+    def test_empty_corpus(self, graph, tmp_path):
+        """Empty corpus → scanned=0, no edges, no conflicts."""
+        result = scan_corpus(graph)
+        assert result["scanned"] == 0
+        assert result["conflicts"] == []
+        assert result["edges_created"] == 0
+
+    def test_skips_layer_2_nodes(self, graph, tmp_path):
+        """Only layer-3+ nodes are scanned."""
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 2\n---\nX is always correct."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 2\n---\nX is never correct."
+        )
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+        result = scan_corpus(graph)
+        assert result["scanned"] == 0
+        assert result["edges_created"] == 0
+
+    def test_finds_cross_node_contradictions(self, graph, tmp_path):
+        """Two layer-3 nodes with reversal bigram → one conflict, one pair."""
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nRouting is always enabled in production."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nRouting is never enabled in production."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        result = scan_corpus(graph)
+        assert result["scanned"] == 2  # a.md and b.md (layer 3)
+        # Dedupe by sorted pair; one conflict regardless of A->B / B->A both firing
+        assert len(result["conflicts"]) == 1
+        pair = result["conflicts"][0]
+        assert sorted([pair["new"], pair["existing"]]) == ["a.md", "b.md"]
+        assert "reversal" in pair["reason"]
+
+    def test_idempotent_across_runs(self, graph, tmp_path):
+        """Re-running produces no new edges (MERGE semantics)."""
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nFeature X works correctly."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nFeature X is broken."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        r1 = scan_corpus(graph)
+        r2 = scan_corpus(graph)
+        assert r1["scanned"] == r2["scanned"]
+        # First run may or may not create edges (depends on detector heuristics);
+        # either way second run creates none.
+        assert r2["edges_created"] == 0
+
+    def test_no_conflicts_between_unrelated_layer_3(self, graph, tmp_path):
+        """Low-overlap nodes produce no conflicts even at layer 3+."""
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nThe pool filter runs weekly."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nKalshi markets settle at resolution."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        result = scan_corpus(graph)
+        assert result["scanned"] == 2
+        assert result["conflicts"] == []
+        assert result["edges_created"] == 0
+
+    def test_dedupes_bidirectional_pairs(self, graph, tmp_path):
+        """A->B and B->A of the same pair count once in `conflicts`."""
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nService is enabled globally."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nService is disabled globally."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        result = scan_corpus(graph)
+        # Pair seen from both ends; conflicts list carries exactly one entry
+        assert len(result["conflicts"]) == 1

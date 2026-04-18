@@ -78,6 +78,59 @@ def _suspected_contradiction(text_a: str, text_b: str) -> tuple[bool, str]:
     return False, ""
 
 
+def scan_corpus(graph, *, overlap_threshold: float = 0.35,
+                candidate_limit: int = 10) -> dict:
+    """Run contradiction detection across all layer-3+ nodes in the corpus.
+
+    The watcher-path invokes detect_contradictions() incrementally as files
+    are written. This function batch-runs the same detection across every
+    existing layer-3+ node — useful after a reindex (which doesn't trigger
+    the watcher) or periodically as a consistency scan.
+
+    Returns a dict with counts + list of conflict dicts:
+      {"scanned": N, "conflicts": [...], "edges_created": K}
+
+    Idempotent: underlying MERGE on the [:CONTRADICTS] edge means re-scans
+    don't double-count. Bidirectional edges are counted per-direction in
+    Neo4j but the same pair in the conflicts list once.
+    """
+    # Find all layer-3+ nodes
+    paths = [row["path"] for row in graph.run(
+        "MATCH (n:Node) WHERE n.layer IS NOT NULL AND n.layer >= 3 "
+        "RETURN n.path AS path ORDER BY n.path"
+    )]
+
+    # Before-edge count to derive edges_created (accounts for idempotent MERGE)
+    before = graph.run_one(
+        "MATCH ()-[r:CONTRADICTS]->() RETURN count(r) AS n"
+    )["n"]
+
+    conflicts = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for p in paths:
+        for c in detect_contradictions(
+            graph, p,
+            overlap_threshold=overlap_threshold,
+            candidate_limit=candidate_limit,
+        ):
+            # Dedupe pair ordering — the detector runs both directions by
+            # construction (A->B and later B->A would both return the pair).
+            key = tuple(sorted((c["new"], c["existing"])))
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                conflicts.append(c)
+
+    after = graph.run_one(
+        "MATCH ()-[r:CONTRADICTS]->() RETURN count(r) AS n"
+    )["n"]
+
+    return {
+        "scanned": len(paths),
+        "conflicts": conflicts,
+        "edges_created": after - before,
+    }
+
+
 def detect_contradictions(graph, new_node_path: str,
                           *, overlap_threshold: float = 0.35,
                           candidate_limit: int = 10) -> list[dict]:

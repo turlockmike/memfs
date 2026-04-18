@@ -407,6 +407,21 @@ def cmd_calibration(args):
     out(curve)
 
 
+def cmd_contradictions_scan(args):
+    """Run S2 contradiction detection across all layer-3+ nodes."""
+    from memfs.contradiction import scan_corpus
+    graph = _connect_or_die()
+    try:
+        result = scan_corpus(
+            graph,
+            overlap_threshold=args.overlap_threshold,
+            candidate_limit=args.candidate_limit,
+        )
+    finally:
+        graph.close()
+    out(result)
+
+
 def cmd_ingest_session(args):
     """Ingest a Claude Code session jsonl into memfs."""
     from memfs.ingest import ingest_session
@@ -682,6 +697,23 @@ def main():
     # Freshness (M5)
     sub.add_parser("freshness-scan", help="Report nodes with stale freshness stamps")
 
+    # Contradiction batch scan (S2 — viable-memory absorption step)
+    p_contra = sub.add_parser(
+        "contradictions-scan",
+        help="Batch-scan all layer-3+ nodes for contradictions. "
+             "Complements the watcher-driven detection by running the same "
+             "detector over the full corpus — useful after reindex or "
+             "periodic consistency checks.",
+    )
+    p_contra.add_argument("--overlap-threshold", dest="overlap_threshold",
+                          type=float, default=0.35,
+                          help="Min token-jaccard overlap for a candidate "
+                               "pair to be considered (default 0.35)")
+    p_contra.add_argument("--candidate-limit", dest="candidate_limit",
+                          type=int, default=10,
+                          help="Max fulltext candidates to compare per node "
+                               "(default 10)")
+
     # Session ingestion (Apr 17)
     p_ingest = sub.add_parser("ingest-session",
                               help="Ingest a Claude Code session jsonl")
@@ -718,6 +750,7 @@ def main():
         "verify": cmd_verify,
         "calibration": cmd_calibration,
         "freshness-scan": cmd_freshness_scan,
+        "contradictions-scan": cmd_contradictions_scan,
         "ingest-session": cmd_ingest_session,
         "dream-briefing": cmd_dream_briefing,
         "link-suggest": cmd_link_suggest,
