@@ -30,8 +30,24 @@ def _append_ledger(mem_home: str, record: dict) -> None:
 
 
 def record_claim(graph, *, text: str, confidence: float, scope: str,
-                 claimed_to: str = "log", mem_home: str | None = None) -> str:
-    """Record a new claim. Returns claim_id (UUID)."""
+                 claimed_to: str = "log",
+                 source: str | None = None,
+                 mem_home: str | None = None) -> str:
+    """Record a new claim. Returns claim_id (UUID).
+
+    `source` is an optional provenance pointer: the evidence this claim
+    derives from. Recommended schemes:
+
+      file:<absolute-path>          — claim derives from a specific file
+      tool:<tool-name>              — claim derives from a CLI tool output
+      session:<session-id>          — claim derives from a session turn
+      llm:<model-name>              — claim is model-generated without external grounding
+      manual                        — operator asserted directly, no evidence
+
+    Unscoped free-form strings are allowed. The first colon-delimited token
+    is used as the "source_type" in breakdown reports; everything after is
+    the "source_ref".
+    """
     if not 0.0 <= confidence <= 1.0:
         raise ValueError(f"confidence must be in [0, 1], got {confidence}")
     if not text or not text.strip():
@@ -45,19 +61,22 @@ def record_claim(graph, *, text: str, confidence: float, scope: str,
     graph.run(
         """CREATE (c:Claim {
              id: $id, text: $text, confidence: $conf, scope: $scope,
-             claimed_at: $now, claimed_to: $to,
+             claimed_at: $now, claimed_to: $to, source: $source,
              verified_at: null, outcome: 'unverified'
            })""",
         id=claim_id, text=text, conf=float(confidence), scope=scope,
-        now=now, to=claimed_to,
+        now=now, to=claimed_to, source=source,
     )
 
     if mem_home:
-        _append_ledger(mem_home, {
+        rec = {
             "event": "claim",
             "id": claim_id, "text": text, "confidence": confidence,
             "scope": scope, "claimed_to": claimed_to, "claimed_at": now,
-        })
+        }
+        if source is not None:
+            rec["source"] = source
+        _append_ledger(mem_home, rec)
 
     return claim_id
 
@@ -88,13 +107,30 @@ def verify_claim(graph, *, claim_id: str, outcome: str,
         })
 
 
+def _source_type(source: str | None) -> str:
+    """Extract the type prefix from a source string: 'file:/x' -> 'file',
+    'manual' -> 'manual', None -> 'unknown'."""
+    if not source:
+        return "unknown"
+    if ":" in source:
+        return source.split(":", 1)[0]
+    return source
+
+
 def calibration_curve(graph, *, window_days: int = 30,
-                      scope: str | None = None) -> dict:
+                      scope: str | None = None,
+                      source_type: str | None = None,
+                      include_source_breakdown: bool = False) -> dict:
     """Return the calibration curve over the last `window_days`.
 
     Buckets verified claims by confidence (0.0-1.0 in 0.1 bins), then computes
     actual correctness rate per bin. A well-calibrated agent has
     correctness_rate ≈ bin_center.
+
+    If `source_type` is given (e.g. 'file', 'tool', 'llm'), only claims whose
+    source prefix matches are counted. If `include_source_breakdown` is true,
+    the return dict gains a 'by_source' key mapping source_type to per-source
+    accuracy + n.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
 
@@ -104,13 +140,18 @@ def calibration_curve(graph, *, window_days: int = 30,
         "  AND c.verified_at >= $cutoff "
         + ("  AND c.scope = $scope " if scope else "")
         + "RETURN c.confidence AS confidence, c.outcome AS outcome, "
-        "c.scope AS scope"
+        "c.scope AS scope, c.source AS source"
     )
     params = {"cutoff": cutoff}
     if scope:
         params["scope"] = scope
 
-    rows = graph.run(cypher, **params)
+    all_rows = list(graph.run(cypher, **params))
+    # Apply source_type filter in Python so source_breakdown can see all rows
+    if source_type:
+        rows = [r for r in all_rows if _source_type(r["source"]) == source_type]
+    else:
+        rows = all_rows
 
     # Bins: [0.0-0.1), [0.1-0.2), ..., [0.9-1.0]
     bins = defaultdict(lambda: {"n": 0, "correct": 0, "partial": 0, "wrong": 0})
@@ -155,9 +196,10 @@ def calibration_curve(graph, *, window_days: int = 30,
             mid = (row["bin_low"] + row["bin_high"]) / 2
             ece += (row["n"] / total) * abs(mid - row["observed_accuracy"])
 
-    return {
+    result = {
         "window_days": window_days,
         "scope": scope,
+        "source_type": source_type,
         "total_verified": total,
         "total_correct": total_correct,
         "total_partial": total_partial,
@@ -165,6 +207,34 @@ def calibration_curve(graph, *, window_days: int = 30,
         "expected_calibration_error": round(ece, 4),
         "curve": curve,
     }
+
+    if include_source_breakdown:
+        # Aggregate across all rows (ignoring the source_type filter — the
+        # breakdown's job is to show where the errors cluster).
+        per_source = defaultdict(lambda: {"n": 0, "correct": 0, "partial": 0, "wrong": 0})
+        for row in all_rows:
+            stype = _source_type(row["source"])
+            per_source[stype]["n"] += 1
+            outcome = row["outcome"]
+            if outcome in ("correct", "partial", "wrong"):
+                per_source[stype][outcome] += 1
+        breakdown = {}
+        for stype, agg in sorted(per_source.items()):
+            n = agg["n"]
+            if n > 0:
+                acc = (agg["correct"] + 0.5 * agg["partial"]) / n
+            else:
+                acc = 0.0
+            breakdown[stype] = {
+                "n": n,
+                "correct": agg["correct"],
+                "partial": agg["partial"],
+                "wrong": agg["wrong"],
+                "accuracy": round(acc, 4),
+            }
+        result["by_source"] = breakdown
+
+    return result
 
 
 def rebuild_from_ledger(graph, *, mem_home: str) -> dict:
@@ -212,19 +282,22 @@ def rebuild_from_ledger(graph, *, mem_home: str) -> dict:
                     """MERGE (c:Claim {id: $id})
                        ON CREATE SET c.text = $text, c.confidence = $conf,
                                      c.scope = $scope, c.claimed_at = $claimed_at,
-                                     c.claimed_to = $to, c.outcome = 'unverified',
+                                     c.claimed_to = $to, c.source = $source,
+                                     c.outcome = 'unverified',
                                      c.verified_at = null
                        ON MATCH SET c.text = coalesce(c.text, $text),
                                     c.confidence = coalesce(c.confidence, $conf),
                                     c.scope = coalesce(c.scope, $scope),
                                     c.claimed_at = coalesce(c.claimed_at, $claimed_at),
-                                    c.claimed_to = coalesce(c.claimed_to, $to)""",
+                                    c.claimed_to = coalesce(c.claimed_to, $to),
+                                    c.source = coalesce(c.source, $source)""",
                     id=cid,
                     text=rec.get("text", ""),
                     conf=float(rec.get("confidence", 0.0)),
                     scope=rec.get("scope", ""),
                     claimed_at=rec.get("claimed_at", ""),
                     to=rec.get("claimed_to", "log"),
+                    source=rec.get("source"),
                 )
                 stats["claims_written"] += 1
 

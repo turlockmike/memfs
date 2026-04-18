@@ -335,6 +335,7 @@ def cmd_claim(args):
                         confidence=float(obj["confidence"]),
                         scope=obj.get("scope", args.scope or "general"),
                         claimed_to=obj.get("to", args.to or "log"),
+                        source=obj.get("source", args.source),
                         mem_home=mem_home,
                     )
                     out({"action": "claim", "claim_id": claim_id,
@@ -363,6 +364,7 @@ def cmd_claim(args):
             confidence=args.confidence,
             scope=args.scope,
             claimed_to=args.to,
+            source=args.source,
             mem_home=mem_home,
         )
     finally:
@@ -393,7 +395,11 @@ def cmd_calibration(args):
             rebuild_stats = rebuild_from_ledger(
                 graph, mem_home=get_mem_home(args),
             )
-        curve = calibration_curve(graph, window_days=args.window, scope=args.scope)
+        curve = calibration_curve(
+            graph, window_days=args.window, scope=args.scope,
+            source_type=getattr(args, "source_type", None),
+            include_source_breakdown=getattr(args, "by_source", False),
+        )
     finally:
         graph.close()
     if rebuild_stats is not None:
@@ -609,10 +615,17 @@ def main():
     p_claim.add_argument("--to", default=None,
                          help="Recipient label (default 'log'; "
                               "in --auto mode, used as default)")
+    p_claim.add_argument("--source", default=None,
+                         help="Provenance pointer. Convention: "
+                              "'file:<abs-path>', 'tool:<name>', "
+                              "'session:<id>', 'llm:<model>', 'manual'. "
+                              "Unscoped strings are allowed; the prefix "
+                              "before the first ':' is used for "
+                              "source-type breakdowns in calibration.")
     p_claim.add_argument("--auto", action="store_true",
                          help="Batch mode: read JSON lines from stdin. "
                               "Each line: {\"text\":..., \"confidence\":..., "
-                              "\"scope\":..., \"to\":...}")
+                              "\"scope\":..., \"to\":..., \"source\":...}")
 
     p_verify = sub.add_parser("verify", help="Verify a claim outcome")
     p_verify.add_argument("claim_id")
@@ -623,6 +636,15 @@ def main():
     p_cal = sub.add_parser("calibration", help="Report calibration curve")
     p_cal.add_argument("--window", default="30d", type=_parse_window)
     p_cal.add_argument("--scope", default=None)
+    p_cal.add_argument("--source-type", dest="source_type", default=None,
+                       help="Filter claims by source prefix (e.g. 'file', "
+                            "'tool', 'llm', 'manual'). The prefix is the "
+                            "token before the first ':' in the source field.")
+    p_cal.add_argument("--by-source", dest="by_source", action="store_true",
+                       help="Include per-source-type accuracy breakdown in "
+                            "the output. Shows n/correct/partial/wrong per "
+                            "source so you can see which evidence paths "
+                            "produce unreliable claims.")
     p_cal.add_argument("--rebuild", action="store_true",
                        help="Replay JSONL ledger into Neo4j before querying. "
                             "Use after a DB reset or when the cache drifts "

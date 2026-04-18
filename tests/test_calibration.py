@@ -6,6 +6,7 @@ import pytest
 
 from memfs.calibration import (
     record_claim, verify_claim, calibration_curve, rebuild_from_ledger,
+    _source_type,
 )
 
 
@@ -245,3 +246,140 @@ class TestRebuildFromLedger:
         stats = rebuild_from_ledger(graph, mem_home=str(tmp_path))
         # Only the one well-formed claim-with-id succeeds
         assert stats["claims_written"] == 1
+
+
+class TestSourceType:
+    """The prefix extractor that powers per-source-type calibration."""
+
+    def test_colon_prefix(self):
+        assert _source_type("file:/home/mike/.config/karpathy/playbook.md") == "file"
+        assert _source_type("tool:telegram-history") == "tool"
+        assert _source_type("session:abc-123") == "session"
+        assert _source_type("llm:claude-opus-4-7") == "llm"
+
+    def test_no_colon(self):
+        assert _source_type("manual") == "manual"
+        assert _source_type("unknown-token") == "unknown-token"
+
+    def test_none_and_empty(self):
+        assert _source_type(None) == "unknown"
+        assert _source_type("") == "unknown"
+
+
+class TestProvenance:
+    """S3* provenance — every claim records the evidence it derives from."""
+
+    def test_claim_stores_source_in_node(self, graph, tmp_path):
+        cid = record_claim(
+            graph, text="X", confidence=0.8, scope="factual",
+            source="file:/tmp/evidence.md", mem_home=str(tmp_path),
+        )
+        row = graph.run_one(
+            "MATCH (c:Claim {id: $id}) RETURN c.source AS s", id=cid,
+        )
+        assert row["s"] == "file:/tmp/evidence.md"
+
+    def test_claim_source_optional(self, graph, tmp_path):
+        """Claims without a source still work (backward compatibility)."""
+        cid = record_claim(
+            graph, text="X", confidence=0.8, scope="factual",
+            mem_home=str(tmp_path),
+        )
+        row = graph.run_one(
+            "MATCH (c:Claim {id: $id}) RETURN c.source AS s", id=cid,
+        )
+        assert row["s"] is None
+
+    def test_source_written_to_ledger(self, graph, tmp_path):
+        import json as _json
+        cid = record_claim(
+            graph, text="X", confidence=0.8, scope="factual",
+            source="tool:memfs-grep", mem_home=str(tmp_path),
+        )
+        line = (tmp_path / ".mem" / "calibration.jsonl").read_text().strip()
+        rec = _json.loads(line)
+        assert rec["source"] == "tool:memfs-grep"
+        assert rec["id"] == cid
+
+    def test_ledger_omits_source_when_none(self, graph, tmp_path):
+        import json as _json
+        record_claim(
+            graph, text="X", confidence=0.5, scope="s",
+            mem_home=str(tmp_path),
+        )
+        line = (tmp_path / ".mem" / "calibration.jsonl").read_text().strip()
+        rec = _json.loads(line)
+        assert "source" not in rec
+
+    def test_calibration_filters_by_source_type(self, graph, tmp_path):
+        # 2 file-sourced correct, 1 tool-sourced wrong
+        for _ in range(2):
+            cid = record_claim(graph, text="file claim", confidence=0.9,
+                               scope="s", source="file:/x",
+                               mem_home=str(tmp_path))
+            verify_claim(graph, claim_id=cid, outcome="correct",
+                         mem_home=str(tmp_path))
+        cid = record_claim(graph, text="tool claim", confidence=0.9,
+                           scope="s", source="tool:y",
+                           mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="wrong",
+                     mem_home=str(tmp_path))
+
+        file_curve = calibration_curve(graph, window_days=30,
+                                       source_type="file")
+        assert file_curve["total_verified"] == 2
+        assert file_curve["overall_accuracy"] == 1.0
+
+        tool_curve = calibration_curve(graph, window_days=30,
+                                       source_type="tool")
+        assert tool_curve["total_verified"] == 1
+        assert tool_curve["overall_accuracy"] == 0.0
+
+    def test_calibration_source_breakdown(self, graph, tmp_path):
+        # 2 file correct, 1 tool wrong, 1 llm correct
+        for _ in range(2):
+            cid = record_claim(graph, text="f", confidence=0.9, scope="s",
+                               source="file:/a", mem_home=str(tmp_path))
+            verify_claim(graph, claim_id=cid, outcome="correct",
+                         mem_home=str(tmp_path))
+        cid = record_claim(graph, text="t", confidence=0.9, scope="s",
+                           source="tool:b", mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="wrong",
+                     mem_home=str(tmp_path))
+        cid = record_claim(graph, text="l", confidence=0.9, scope="s",
+                           source="llm:claude", mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="correct",
+                     mem_home=str(tmp_path))
+
+        curve = calibration_curve(graph, window_days=30,
+                                  include_source_breakdown=True)
+        by_src = curve["by_source"]
+        assert by_src["file"]["n"] == 2 and by_src["file"]["accuracy"] == 1.0
+        assert by_src["tool"]["n"] == 1 and by_src["tool"]["accuracy"] == 0.0
+        assert by_src["llm"]["n"] == 1 and by_src["llm"]["accuracy"] == 1.0
+
+    def test_rebuild_preserves_source(self, graph, tmp_path):
+        cid = record_claim(graph, text="X", confidence=0.8, scope="s",
+                           source="file:/evidence.md", mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="correct",
+                     mem_home=str(tmp_path))
+
+        # Wipe, replay — source should come back
+        graph.run("MATCH (c:Claim) DETACH DELETE c")
+        rebuild_from_ledger(graph, mem_home=str(tmp_path))
+
+        row = graph.run_one(
+            "MATCH (c:Claim {id: $id}) RETURN c.source AS s", id=cid,
+        )
+        assert row["s"] == "file:/evidence.md"
+
+    def test_breakdown_unknown_for_legacy_claims(self, graph, tmp_path):
+        """Claims from before provenance shipped (no source field) bucket as 'unknown'."""
+        cid = record_claim(graph, text="legacy", confidence=0.8, scope="s",
+                           mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="correct",
+                     mem_home=str(tmp_path))
+        curve = calibration_curve(graph, window_days=30,
+                                  include_source_breakdown=True)
+        assert curve["by_source"]["unknown"]["n"] == 1
+        assert curve["by_source"]["unknown"]["accuracy"] == 1.0
