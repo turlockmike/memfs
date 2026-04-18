@@ -17,6 +17,9 @@ from memfs.indexer import index_directory, reindex as do_reindex
 from memfs.search import grep as do_grep
 from memfs.decay import run_decay
 from memfs.watcher import start_watcher, stop_watcher, watcher_status
+from memfs.access import (
+    access_summary, hot_nodes, cold_nodes, empty_hit_queries,
+)
 
 
 def out(obj):
@@ -529,6 +532,43 @@ def cmd_link_apply(args):
     err({"summary": {"applied": applied, "skipped": skipped, "errors": errors}})
 
 
+def cmd_access_report(args):
+    """Report on grep retrieval patterns.
+
+    Default output = summary (total accesses, hits, empty hits, distinct
+    queries, distinct nodes touched) in the window.
+
+    --kind hot   : nodes retrieved most often
+    --kind cold  : nodes not retrieved in the window (or never)
+    --kind empty : queries that returned 0 results (memory gaps)
+    """
+    graph = _connect_or_die()
+    try:
+        kind = getattr(args, "kind", None)
+        window = getattr(args, "window_days", None)
+        limit = getattr(args, "limit", 20)
+
+        if kind in (None, "summary"):
+            out(access_summary(graph, window_days=window))
+            return
+
+        if kind == "hot":
+            rows = hot_nodes(graph, window_days=window, limit=limit)
+        elif kind == "cold":
+            rows = cold_nodes(graph, window_days=window, limit=limit)
+        elif kind == "empty":
+            rows = empty_hit_queries(graph, window_days=window, limit=limit)
+        else:
+            err({"error": "unknown_kind", "kind": kind,
+                 "allowed": ["summary", "hot", "cold", "empty"]})
+            sys.exit(2)
+
+        for row in rows:
+            out(row)
+    finally:
+        graph.close()
+
+
 def cmd_freshness_scan(args):
     """Report nodes whose freshness is stale. Auto-refresh is future work."""
     graph = _connect_or_die()
@@ -694,6 +734,25 @@ def main():
                            "Edges NOT labeled 'authored' survive file "
                            "re-indexing. (default 'manual')")
 
+    # Access-frequency report (viable-memory S3 quality control)
+    p_access = sub.add_parser(
+        "access-report",
+        help="Report on retrieval patterns from grep (hot/cold nodes, "
+             "empty-hit queries). Each grep call logs one (:Access) node; "
+             "this reads that log.",
+    )
+    p_access.add_argument("--kind", default="summary",
+                          choices=["summary", "hot", "cold", "empty"],
+                          help="summary: totals; hot: most-retrieved nodes; "
+                               "cold: nodes not retrieved in window; "
+                               "empty: queries that returned no results.")
+    p_access.add_argument("--window-days", dest="window_days", type=int,
+                          default=7,
+                          help="Time window in days (default 7). 0 or "
+                               "negative = all time.")
+    p_access.add_argument("--limit", type=int, default=20,
+                          help="Max rows to emit (default 20)")
+
     # Freshness (M5)
     sub.add_parser("freshness-scan", help="Report nodes with stale freshness stamps")
 
@@ -750,6 +809,7 @@ def main():
         "verify": cmd_verify,
         "calibration": cmd_calibration,
         "freshness-scan": cmd_freshness_scan,
+        "access-report": cmd_access_report,
         "contradictions-scan": cmd_contradictions_scan,
         "ingest-session": cmd_ingest_session,
         "dream-briefing": cmd_dream_briefing,

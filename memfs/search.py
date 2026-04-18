@@ -13,6 +13,7 @@ import string
 from datetime import datetime, timezone, date as date_type, timedelta
 
 from memfs import graph as graph_mod
+from memfs.access import log_access
 
 
 def normalize_query(query_text: str) -> str:
@@ -115,6 +116,12 @@ def grep(graph, query: str, limit: int = 20, layer: int | None = None,
 
     lucene_query = _escape_lucene(clean_query)
     if not lucene_query:
+        # Log the empty-hit attempt so we can see unparseable queries too.
+        try:
+            log_access(graph, query, normalize_query(query), [],
+                       status="empty_hit")
+        except Exception:
+            pass
         return []
 
     # Over-fetch so we can re-rank after temporal boost
@@ -122,6 +129,11 @@ def grep(graph, query: str, limit: int = 20, layer: int | None = None,
         graph, lucene_query, limit=limit * 3, layer=layer,
     )
     if not raw:
+        try:
+            log_access(graph, query, normalize_query(query), [],
+                       status="empty_hit")
+        except Exception:
+            pass
         return []
 
     results = []
@@ -178,12 +190,20 @@ def grep(graph, query: str, limit: int = 20, layer: int | None = None,
             graph, query_id, result["path"], rank=i + 1,
             rank_weight=rank_weights[i],
         )
-        graph_mod.update_node_search_tracking(graph, result["path"])
+
+    # Track ALL returned nodes on the Node counter, not just top-3.
+    # The top-3 get search edges; ranks 4-N still count as "retrieved"
+    # for bloat/hot/cold analysis.
+    for r in results:
+        graph_mod.update_node_search_tracking(graph, r["path"])
 
     # Attach edge_strength
     for r in results:
         r["edge_strength"] = graph_mod.get_search_edge_strength(
             graph, query_id, r["path"],
         )
+
+    # Access log — always called. Failure is swallowed inside log_access.
+    log_access(graph, query, query_id, results, status="hit")
 
     return results

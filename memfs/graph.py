@@ -16,6 +16,8 @@ Schema:
     (n:Node)-[:DERIVED_FROM {extraction_type, created_at}]->(src:Node)
     (n:Node)-[:CLAIMS_ABOUT {created_at}]->(c:Claim)
     (a:Claim)-[:CONTRADICTS {detected_at, adjudicated}]->(b:Claim)
+    (:Access {id, ts, query_text, query_id, result_count, status})
+    (a:Access)-[:RETRIEVED {rank}]->(n:Node)
 
 Full-text index:
     node_content ON Node(title, description, content)
@@ -146,11 +148,14 @@ _SCHEMA_STATEMENTS = [
     "CREATE CONSTRAINT node_path_unique IF NOT EXISTS FOR (n:Node) REQUIRE n.path IS UNIQUE",
     "CREATE CONSTRAINT query_id_unique IF NOT EXISTS FOR (q:Query) REQUIRE q.id IS UNIQUE",
     "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (c:Claim) REQUIRE c.id IS UNIQUE",
+    "CREATE CONSTRAINT access_id_unique IF NOT EXISTS FOR (a:Access) REQUIRE a.id IS UNIQUE",
     "CREATE CONSTRAINT meta_key_unique IF NOT EXISTS FOR (m:Meta) REQUIRE m.key IS UNIQUE",
     # Search-performance indexes
     "CREATE INDEX node_layer IF NOT EXISTS FOR (n:Node) ON (n.layer)",
     "CREATE INDEX node_modified IF NOT EXISTS FOR (n:Node) ON (n.modified_at)",
     "CREATE INDEX node_last_searched IF NOT EXISTS FOR (n:Node) ON (n.last_searched)",
+    "CREATE INDEX access_ts IF NOT EXISTS FOR (a:Access) ON (a.ts)",
+    "CREATE INDEX access_status IF NOT EXISTS FOR (a:Access) ON (a.status)",
     # Full-text index for grep (Lucene-based, BM25 scoring native)
     (
         "CREATE FULLTEXT INDEX node_content IF NOT EXISTS "
@@ -163,10 +168,13 @@ _DROP_STATEMENTS = [
     "DROP CONSTRAINT node_path_unique IF EXISTS",
     "DROP CONSTRAINT query_id_unique IF EXISTS",
     "DROP CONSTRAINT claim_id_unique IF EXISTS",
+    "DROP CONSTRAINT access_id_unique IF EXISTS",
     "DROP CONSTRAINT meta_key_unique IF EXISTS",
     "DROP INDEX node_layer IF EXISTS",
     "DROP INDEX node_modified IF EXISTS",
     "DROP INDEX node_last_searched IF EXISTS",
+    "DROP INDEX access_ts IF EXISTS",
+    "DROP INDEX access_status IF EXISTS",
     "DROP INDEX node_content IF EXISTS",
 ]
 
