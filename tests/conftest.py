@@ -24,6 +24,20 @@ from memfs.graph import create_db, connect, clear_data
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _disable_semantic_contradiction():
+    """Tests run without calling `infer` — heuristic-only semantics.
+
+    The production detector calls `infer -r contradiction-judge` as a
+    subprocess to semantically verify heuristic candidates. That would be
+    (a) slow, (b) non-deterministic, and (c) require infer + ollama to be
+    running in CI. Setting this env var bypasses the semantic stage so
+    tests validate the heuristic + edge-creation paths only. The semantic
+    path has its own dedicated tests that mock subprocess explicitly.
+    """
+    os.environ["MEMFS_CONTRADICTION_SKIP_SEMANTIC"] = "1"
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _ensure_schema():
     """Create schema once per session; tests wipe data each run."""
     if os.environ.get("MEMFS_TEST_ALLOW_WIPE") != "1":

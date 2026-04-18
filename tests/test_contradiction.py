@@ -1,9 +1,24 @@
-"""Tests for M4 — contradiction detection on layer-3+ ingest."""
+"""Tests for M4 — contradiction detection on layer-3+ ingest.
+
+Heuristic tests (original M4) run with MEMFS_CONTRADICTION_SKIP_SEMANTIC=1
+(set in conftest). The semantic stage has dedicated tests in
+TestSemanticStage below that mock subprocess.
+"""
+
+import json
+import os
+import subprocess
+import unittest.mock as mock
 
 import pytest
 
 from memfs.indexer import index_file
-from memfs.contradiction import detect_contradictions, scan_corpus
+from memfs.contradiction import (
+    detect_contradictions,
+    scan_corpus,
+    _semantic_contradiction,
+    _extract_judge_json,
+)
 
 
 class TestDetection:
@@ -232,3 +247,229 @@ class TestScanCorpus:
         result = scan_corpus(graph)
         # Pair seen from both ends; conflicts list carries exactly one entry
         assert len(result["conflicts"]) == 1
+
+
+class TestSemanticStage:
+    """The LLM-backed contradiction judge.
+
+    Shipped 2026-04-18 after a coverage-level scan produced 12 conflicts, 0
+    true positives — every flag was `reversal:correct->wrong` firing on
+    shared vocabulary between retrospective documents that weren't actually
+    contradicting each other. The semantic stage is the precision fix.
+
+    These tests mock the `infer` subprocess so they run deterministically
+    without Ollama. The 12 FPs from the 2026-04-18 02:06 CDT scan serve as
+    regression fixtures — they must NOT produce edges under the mocked
+    semantic judge returning `contradicts: false`.
+    """
+
+    def test_extract_judge_json_plain(self):
+        assert _extract_judge_json('{"contradicts": true, "subject": "X"}') == {
+            "contradicts": True, "subject": "X"
+        }
+
+    def test_extract_judge_json_with_prose(self):
+        raw = 'Sure, here is the verdict: {"contradicts": false, "subject": null, "reason": "unrelated"}\nEnd.'
+        got = _extract_judge_json(raw)
+        assert got == {"contradicts": False, "subject": None, "reason": "unrelated"}
+
+    def test_extract_judge_json_empty(self):
+        assert _extract_judge_json("") is None
+        assert _extract_judge_json("no json here") is None
+
+    def test_extract_judge_json_malformed(self):
+        assert _extract_judge_json("{not valid json}") is None
+
+    def test_bypass_via_env(self, monkeypatch):
+        """SKIP_SEMANTIC=1 → returns (True, semantic_bypassed) — heuristic wins."""
+        monkeypatch.setenv("MEMFS_CONTRADICTION_SKIP_SEMANTIC", "1")
+        ok, subj = _semantic_contradiction("A text", "B text")
+        assert ok is True
+        assert subj == "semantic_bypassed"
+
+    def test_missing_infer(self, monkeypatch):
+        """Missing infer binary → (False, infer_not_found)."""
+        monkeypatch.delenv("MEMFS_CONTRADICTION_SKIP_SEMANTIC", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: None)
+        ok, subj = _semantic_contradiction("A", "B")
+        assert ok is False
+        assert "infer_not_found" in subj
+
+    def test_missing_role(self, monkeypatch, tmp_path):
+        """Missing role file → (False, role_missing)."""
+        monkeypatch.delenv("MEMFS_CONTRADICTION_SKIP_SEMANTIC", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/infer-fake")
+        monkeypatch.setenv("HOME", str(tmp_path))  # no role file under this HOME
+        ok, subj = _semantic_contradiction("A", "B")
+        assert ok is False
+        assert "role_missing" in subj
+
+    def _mock_infer(self, stdout: str, returncode: int = 0):
+        """Helper: patch subprocess.run to return canned infer output."""
+        result = subprocess.CompletedProcess(
+            args=[], returncode=returncode, stdout=stdout, stderr=""
+        )
+        return mock.patch("subprocess.run", return_value=result)
+
+    def _prepare_infer_env(self, monkeypatch, tmp_path):
+        """Create fake infer binary + role file so the guards pass."""
+        monkeypatch.delenv("MEMFS_CONTRADICTION_SKIP_SEMANTIC", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/infer-fake")
+        role_dir = tmp_path / ".config" / "infer" / "roles"
+        role_dir.mkdir(parents=True, exist_ok=True)
+        (role_dir / "contradiction-judge.md").write_text("# judge")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+    def test_semantic_agrees(self, monkeypatch, tmp_path):
+        """Judge says contradicts:true → (True, subject)."""
+        self._prepare_infer_env(monkeypatch, tmp_path)
+        with self._mock_infer('{"contradicts": true, "subject": "CronCreate persistence", "reason": "opposite claims"}'):
+            ok, subj = _semantic_contradiction("A text", "B text")
+        assert ok is True
+        assert "CronCreate" in subj
+
+    def test_semantic_disagrees(self, monkeypatch, tmp_path):
+        """Judge says contradicts:false → (False, ...). THE CORE FIX."""
+        self._prepare_infer_env(monkeypatch, tmp_path)
+        with self._mock_infer('{"contradicts": false, "subject": null, "reason": "different subjects"}'):
+            ok, subj = _semantic_contradiction("A", "B")
+        assert ok is False
+
+    def test_semantic_garbage_output(self, monkeypatch, tmp_path):
+        """Unparseable stdout → (False, parse)."""
+        self._prepare_infer_env(monkeypatch, tmp_path)
+        with self._mock_infer("not json at all"):
+            ok, subj = _semantic_contradiction("A", "B")
+        assert ok is False
+        assert "parse" in subj
+
+    def test_semantic_timeout(self, monkeypatch, tmp_path):
+        """subprocess.TimeoutExpired → (False, timeout)."""
+        self._prepare_infer_env(monkeypatch, tmp_path)
+        def _raise(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="infer", timeout=15)
+        with mock.patch("subprocess.run", side_effect=_raise):
+            ok, subj = _semantic_contradiction("A", "B")
+        assert ok is False
+        assert "timeout" in subj
+
+
+class TestSemanticIntegration:
+    """End-to-end: heuristic + semantic interaction on real-style inputs.
+
+    Mocks the subprocess.run call to keep the test deterministic. Uses the
+    actual graph + indexer path.
+    """
+
+    def _install_fake_infer(self, monkeypatch, tmp_path_factory):
+        """Satisfy both `which infer` and the role-file existence check."""
+        monkeypatch.delenv("MEMFS_CONTRADICTION_SKIP_SEMANTIC", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/infer-fake")
+        # Role file must exist under HOME
+        home = tmp_path_factory.mktemp("fake_home")
+        role_dir = home / ".config" / "infer" / "roles"
+        role_dir.mkdir(parents=True)
+        (role_dir / "contradiction-judge.md").write_text("# judge")
+        monkeypatch.setenv("HOME", str(home))
+
+    def test_semantic_vetoes_heuristic_false_positive(
+        self, graph, tmp_path, monkeypatch, tmp_path_factory
+    ):
+        """Heuristic fires (reversal bigram) but semantic says no → NO edge.
+
+        This is the regression test for the 2026-04-18 12-FP bug: Karpathy
+        retrospective docs containing 'correct' and 'wrong' in different
+        contexts triggered the heuristic but were not actual contradictions.
+        """
+        self._install_fake_infer(monkeypatch, tmp_path_factory)
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nThe old approach was correct for that era. New approach needed."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nThe prior design turned out to be wrong; hence the rework."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        # Semantic judge says NOT a contradiction
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"contradicts": false, "subject": null, "reason": "retrospective, different subjects"}',
+            stderr="",
+        )
+        with mock.patch("subprocess.run", return_value=fake):
+            conflicts = detect_contradictions(graph, "b.md")
+
+        # Zero edges in the graph
+        edges = graph.run(
+            "MATCH ()-[r:CONTRADICTS]-() RETURN count(r) AS n"
+        )
+        assert edges[0]["n"] == 0
+        assert conflicts == []
+
+    def test_semantic_confirms_heuristic_true_positive(
+        self, graph, tmp_path, monkeypatch, tmp_path_factory
+    ):
+        """Heuristic fires AND semantic agrees → edge emitted with subject."""
+        self._install_fake_infer(monkeypatch, tmp_path_factory)
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nNative CronCreate persists across sessions reliably."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nNative CronCreate does not persist across sessions — flag ignored."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='{"contradicts": true, "subject": "CronCreate persistence across sessions", "reason": "opposite"}',
+            stderr="",
+        )
+        with mock.patch("subprocess.run", return_value=fake):
+            conflicts = detect_contradictions(graph, "b.md")
+
+        assert len(conflicts) >= 1
+        # The subject from the judge surfaces in the reason field
+        assert any("CronCreate" in c["reason"] for c in conflicts)
+
+    def test_semantic_error_fails_closed(
+        self, graph, tmp_path, monkeypatch, tmp_path_factory
+    ):
+        """Semantic subprocess error → no edge emitted. Precision over recall."""
+        self._install_fake_infer(monkeypatch, tmp_path_factory)
+        (tmp_path / "src.md").write_text("# Source")
+        (tmp_path / "a.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# A\nService is enabled globally in production."
+        )
+        (tmp_path / "b.md").write_text(
+            "---\nlayer: 3\nsource: src.md\n---\n"
+            "# B\nService is disabled globally in production."
+        )
+        index_file(graph, str(tmp_path), "src.md")
+        index_file(graph, str(tmp_path), "a.md")
+        index_file(graph, str(tmp_path), "b.md")
+
+        # Semantic subprocess times out
+        def _timeout(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="infer", timeout=15)
+        with mock.patch("subprocess.run", side_effect=_timeout):
+            conflicts = detect_contradictions(graph, "b.md")
+
+        # Even though the heuristic would have fired, the semantic failure
+        # means NO edge. This is the defensive posture — infrastructure
+        # breakage must not emit junk contradictions.
+        edges = graph.run(
+            "MATCH ()-[r:CONTRADICTS]-() RETURN count(r) AS n"
+        )
+        assert edges[0]["n"] == 0
+        assert conflicts == []
