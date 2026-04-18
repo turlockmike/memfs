@@ -29,6 +29,31 @@ def _append_ledger(mem_home: str, record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
+def _infer_source() -> str | None:
+    """Detect provenance from the calling environment when `--source` is absent.
+
+    Priority (first match wins):
+      1. `MEMFS_SOURCE` env — explicit override, used verbatim
+      2. `CLAUDE_LOOP_NAME` env — claude-loop persistent session → `session:<name>`
+      3. `CLAUDECODE=1` env — Claude Code main session (no loop) → `llm:claude`
+      4. None — backwards-compatible "unknown" bucket
+
+    The goal: make per-source calibration breakdowns usable by default instead
+    of requiring every CLI caller to pass `--source` manually. Without this,
+    claims pile into the "unknown" bucket — the exact failure mode captured
+    by the 12/13 "unknown" split in the Apr 17 baseline.
+    """
+    explicit = os.environ.get("MEMFS_SOURCE", "").strip()
+    if explicit:
+        return explicit
+    loop_name = os.environ.get("CLAUDE_LOOP_NAME", "").strip()
+    if loop_name:
+        return f"session:{loop_name}"
+    if os.environ.get("CLAUDECODE", "").strip() == "1":
+        return "llm:claude"
+    return None
+
+
 def record_claim(graph, *, text: str, confidence: float, scope: str,
                  claimed_to: str = "log",
                  source: str | None = None,
@@ -47,6 +72,10 @@ def record_claim(graph, *, text: str, confidence: float, scope: str,
     Unscoped free-form strings are allowed. The first colon-delimited token
     is used as the "source_type" in breakdown reports; everything after is
     the "source_ref".
+
+    If `source` is None, the environment is probed (see `_infer_source`) —
+    agent-logged claims end up with `session:<loop-name>` or `llm:claude`
+    instead of the uninformative "unknown" bucket.
     """
     if not 0.0 <= confidence <= 1.0:
         raise ValueError(f"confidence must be in [0, 1], got {confidence}")
@@ -54,6 +83,9 @@ def record_claim(graph, *, text: str, confidence: float, scope: str,
         raise ValueError("text is required")
     if not scope or not scope.strip():
         raise ValueError("scope is required")
+
+    if source is None:
+        source = _infer_source()
 
     claim_id = str(uuid.uuid4())
     now = _now()

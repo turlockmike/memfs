@@ -6,8 +6,19 @@ import pytest
 
 from memfs.calibration import (
     record_claim, verify_claim, calibration_curve, rebuild_from_ledger,
-    _source_type,
+    _source_type, _infer_source,
 )
+
+
+@pytest.fixture
+def clean_source_env(monkeypatch):
+    """Clear env vars that `_infer_source` reads, so tests that want a true
+    'no source' state aren't poisoned by the shell that launched pytest
+    (CLAUDE_LOOP_NAME is set whenever pytest runs inside the karpathy loop).
+    """
+    monkeypatch.delenv("MEMFS_SOURCE", raising=False)
+    monkeypatch.delenv("CLAUDE_LOOP_NAME", raising=False)
+    monkeypatch.delenv("CLAUDECODE", raising=False)
 
 
 class TestRecordClaim:
@@ -279,8 +290,9 @@ class TestProvenance:
         )
         assert row["s"] == "file:/tmp/evidence.md"
 
-    def test_claim_source_optional(self, graph, tmp_path):
-        """Claims without a source still work (backward compatibility)."""
+    def test_claim_source_optional(self, graph, tmp_path, clean_source_env):
+        """Claims without a source still work (backward compatibility) when
+        the environment supplies no inference hints."""
         cid = record_claim(
             graph, text="X", confidence=0.8, scope="factual",
             mem_home=str(tmp_path),
@@ -301,7 +313,7 @@ class TestProvenance:
         assert rec["source"] == "tool:memfs-grep"
         assert rec["id"] == cid
 
-    def test_ledger_omits_source_when_none(self, graph, tmp_path):
+    def test_ledger_omits_source_when_none(self, graph, tmp_path, clean_source_env):
         import json as _json
         record_claim(
             graph, text="X", confidence=0.5, scope="s",
@@ -373,7 +385,8 @@ class TestProvenance:
         )
         assert row["s"] == "file:/evidence.md"
 
-    def test_breakdown_unknown_for_legacy_claims(self, graph, tmp_path):
+    def test_breakdown_unknown_for_legacy_claims(self, graph, tmp_path,
+                                                 clean_source_env):
         """Claims from before provenance shipped (no source field) bucket as 'unknown'."""
         cid = record_claim(graph, text="legacy", confidence=0.8, scope="s",
                            mem_home=str(tmp_path))
@@ -383,3 +396,68 @@ class TestProvenance:
                                   include_source_breakdown=True)
         assert curve["by_source"]["unknown"]["n"] == 1
         assert curve["by_source"]["unknown"]["accuracy"] == 1.0
+
+
+class TestSourceInference:
+    """_infer_source reads env when the caller doesn't pass `--source`."""
+
+    def test_no_env_returns_none(self, monkeypatch):
+        monkeypatch.delenv("MEMFS_SOURCE", raising=False)
+        monkeypatch.delenv("CLAUDE_LOOP_NAME", raising=False)
+        monkeypatch.delenv("CLAUDECODE", raising=False)
+        assert _infer_source() is None
+
+    def test_explicit_memfs_source_wins(self, monkeypatch):
+        monkeypatch.setenv("MEMFS_SOURCE", "tool:explicit-override")
+        monkeypatch.setenv("CLAUDE_LOOP_NAME", "karpathy")
+        monkeypatch.setenv("CLAUDECODE", "1")
+        assert _infer_source() == "tool:explicit-override"
+
+    def test_claude_loop_name_becomes_session(self, monkeypatch):
+        monkeypatch.delenv("MEMFS_SOURCE", raising=False)
+        monkeypatch.setenv("CLAUDE_LOOP_NAME", "karpathy")
+        monkeypatch.setenv("CLAUDECODE", "1")
+        assert _infer_source() == "session:karpathy"
+
+    def test_claudecode_without_loop_name_becomes_llm(self, monkeypatch):
+        monkeypatch.delenv("MEMFS_SOURCE", raising=False)
+        monkeypatch.delenv("CLAUDE_LOOP_NAME", raising=False)
+        monkeypatch.setenv("CLAUDECODE", "1")
+        assert _infer_source() == "llm:claude"
+
+    def test_claudecode_false_is_ignored(self, monkeypatch):
+        monkeypatch.delenv("MEMFS_SOURCE", raising=False)
+        monkeypatch.delenv("CLAUDE_LOOP_NAME", raising=False)
+        monkeypatch.setenv("CLAUDECODE", "0")
+        assert _infer_source() is None
+
+    def test_empty_env_values_are_ignored(self, monkeypatch):
+        monkeypatch.setenv("MEMFS_SOURCE", "   ")
+        monkeypatch.setenv("CLAUDE_LOOP_NAME", "")
+        monkeypatch.delenv("CLAUDECODE", raising=False)
+        assert _infer_source() is None
+
+    def test_record_claim_uses_inferred_source(self, graph, tmp_path, monkeypatch):
+        """When caller omits source, env-inferred source populates the node."""
+        monkeypatch.delenv("MEMFS_SOURCE", raising=False)
+        monkeypatch.setenv("CLAUDE_LOOP_NAME", "karpathy")
+        cid = record_claim(
+            graph, text="inferred", confidence=0.7, scope="s",
+            mem_home=str(tmp_path),
+        )
+        row = graph.run_one(
+            "MATCH (c:Claim {id: $id}) RETURN c.source AS s", id=cid,
+        )
+        assert row["s"] == "session:karpathy"
+
+    def test_explicit_source_arg_beats_env(self, graph, tmp_path, monkeypatch):
+        """Caller-provided source is not overridden by inference."""
+        monkeypatch.setenv("CLAUDE_LOOP_NAME", "karpathy")
+        cid = record_claim(
+            graph, text="explicit", confidence=0.7, scope="s",
+            source="file:/evidence.md", mem_home=str(tmp_path),
+        )
+        row = graph.run_one(
+            "MATCH (c:Claim {id: $id}) RETURN c.source AS s", id=cid,
+        )
+        assert row["s"] == "file:/evidence.md"
