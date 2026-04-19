@@ -6,6 +6,7 @@ import pytest
 
 from memfs.calibration import (
     record_claim, verify_claim, calibration_curve, rebuild_from_ledger,
+    calibration_timeseries, snapshot_trend,
     _source_type, _infer_source,
 )
 
@@ -461,3 +462,141 @@ class TestSourceInference:
             "MATCH (c:Claim {id: $id}) RETURN c.source AS s", id=cid,
         )
         assert row["s"] == "file:/evidence.md"
+
+
+class TestTimeseries:
+    """calibration_timeseries composes calibration_curve over rolling buckets —
+    answers 'is my ECE improving?' rather than 'what is it right now?'.
+
+    Three tests cover: (1) timeseries composition — bucket count, monotonic
+    timestamps, empty buckets; (2) `--trend` CLI argument; (3) snapshot
+    write to calibration-trend.jsonl.
+    """
+
+    def test_composition_buckets_timestamps_and_empty_window(self, graph, tmp_path):
+        """Timeseries composition: bucket count matches window/bucket math,
+        bucket_end timestamps increase monotonically, every bucket spans
+        exactly bucket_days, claims fall in exactly one bucket (half-open
+        boundaries — no double counting), and empty buckets return n=0
+        without crashing."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+
+        # (a) Empty-window case: no claims in DB yet.
+        empty = calibration_timeseries(graph, window_days=30, bucket_days=7)
+        # ceil(30/7) = 5 buckets
+        assert len(empty) == 5
+        for s in empty:
+            assert s["n_verified"] == 0
+            assert s["ece"] == 0.0
+            assert s["accuracy"] == 0.0
+            for key in ("bucket_start", "bucket_end", "n_verified",
+                        "accuracy", "ece"):
+                assert key in s
+
+        # (b) Seed 1 correct + 1 wrong claim per each 10-day slot going back
+        # 60d. Override verified_at via Cypher so claims land in specific
+        # historical buckets (record/verify API stamps _now()).
+        for days_ago in (5, 15, 25, 35, 45, 55):
+            for outcome, conf in (("correct", 0.9), ("wrong", 0.5)):
+                cid = record_claim(graph, text=f"c{days_ago}{outcome}",
+                                   confidence=conf, scope="factual",
+                                   mem_home=str(tmp_path))
+                verified_at = (now - timedelta(days=days_ago)).isoformat()
+                graph.run(
+                    "MATCH (c:Claim {id: $id}) "
+                    "SET c.verified_at = $va, c.outcome = $o",
+                    id=cid, va=verified_at, o=outcome,
+                )
+
+        # 90-day window, 10-day buckets → 9 buckets.
+        series = calibration_timeseries(graph, window_days=90, bucket_days=10)
+        assert len(series) == 9
+
+        # Monotonic bucket_end timestamps, oldest first.
+        ends = [s["bucket_end"] for s in series]
+        assert ends == sorted(ends)
+
+        # Each bucket spans exactly bucket_days.
+        for s in series:
+            start = datetime.fromisoformat(s["bucket_start"])
+            end = datetime.fromisoformat(s["bucket_end"])
+            assert (end - start).days == 10
+
+        # Populated buckets match seeded count (half-open, no double count).
+        # We seeded 12 claims total (6 days × 2 outcomes). All 12 should be
+        # within the 90-day window — total n_verified across all buckets == 12.
+        total = sum(s["n_verified"] for s in series)
+        assert total == 12
+
+        # At least half the buckets carry seeded content.
+        populated = [s for s in series if s["n_verified"] > 0]
+        assert len(populated) >= 5
+
+    def test_trend_arg_via_cli(self, graph, tmp_path, monkeypatch):
+        """`memfs calibration --trend` emits one NDJSON line per bucket
+        instead of a single curve JSON. Exercises the CLI plumbing:
+        --trend flag, --trend-window, --trend-bucket, cmd_calibration
+        branching."""
+        import io
+        import sys
+        from memfs import cli as cli_mod
+
+        # Seed a couple of verified claims so at least one bucket is non-empty.
+        cid = record_claim(graph, text="x", confidence=0.9, scope="s",
+                           mem_home=str(tmp_path))
+        verify_claim(graph, claim_id=cid, outcome="correct",
+                     mem_home=str(tmp_path))
+
+        # Point MEM_HOME at tmp so get_mem_home returns it.
+        monkeypatch.setenv("MEM_HOME", str(tmp_path))
+
+        argv = [
+            "memfs", "calibration",
+            "--trend",
+            "--trend-window", "30",
+            "--trend-bucket", "10",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        buf = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", buf)
+        cli_mod.main()
+        output = buf.getvalue().strip().split("\n")
+
+        # ceil(30/10) = 3 buckets → 3 NDJSON lines, each a valid bucket.
+        assert len(output) == 3
+        for line in output:
+            rec = json.loads(line)
+            assert "bucket_end" in rec
+            assert "ece" in rec
+            assert "n_verified" in rec
+
+        # Total across all buckets should include the one seeded verified claim.
+        total = sum(json.loads(line)["n_verified"] for line in output)
+        assert total >= 1
+
+    def test_snapshot_write_appends_durable_ledger(self, graph, tmp_path):
+        """snapshot_trend appends a single JSON line to
+        .mem/calibration-trend.jsonl with a recorded_at timestamp — the
+        durable record cron writes daily, independent of Neo4j."""
+        snapshot = {
+            "bucket_end": "2026-04-19T00:00:00+00:00",
+            "bucket_start": "2026-04-12T00:00:00+00:00",
+            "n_verified": 7,
+            "accuracy": 0.71,
+            "ece": 0.19,
+        }
+        snapshot_trend(str(tmp_path), snapshot)
+        snapshot_trend(str(tmp_path), snapshot)
+
+        trend_path = tmp_path / ".mem" / "calibration-trend.jsonl"
+        assert trend_path.exists()
+        lines = trend_path.read_text().strip().split("\n")
+        assert len(lines) == 2
+        for line in lines:
+            rec = json.loads(line)
+            assert rec["ece"] == 0.19
+            assert rec["n_verified"] == 7
+            # snapshot_trend injects recorded_at if missing.
+            assert "recorded_at" in rec

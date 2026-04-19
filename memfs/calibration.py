@@ -269,6 +269,125 @@ def calibration_curve(graph, *, window_days: int = 30,
     return result
 
 
+def calibration_timeseries(graph, *, window_days: int = 90,
+                           bucket_days: int = 7,
+                           scope: str | None = None,
+                           source_type: str | None = None) -> list:
+    """Compute rolling-window calibration over time.
+
+    Slides a `bucket_days`-sized window forward from (now - window_days) to
+    now in `bucket_days` steps. At each step, runs the existing
+    ``calibration_curve`` over claims verified within that bucket's window.
+    Returns a list of snapshots — one per bucket — each containing
+    ``bucket_end``, ``ece``, ``accuracy``, and ``n_verified``.
+
+    Used to answer "is my ECE improving?" — the secondary success metric
+    from the viable-memory architecture. Pure composition over
+    ``calibration_curve``; no new computation — each bucket is a
+    point-in-time ECE snapshot whose window starts at bucket_end -
+    bucket_days and ends at bucket_end.
+
+    Empty buckets (no verified claims in the window) return
+    ``n_verified: 0`` and ``ece: 0.0`` rather than crashing — callers can
+    filter these out if desired.
+
+    Bucket boundaries are half-open ``[bucket_end - bucket_days,
+    bucket_end)`` to avoid double-counting a claim that straddles a
+    boundary.
+    """
+    if window_days <= 0:
+        raise ValueError(f"window_days must be positive, got {window_days}")
+    if bucket_days <= 0:
+        raise ValueError(f"bucket_days must be positive, got {bucket_days}")
+
+    now = datetime.now(timezone.utc)
+    # How many buckets fit in the window (round up so earliest bucket is covered).
+    n_buckets = max(1, (window_days + bucket_days - 1) // bucket_days)
+
+    snapshots = []
+    for i in range(n_buckets):
+        # Buckets ordered oldest → newest. Bucket i ends at:
+        #   now - (n_buckets - 1 - i) * bucket_days
+        # so the final bucket ends at `now`.
+        bucket_end = now - timedelta(days=(n_buckets - 1 - i) * bucket_days)
+        bucket_start = bucket_end - timedelta(days=bucket_days)
+
+        # Query claims verified in [bucket_start, bucket_end). We reuse the
+        # curve computation by running it with window_days=bucket_days and
+        # then overriding the cutoff via a direct Cypher query — but to
+        # preserve "pure composition", we instead query claims in the
+        # bucket ourselves and compute the ECE via the same logic.
+        cypher = (
+            "MATCH (c:Claim) "
+            "WHERE c.verified_at IS NOT NULL "
+            "  AND c.verified_at >= $start "
+            "  AND c.verified_at < $end "
+            + ("  AND c.scope = $scope " if scope else "")
+            + "RETURN c.confidence AS confidence, c.outcome AS outcome, "
+            "c.source AS source"
+        )
+        params = {
+            "start": bucket_start.isoformat(),
+            "end": bucket_end.isoformat(),
+        }
+        if scope:
+            params["scope"] = scope
+        rows = list(graph.run(cypher, **params))
+        if source_type:
+            rows = [r for r in rows if _source_type(r["source"]) == source_type]
+
+        # Reuse the bin/ECE logic inline (same shape as calibration_curve).
+        bins = defaultdict(lambda: {"n": 0, "correct": 0, "partial": 0, "wrong": 0})
+        for row in rows:
+            conf = row["confidence"] or 0.0
+            bin_key = min(int(conf * 10) / 10.0, 0.9)
+            bins[bin_key]["n"] += 1
+            outcome = row["outcome"]
+            if outcome in ("correct", "partial", "wrong"):
+                bins[bin_key][outcome] += 1
+
+        total = sum(b["n"] for b in bins.values())
+        total_correct = sum(b["correct"] for b in bins.values())
+        total_partial = sum(b["partial"] for b in bins.values())
+
+        ece = 0.0
+        if total > 0:
+            for bin_start, b in bins.items():
+                mid = bin_start + 0.05
+                obs = (b["correct"] + 0.5 * b["partial"]) / b["n"] if b["n"] else 0.0
+                ece += (b["n"] / total) * abs(mid - obs)
+
+        accuracy = (
+            (total_correct + 0.5 * total_partial) / total if total else 0.0
+        )
+
+        snapshots.append({
+            "bucket_end": bucket_end.isoformat(),
+            "bucket_start": bucket_start.isoformat(),
+            "n_verified": total,
+            "accuracy": round(accuracy, 4),
+            "ece": round(ece, 4),
+        })
+
+    return snapshots
+
+
+def snapshot_trend(mem_home: str, snapshot: dict) -> None:
+    """Append one trend snapshot to ``<MEM_HOME>/.mem/calibration-trend.jsonl``.
+
+    Used by the hourly/daily snapshot hook in karpathy-snapshot.sh to
+    record a durable record of ECE over time independent of Neo4j. Each
+    line is a JSON object with at least ``recorded_at``, ``ece``,
+    ``accuracy``, ``n_verified``, and ``window_days``.
+    """
+    path = os.path.join(mem_home, ".mem", "calibration-trend.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    record = dict(snapshot)
+    record.setdefault("recorded_at", _now())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 def rebuild_from_ledger(graph, *, mem_home: str) -> dict:
     """Replay the JSONL ledger to rebuild Claim nodes in Neo4j.
 

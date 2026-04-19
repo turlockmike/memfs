@@ -390,7 +390,10 @@ def cmd_verify(args):
 
 
 def cmd_calibration(args):
-    from memfs.calibration import calibration_curve, rebuild_from_ledger
+    from memfs.calibration import (
+        calibration_curve, calibration_timeseries,
+        rebuild_from_ledger, snapshot_trend,
+    )
     graph = _connect_or_die()
     try:
         rebuild_stats = None
@@ -398,6 +401,26 @@ def cmd_calibration(args):
             rebuild_stats = rebuild_from_ledger(
                 graph, mem_home=get_mem_home(args),
             )
+
+        # --trend mode: emit one NDJSON line per bucket instead of a single
+        # point-in-time curve. Rolling ECE over `--trend-window` sliced in
+        # `--trend-bucket`-day buckets.
+        if getattr(args, "trend", False):
+            series = calibration_timeseries(
+                graph,
+                window_days=getattr(args, "trend_window", 90),
+                bucket_days=getattr(args, "trend_bucket", 7),
+                scope=args.scope,
+                source_type=getattr(args, "source_type", None),
+            )
+            # Optional snapshot write — record the most recent bucket to the
+            # durable trend ledger so successive invocations build history.
+            if getattr(args, "snapshot", False) and series:
+                snapshot_trend(get_mem_home(args), series[-1])
+            for s in series:
+                out(s)
+            return
+
         curve = calibration_curve(
             graph, window_days=args.window, scope=args.scope,
             source_type=getattr(args, "source_type", None),
@@ -717,6 +740,24 @@ def main():
                        help="Replay JSONL ledger into Neo4j before querying. "
                             "Use after a DB reset or when the cache drifts "
                             "from the durable ledger.")
+    p_cal.add_argument("--trend", action="store_true",
+                       help="Emit rolling-window ECE timeseries (one NDJSON "
+                            "line per bucket) instead of a point-in-time "
+                            "curve. Use --trend-window and --trend-bucket "
+                            "to size the series.")
+    p_cal.add_argument("--trend-window", dest="trend_window", type=int,
+                       default=90,
+                       help="Total span (in days) of the timeseries "
+                            "(default 90).")
+    p_cal.add_argument("--trend-bucket", dest="trend_bucket", type=int,
+                       default=7,
+                       help="Bucket size in days for the timeseries "
+                            "(default 7).")
+    p_cal.add_argument("--snapshot", action="store_true",
+                       help="In --trend mode, append the most recent bucket "
+                            "to <MEM_HOME>/.mem/calibration-trend.jsonl as a "
+                            "durable record of this moment's ECE. Used by "
+                            "the daily cron hook.")
 
     # Link materialization (Apr 17 — bootstrapping empty juxtaposition surface)
     p_ls = sub.add_parser("link-suggest",
