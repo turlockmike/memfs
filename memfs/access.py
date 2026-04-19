@@ -196,6 +196,123 @@ def empty_hit_queries(
     return graph.run(cypher, **params)
 
 
+def gap_signals(
+    graph: Graph,
+    *,
+    window_days: int | None = 7,
+    cold_days: int = 30,
+    min_layer: int = 3,
+    limit: int = 20,
+) -> dict:
+    """Actionable view over accumulated access data.
+
+    Returns a combined-view dict with two actionable buckets:
+
+    - ``empty_hit_queries``: queries that returned zero results in the last
+      ``window_days``. These are the gap signals — things the agent looked
+      for and memory didn't have.
+    - ``dead_weight``: indexed :Node rows at layer ``>= min_layer`` that have
+      NOT been retrieved by any :Access in the last ``cold_days``. The
+      definition mirrors ``cold_nodes`` but restricts to the "layer 3+
+      never-retrieved in N days" slice — the classic bloat signal.
+    - ``stale_hotspots``: nodes retrieved heavily in the window whose
+      ``modified_at`` hasn't been bumped recently. Hot, but not maintained.
+
+    Summary counts are included under ``summary`` so a snapshot sweep can
+    branch on them without a second round-trip.
+
+    The function is read-only; the dream-briefing wrapper calls
+    ``find_dead_weight`` separately so its output fits the
+    candidate_type=...  shape used by run_briefing.
+    """
+    empties = empty_hit_queries(graph, window_days=window_days, limit=limit)
+
+    # Dead weight: layer >= min_layer nodes not retrieved in cold_days. We
+    # emit the path + last_hit so a dream candidate can include it.
+    cold_cutoff = _window_cutoff(cold_days)
+    if cold_cutoff is None:
+        dead_cypher = (
+            "MATCH (n:Node) "
+            "WHERE coalesce(n.layer, 0) >= $min_layer "
+            "  AND NOT (n)<-[:RETRIEVED]-(:Access) "
+            "RETURN n.path AS path, n.title AS title, n.layer AS layer, "
+            "       n.modified_at AS modified_at, "
+            "       null AS last_hit "
+            "ORDER BY coalesce(n.modified_at, '') ASC "
+            "LIMIT $limit"
+        )
+        dead = graph.run(dead_cypher, min_layer=int(min_layer),
+                         limit=int(limit))
+    else:
+        dead_cypher = (
+            "MATCH (n:Node) "
+            "WHERE coalesce(n.layer, 0) >= $min_layer "
+            "OPTIONAL MATCH (n)<-[:RETRIEVED]-(a:Access) "
+            "WITH n, max(a.ts) AS last_hit "
+            "WHERE last_hit IS NULL OR last_hit < $cutoff "
+            "RETURN n.path AS path, n.title AS title, n.layer AS layer, "
+            "       n.modified_at AS modified_at, last_hit "
+            "ORDER BY coalesce(last_hit, '') ASC, n.path ASC "
+            "LIMIT $limit"
+        )
+        dead = graph.run(dead_cypher, min_layer=int(min_layer),
+                         cutoff=cold_cutoff, limit=int(limit))
+
+    # Stale hotspots: top hot nodes whose modified_at is well before their
+    # last_hit. i.e. still being retrieved, but content is aging.
+    hot_cutoff = _window_cutoff(window_days)
+    where = "WHERE a.ts >= $cutoff" if hot_cutoff else ""
+    hotspot_cypher = (
+        "MATCH (a:Access)-[:RETRIEVED]->(n:Node) "
+        f"{where} "
+        "WITH n, count(*) AS hits, max(a.ts) AS last_hit "
+        "WHERE hits >= 3 "
+        "RETURN n.path AS path, n.title AS title, n.layer AS layer, "
+        "       n.modified_at AS modified_at, hits, last_hit "
+        "ORDER BY hits DESC "
+        "LIMIT $limit"
+    )
+    hp_params = {"limit": int(limit)}
+    if hot_cutoff:
+        hp_params["cutoff"] = hot_cutoff
+    hotspots_raw = graph.run(hotspot_cypher, **hp_params)
+
+    # A hotspot is "stale" only if modified_at trails last_hit by more than
+    # the cold_days window. Filtering in Python keeps the cypher portable
+    # across date-parse quirks.
+    stale_hotspots: list[dict] = []
+    for row in hotspots_raw:
+        mod = _parse_ts(row.get("modified_at"))
+        last = _parse_ts(row.get("last_hit"))
+        if mod is None or last is None:
+            continue
+        if (last - mod).days >= int(cold_days):
+            stale_hotspots.append(row)
+
+    return {
+        "window_days": window_days,
+        "cold_days": cold_days,
+        "min_layer": min_layer,
+        "summary": access_summary(graph, window_days=window_days),
+        "empty_hit_queries": empties,
+        "dead_weight": dead,
+        "stale_hotspots": stale_hotspots,
+    }
+
+
+def _parse_ts(s):
+    """Lenient ISO parser used only for gap_signals' in-memory filter."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
 def access_summary(
     graph: Graph,
     window_days: int | None = 7,

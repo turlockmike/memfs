@@ -367,6 +367,70 @@ def find_cosearched_unlinked(graph, min_cooccur: int = 3) -> list[dict]:
     return candidates
 
 
+def find_dead_weight(
+    graph,
+    *,
+    cold_days: int = 60,
+    min_layer: int = 3,
+    limit: int = 50,
+) -> list[dict]:
+    """Indexed nodes at layer >= min_layer that have not been retrieved by
+    any (:Access) in cold_days. Emits one candidate per node of type
+    'dead_weight'.
+
+    Rationale: memory accrues by adding. Without an opposing signal, it
+    bloats. Access-log-driven dead-weight is the S3 counter-pressure — we
+    ask "is this indexed thing still paying its keep?" and surface the
+    ones that haven't been retrieved in a long window. The agent decides
+    whether to archive, split, re-link, or (often) simply tighten the
+    title so search finds it.
+
+    This is the dream-briefing counterpart to the
+    ``memfs access-report --kind gap-signals`` view. Both read the same
+    (:Access) data; this emits candidate_type='dead_weight' dicts so the
+    nightly briefing can stream it alongside orphan/merge/split/link.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(cold_days))).isoformat()
+    rows = graph.run(
+        "MATCH (n:Node) "
+        "WHERE coalesce(n.layer, 0) >= $min_layer "
+        "OPTIONAL MATCH (n)<-[:RETRIEVED]-(a:Access) "
+        "WITH n, max(a.ts) AS last_hit "
+        "WHERE last_hit IS NULL OR last_hit < $cutoff "
+        "RETURN n.path AS path, n.title AS title, n.layer AS layer, "
+        "       n.modified_at AS modified_at, last_hit "
+        "ORDER BY coalesce(last_hit, '') ASC, n.path ASC "
+        "LIMIT $limit",
+        min_layer=int(min_layer),
+        cutoff=cutoff,
+        limit=int(limit),
+    )
+
+    out: list[dict] = []
+    for row in rows:
+        last_hit = row.get("last_hit")
+        never_retrieved = last_hit is None
+        reason = (
+            f"layer {row.get('layer')}, never retrieved by any access "
+            f"(dead_weight>={cold_days}d)"
+            if never_retrieved else
+            f"layer {row.get('layer')}, last retrieved {last_hit} "
+            f"(dead_weight>={cold_days}d)"
+        )
+        out.append({
+            "candidate_type": "dead_weight",
+            "nodes": [row["path"]],
+            "reason": reason,
+            "priority": 0.35 if never_retrieved else 0.25,
+            "title": row.get("title"),
+            "layer": row.get("layer"),
+            "modified_at": row.get("modified_at"),
+            "last_hit": last_hit,
+            "never_retrieved": never_retrieved,
+        })
+    return out
+
+
 def find_stale_facts(graph) -> list[dict]:
     rows = graph.run(
         "MATCH (n:Node) "
@@ -402,6 +466,8 @@ def run_briefing(graph, *, mem_home: str, args) -> list[dict]:
     orphan_days = getattr(args, "orphan_days", 30)
     bloat_lines = getattr(args, "bloat_lines", 500)
     bloat_bytes = getattr(args, "bloat_bytes", 10240)
+    dead_weight_days = getattr(args, "dead_weight_days", 60)
+    dead_weight_min_layer = getattr(args, "dead_weight_min_layer", 3)
 
     candidates: list[dict] = []
     candidates.extend(find_orphans(graph, orphan_days=orphan_days))
@@ -411,6 +477,11 @@ def run_briefing(graph, *, mem_home: str, args) -> list[dict]:
     candidates.extend(find_cosearched_unlinked(graph))
     candidates.extend(find_content_similar_unlinked(graph))
     candidates.extend(find_stale_facts(graph))
+    candidates.extend(find_dead_weight(
+        graph,
+        cold_days=dead_weight_days,
+        min_layer=dead_weight_min_layer,
+    ))
 
     # Highest priority first
     candidates.sort(key=lambda c: -c.get("priority", 0.0))

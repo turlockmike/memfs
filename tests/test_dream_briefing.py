@@ -15,10 +15,13 @@ from memfs.indexer import index_file
 
 
 class Args:
-    def __init__(self, orphan_days=0, bloat_lines=5, bloat_bytes=100):
+    def __init__(self, orphan_days=0, bloat_lines=5, bloat_bytes=100,
+                 dead_weight_days=60, dead_weight_min_layer=3):
         self.orphan_days = orphan_days
         self.bloat_lines = bloat_lines
         self.bloat_bytes = bloat_bytes
+        self.dead_weight_days = dead_weight_days
+        self.dead_weight_min_layer = dead_weight_min_layer
 
 
 def _write(path: str, content: str) -> None:
@@ -135,6 +138,51 @@ def test_candidates_sorted_by_priority(dream_corpus, graph):
     candidates = run_briefing(graph, mem_home=dream_corpus, args=Args())
     priorities = [c["priority"] for c in candidates]
     assert priorities == sorted(priorities, reverse=True)
+
+
+def test_dead_weight_candidate_included_in_briefing(tmp_path, graph):
+    """Roadmap priority #1 test #3: the dead_weight candidate type must
+    appear in dream-briefing output for layer-3+ nodes with no retrieval
+    in the cold_days window.
+
+    Setup: one layer-3 node that's indexed but never retrieved, one
+    layer-1 node (below min_layer) that's also never retrieved. Only
+    the layer-3 one should produce a dead_weight candidate.
+    """
+    mh = tmp_path / "mem"
+    mh.mkdir()
+    mem_home = str(mh)
+
+    _write(
+        f"{mem_home}/unused_high_layer.md",
+        "---\nlayer: 3\nsource: synthetic-test-fixture\n---\n\n"
+        "# Never retrieved, layer 3\n\nBody.\n",
+    )
+    index_file(graph, mem_home, "unused_high_layer.md")
+
+    _write(f"{mem_home}/unused_low_layer.md",
+           "---\nlayer: 1\n---\n\n# Never retrieved, layer 1\n\nBody.\n")
+    index_file(graph, mem_home, "unused_low_layer.md")
+
+    candidates = run_briefing(
+        graph, mem_home=mem_home,
+        args=Args(dead_weight_days=0, dead_weight_min_layer=3),
+    )
+
+    dead = [c for c in candidates if c["candidate_type"] == "dead_weight"]
+    dead_paths = {p for c in dead for p in c["nodes"]}
+
+    assert "unused_high_layer.md" in dead_paths, (
+        f"layer-3 never-retrieved node should be dead_weight; got {dead}"
+    )
+    assert "unused_low_layer.md" not in dead_paths, (
+        f"layer-1 must be filtered by min_layer; got {dead}"
+    )
+    # dead_weight candidates must satisfy the same invariant as others
+    for c in dead:
+        assert "reason" in c and "priority" in c and "nodes" in c
+        assert 0.0 <= c["priority"] <= 1.0
+        assert c.get("never_retrieved") is True
 
 
 def test_sessions_excluded_from_merge_candidates(tmp_path, graph):

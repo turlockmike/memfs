@@ -18,7 +18,7 @@ from memfs.search import grep as do_grep
 from memfs.decay import run_decay
 from memfs.watcher import start_watcher, stop_watcher, watcher_status
 from memfs.access import (
-    access_summary, hot_nodes, cold_nodes, empty_hit_queries,
+    access_summary, hot_nodes, cold_nodes, empty_hit_queries, gap_signals,
 )
 
 
@@ -538,15 +538,22 @@ def cmd_access_report(args):
     Default output = summary (total accesses, hits, empty hits, distinct
     queries, distinct nodes touched) in the window.
 
-    --kind hot   : nodes retrieved most often
-    --kind cold  : nodes not retrieved in the window (or never)
-    --kind empty : queries that returned 0 results (memory gaps)
+    --kind hot          : nodes retrieved most often
+    --kind cold         : nodes not retrieved in the window (or never)
+    --kind empty        : queries that returned 0 results (memory gaps)
+    --kind gap-signals  : combined actionable view — empty-hit queries
+                          (what was asked for and not found) plus
+                          dead-weight nodes (indexed but never retrieved)
+                          plus stale hotspots (retrieved but not updated).
+                          Emitted as a single JSON object.
     """
     graph = _connect_or_die()
     try:
         kind = getattr(args, "kind", None)
         window = getattr(args, "window_days", None)
         limit = getattr(args, "limit", 20)
+        cold_days = getattr(args, "cold_days", 30)
+        min_layer = getattr(args, "min_layer", 3)
 
         if kind in (None, "summary"):
             out(access_summary(graph, window_days=window))
@@ -558,9 +565,15 @@ def cmd_access_report(args):
             rows = cold_nodes(graph, window_days=window, limit=limit)
         elif kind == "empty":
             rows = empty_hit_queries(graph, window_days=window, limit=limit)
+        elif kind == "gap-signals":
+            out(gap_signals(graph, window_days=window,
+                            cold_days=cold_days, min_layer=min_layer,
+                            limit=limit))
+            return
         else:
             err({"error": "unknown_kind", "kind": kind,
-                 "allowed": ["summary", "hot", "cold", "empty"]})
+                 "allowed": ["summary", "hot", "cold", "empty",
+                             "gap-signals"]})
             sys.exit(2)
 
         for row in rows:
@@ -742,14 +755,27 @@ def main():
              "this reads that log.",
     )
     p_access.add_argument("--kind", default="summary",
-                          choices=["summary", "hot", "cold", "empty"],
+                          choices=["summary", "hot", "cold", "empty",
+                                   "gap-signals"],
                           help="summary: totals; hot: most-retrieved nodes; "
                                "cold: nodes not retrieved in window; "
-                               "empty: queries that returned no results.")
+                               "empty: queries that returned no results; "
+                               "gap-signals: combined actionable view "
+                               "(empty-hits + dead-weight + stale-hotspots)")
     p_access.add_argument("--window-days", dest="window_days", type=int,
                           default=7,
                           help="Time window in days (default 7). 0 or "
                                "negative = all time.")
+    p_access.add_argument("--cold-days", dest="cold_days", type=int,
+                          default=30,
+                          help="Dead-weight threshold in days (gap-signals). "
+                               "Nodes not retrieved in this window become "
+                               "dead_weight candidates. Default 30.")
+    p_access.add_argument("--min-layer", dest="min_layer", type=int,
+                          default=3,
+                          help="Dead-weight layer floor (gap-signals). "
+                               "Only layer >= N is considered dead weight. "
+                               "Default 3.")
     p_access.add_argument("--limit", type=int, default=20,
                           help="Max rows to emit (default 20)")
 
@@ -789,6 +815,16 @@ def main():
                          help="Line threshold for bloated-file flag")
     p_dream.add_argument("--bloat-bytes", type=int, default=10240,
                          help="Byte threshold for bloated-file flag")
+    p_dream.add_argument("--dead-weight-days", type=int, default=60,
+                         dest="dead_weight_days",
+                         help="Dead-weight age threshold in days "
+                              "(default 60). Layer>=3 nodes with no "
+                              "retrieval in this window become "
+                              "dead_weight candidates.")
+    p_dream.add_argument("--dead-weight-min-layer", type=int, default=3,
+                         dest="dead_weight_min_layer",
+                         help="Minimum layer for dead_weight candidates "
+                              "(default 3).")
 
     args = parser.parse_args()
 

@@ -12,6 +12,7 @@ from memfs.access import (
     access_summary,
     cold_nodes,
     empty_hit_queries,
+    gap_signals,
     hot_nodes,
     log_access,
 )
@@ -231,6 +232,131 @@ def test_grep_no_results_emits_empty_hit(graph):
         "MATCH (a:Access) RETURN a.status"
     )
     assert status == "empty_hit"
+
+
+# --- gap_signals (roadmap priority #1, 2026-04-19) --------------------------
+
+
+def _add_with_layer(graph, path, layer, title="t", content="hello"):
+    add_node(
+        graph, path=path, title=title, content_hash=f"h-{path}",
+        date_hint=None, description=None, content=content, layer=layer,
+    )
+
+
+class TestGapSignals:
+    """memfs access-report --kind gap-signals — combined actionable view.
+
+    Validates shape + the three buckets: empty_hit_queries (gap signal),
+    dead_weight (indexed but never retrieved), stale_hotspots (retrieved
+    heavily but content not updated).
+    """
+
+    def test_gap_signals_returns_expected_shape(self, graph):
+        """Roadmap test #2: gap-signals view returns expected shape.
+
+        The sweep in karpathy-snapshot.sh pulls this JSON and counts rows
+        in the three buckets — the shape is the contract.
+        """
+        _add_with_layer(graph, "a.md", layer=3)
+        # an empty-hit to populate the bucket
+        log_access(graph, "missing thing", "qid-miss", [])
+
+        result = gap_signals(graph, window_days=7, cold_days=30,
+                             min_layer=3, limit=20)
+
+        # Contract: keyset matches what the snapshot sweep reads
+        assert set(result) == {
+            "window_days", "cold_days", "min_layer",
+            "summary", "empty_hit_queries", "dead_weight", "stale_hotspots",
+        }
+        assert isinstance(result["empty_hit_queries"], list)
+        assert isinstance(result["dead_weight"], list)
+        assert isinstance(result["stale_hotspots"], list)
+        assert isinstance(result["summary"], dict)
+        # empty-hit we logged shows up
+        assert any(r.get("query_text") == "missing thing"
+                   for r in result["empty_hit_queries"])
+
+    def test_gap_signals_flags_dead_weight_never_retrieved(self, graph):
+        """Layer-3 node with zero accesses appears under dead_weight;
+        layer-1 node (too shallow) does NOT; retrieved node does NOT."""
+        _add_with_layer(graph, "dead.md", layer=3, title="Never accessed")
+        _add_with_layer(graph, "shallow.md", layer=1,
+                        title="Low layer, also never accessed")
+        _add_with_layer(graph, "live.md", layer=3, title="I get retrieved")
+        log_access(graph, "q", "qid", [{"path": "live.md", "rank": 1}])
+
+        result = gap_signals(graph, window_days=7, cold_days=30,
+                             min_layer=3, limit=20)
+
+        dead_paths = {r["path"] for r in result["dead_weight"]}
+        assert "dead.md" in dead_paths
+        assert "shallow.md" not in dead_paths  # min_layer filter
+        assert "live.md" not in dead_paths     # was retrieved
+
+    def test_hourly_sweep_runs_without_error(self, graph):
+        """Roadmap test #1: hourly sweep (access-report --kind gap-signals)
+        must exit cleanly and emit the JSON object the snapshot sweep
+        parses. Mirrors the exact invocation used by
+        karpathy-snapshot.sh::run_access_sweep.
+        """
+        import json
+        import os
+        import subprocess
+        import sys
+
+        # Seed one empty-hit so the sweep has something to report
+        log_access(graph, "sweep-test query", "qid-sweep", [])
+
+        env = os.environ.copy()
+        # Propagate test DB so CLI doesn't point at 7687 prod by default
+        env["MEMFS_NEO4J_URI"] = os.environ.get(
+            "MEMFS_NEO4J_URI", "bolt://localhost:7688")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memfs.cli",
+             "access-report", "--kind", "gap-signals",
+             "--window-days", "1", "--cold-days", "30"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+
+        assert result.returncode == 0, (
+            f"sweep command failed: stderr={result.stderr!r}, "
+            f"stdout={result.stdout!r}"
+        )
+        # stdout must be a single JSON object (what the sweep parses)
+        stdout = result.stdout.strip()
+        assert stdout, "sweep produced no stdout"
+        parsed = json.loads(stdout)
+        assert "empty_hit_queries" in parsed
+        assert "dead_weight" in parsed
+        assert "stale_hotspots" in parsed
+        # The empty-hit we seeded must round-trip through the CLI path
+        assert any(r.get("query_text") == "sweep-test query"
+                   for r in parsed["empty_hit_queries"])
+
+    def test_gap_signals_schema_round_trips_cleanly(self, graph):
+        """Output must be JSON-serializable in full. Roadmap explicitly
+        requires schema round-trip: the sweep pipes through json.loads
+        and gap_signals into a log — a non-serializable field (e.g. a
+        datetime) would crash the sweep silently."""
+        import json
+        _add_with_layer(graph, "orphan.md", layer=3)
+        log_access(graph, "missing", "qid-m", [])
+        log_access(graph, "q", "qid-h",
+                   [{"path": "orphan.md", "rank": 1}])
+
+        result = gap_signals(graph, window_days=7, cold_days=30,
+                             min_layer=3, limit=10)
+
+        # Round-trip through JSON; preserves shape.
+        round_tripped = json.loads(json.dumps(result))
+        assert round_tripped["window_days"] == 7
+        assert round_tripped["cold_days"] == 30
+        assert round_tripped["min_layer"] == 3
+        # summary subfields still intact
+        assert "total_accesses" in round_tripped["summary"]
 
 
 def test_grep_updates_node_search_tracking_for_all_returned(graph):
