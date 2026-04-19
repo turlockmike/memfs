@@ -150,12 +150,15 @@ _SCHEMA_STATEMENTS = [
     "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (c:Claim) REQUIRE c.id IS UNIQUE",
     "CREATE CONSTRAINT access_id_unique IF NOT EXISTS FOR (a:Access) REQUIRE a.id IS UNIQUE",
     "CREATE CONSTRAINT meta_key_unique IF NOT EXISTS FOR (m:Meta) REQUIRE m.key IS UNIQUE",
+    "CREATE CONSTRAINT dreamrun_id_unique IF NOT EXISTS FOR (r:DreamRun) REQUIRE r.id IS UNIQUE",
+    "CREATE CONSTRAINT dreamaction_id_unique IF NOT EXISTS FOR (a:DreamAction) REQUIRE a.id IS UNIQUE",
     # Search-performance indexes
     "CREATE INDEX node_layer IF NOT EXISTS FOR (n:Node) ON (n.layer)",
     "CREATE INDEX node_modified IF NOT EXISTS FOR (n:Node) ON (n.modified_at)",
     "CREATE INDEX node_last_searched IF NOT EXISTS FOR (n:Node) ON (n.last_searched)",
     "CREATE INDEX access_ts IF NOT EXISTS FOR (a:Access) ON (a.ts)",
     "CREATE INDEX access_status IF NOT EXISTS FOR (a:Access) ON (a.status)",
+    "CREATE INDEX dreamrun_started IF NOT EXISTS FOR (r:DreamRun) ON (r.started_at)",
     # Full-text index for grep (Lucene-based, BM25 scoring native)
     (
         "CREATE FULLTEXT INDEX node_content IF NOT EXISTS "
@@ -170,11 +173,14 @@ _DROP_STATEMENTS = [
     "DROP CONSTRAINT claim_id_unique IF EXISTS",
     "DROP CONSTRAINT access_id_unique IF EXISTS",
     "DROP CONSTRAINT meta_key_unique IF EXISTS",
+    "DROP CONSTRAINT dreamrun_id_unique IF EXISTS",
+    "DROP CONSTRAINT dreamaction_id_unique IF EXISTS",
     "DROP INDEX node_layer IF EXISTS",
     "DROP INDEX node_modified IF EXISTS",
     "DROP INDEX node_last_searched IF EXISTS",
     "DROP INDEX access_ts IF EXISTS",
     "DROP INDEX access_status IF EXISTS",
+    "DROP INDEX dreamrun_started IF EXISTS",
     "DROP INDEX node_content IF EXISTS",
 ]
 

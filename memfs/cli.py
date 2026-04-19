@@ -605,6 +605,122 @@ def cmd_access_report(args):
         graph.close()
 
 
+def cmd_dream_log(args):
+    """Record a dream-pass action / start / finish / show / rebuild.
+
+    Modes (``args.mode``):
+      start    — open a run with input candidate counts by type
+      action   — record one action taken during the run
+      finish   — close the run, stamp status_delta
+      show     — dump one run by id
+      rebuild  — replay the JSONL ledger into Neo4j (after DB wipe)
+
+    Uniform semantics with the calibration ledger: files-as-truth
+    (``.mem/dream-log.jsonl``) + Neo4j derived cache. Each write appends
+    one ledger line + one/two Cypher statements.
+    """
+    from memfs.dream_log import (
+        start_run, record_action, finish_run, get_run, rebuild_from_ledger,
+    )
+    mem_home = get_mem_home(args)
+    mode = args.mode
+
+    if mode == "rebuild":
+        graph = _connect_or_die()
+        try:
+            stats = rebuild_from_ledger(graph, mem_home=mem_home)
+        finally:
+            graph.close()
+        out({"action": "dream_log_rebuild", **stats})
+        return
+
+    if not args.run_id:
+        err({"error": "run_id_required",
+             "hint": "memfs dream-log <mode> <run-id> ..."})
+        sys.exit(2)
+
+    graph = _connect_or_die()
+    try:
+        if mode == "start":
+            cbt = {}
+            if args.candidates_json:
+                try:
+                    cbt = json.loads(args.candidates_json)
+                except json.JSONDecodeError as e:
+                    err({"error": "bad_candidates_json", "detail": str(e)})
+                    sys.exit(2)
+            start_run(graph, run_id=args.run_id,
+                      candidates_by_type=cbt, mem_home=mem_home)
+            out({"action": "dream_log_start", "run_id": args.run_id,
+                 "candidates_by_type": cbt})
+            return
+
+        if mode == "action":
+            if not args.action_kind or not args.candidate_type:
+                err({"error": "missing_args",
+                     "hint": "--action and --candidate-type are required"})
+                sys.exit(2)
+            nodes = list(args.nodes or [])
+            action_id = record_action(
+                graph, run_id=args.run_id,
+                action=args.action_kind,
+                candidate_type=args.candidate_type,
+                nodes=nodes,
+                claim_id=args.claim_id,
+                note=args.note,
+                mem_home=mem_home,
+            )
+            out({"action": "dream_log_action", "action_id": action_id,
+                 "run_id": args.run_id, "kind": args.action_kind,
+                 "candidate_type": args.candidate_type, "nodes": nodes})
+            return
+
+        if mode == "finish":
+            sd = {}
+            if args.status_delta_json:
+                try:
+                    sd = json.loads(args.status_delta_json)
+                except json.JSONDecodeError as e:
+                    err({"error": "bad_status_delta_json", "detail": str(e)})
+                    sys.exit(2)
+            finish_run(graph, run_id=args.run_id,
+                       status_delta=sd, mem_home=mem_home)
+            out({"action": "dream_log_finish", "run_id": args.run_id,
+                 "status_delta": sd})
+            return
+
+        if mode == "show":
+            run = get_run(graph, args.run_id)
+            if run is None:
+                err({"error": "run_not_found", "run_id": args.run_id})
+                sys.exit(1)
+            out(run)
+            return
+
+        err({"error": "unknown_mode", "mode": mode,
+             "allowed": ["start", "action", "finish", "show", "rebuild"]})
+        sys.exit(2)
+    finally:
+        graph.close()
+
+
+def cmd_dream_report(args):
+    """Summary over the last ``--window`` days of dream passes.
+
+    Shows action rate, recurring-ignored candidates, and per-run summary.
+    """
+    from memfs.dream_log import dream_report
+    graph = _connect_or_die()
+    try:
+        result = dream_report(
+            graph, window_days=args.window,
+            recurrence_threshold=args.recurrence_threshold,
+        )
+    finally:
+        graph.close()
+    out(result)
+
+
 def cmd_freshness_scan(args):
     """Report nodes whose freshness is stale. Auto-refresh is future work."""
     graph = _connect_or_die()
@@ -867,6 +983,64 @@ def main():
                          help="Minimum layer for dead_weight candidates "
                               "(default 3).")
 
+    # Dream-pass output logging (Apr 19 — close the loop on nightly consolidation)
+    p_dlog = sub.add_parser(
+        "dream-log",
+        help="Record / query a dream-pass run. "
+             "Modes: start | action | finish | show | rebuild.",
+    )
+    p_dlog.add_argument("mode",
+                        choices=["start", "action", "finish", "show",
+                                 "rebuild"],
+                        help="start: open a run; action: record one action; "
+                             "finish: close the run; show: dump one run; "
+                             "rebuild: replay JSONL → Neo4j.")
+    p_dlog.add_argument("run_id", nargs="?", default=None,
+                        help="Run identifier (typically ISO timestamp). "
+                             "Required for all modes except 'rebuild'.")
+    p_dlog.add_argument("--candidates-json", dest="candidates_json",
+                        default=None,
+                        help="[start] JSON object mapping candidate_type → "
+                             "count, e.g. '{\"orphan\": 5, \"merge\": 3}'.")
+    p_dlog.add_argument("--action", dest="action_kind", default=None,
+                        choices=["merge", "split", "link", "defer", "ignore",
+                                 "archive", "other"],
+                        help="[action] Action taken on the candidate.")
+    p_dlog.add_argument("--candidate-type", dest="candidate_type",
+                        default=None,
+                        help="[action] The dream-briefing candidate_type "
+                             "(orphan|merge|split|link|stale|dead_weight|"
+                             "index|...) being actioned.")
+    p_dlog.add_argument("--nodes", nargs="*", default=None,
+                        help="[action] Paths of the nodes involved. For "
+                             "merge/link: two nodes. For split/defer/etc: one.")
+    p_dlog.add_argument("--claim-id", dest="claim_id", default=None,
+                        help="[action] Calibration-ledger claim_id cross-"
+                             "reference, if the action produced a claim.")
+    p_dlog.add_argument("--note", default=None,
+                        help="[action] Free-text note.")
+    p_dlog.add_argument("--status-delta-json", dest="status_delta_json",
+                        default=None,
+                        help="[finish] JSON object describing post-pass state "
+                             "change (e.g. '{\"nodes_before\":197,"
+                             "\"nodes_after\":192}').")
+    p_dlog.add_argument("--dir", default=None, help="MEM_HOME override")
+
+    p_drep = sub.add_parser(
+        "dream-report",
+        help="Summary across recent dream passes: candidate volume, action "
+             "rate, recurring-ignored candidates.",
+    )
+    p_drep.add_argument("--window", default="7d", type=_parse_window,
+                        help="Window in days (default 7d).")
+    p_drep.add_argument("--recurrence-threshold", dest="recurrence_threshold",
+                        type=int, default=3,
+                        help="Minimum distinct-run count for a candidate to "
+                             "qualify as 'recurring ignored' (default 3). "
+                             "A candidate counts only if its most-recent "
+                             "action was defer/ignore.")
+    p_drep.add_argument("--dir", default=None, help="MEM_HOME override")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -892,6 +1066,8 @@ def main():
         "dream-briefing": cmd_dream_briefing,
         "link-suggest": cmd_link_suggest,
         "link-apply": cmd_link_apply,
+        "dream-log": cmd_dream_log,
+        "dream-report": cmd_dream_report,
     }
 
     try:

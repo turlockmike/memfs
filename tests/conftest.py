@@ -6,8 +6,9 @@ the URI specified in $MEMFS_NEO4J_URI.
 PRODUCTION-GRAPH GUARDS (two layers)
 ------------------------------------
 The `graph` fixture is destructive: it runs ``MATCH (n) WHERE n:Node OR
-n:Query OR n:Claim OR n:Access DETACH DELETE n`` before every test.
-Running tests against a production Neo4j wipes memory corpora — which
+n:Query OR n:Claim OR n:Access OR n:DreamRun OR n:DreamAction DETACH
+DELETE n`` before every test. Running tests against a production Neo4j
+wipes memory corpora — which
 happened 2026-04-17 03:01 CDT (187 nodes → 9) AND AGAIN 2026-04-18 14:37
 CDT (205 nodes → 5) when a dev pytest invocation quietly nuked the
 karpathy graph.
@@ -111,7 +112,7 @@ def graph():
     # Start clean
     g.run(
         "MATCH (n) WHERE n:Node OR n:Query OR n:Claim OR n:Access "
-        "DETACH DELETE n"
+        "OR n:DreamRun OR n:DreamAction DETACH DELETE n"
     )
     try:
         yield g
