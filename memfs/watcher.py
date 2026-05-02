@@ -29,11 +29,19 @@ from memfs.index_render import write_index_if_drifted
 
 
 class MemfsEventHandler(FileSystemEventHandler):
-    """Handles filesystem events and updates the Neo4j graph."""
+    """Handles filesystem events and updates the Neo4j graph.
 
-    def __init__(self, mem_home: str):
+    `root_id` (added 2026-05-01): identifies which configured root this
+    handler is watching. Threaded through to index_file / update_node so
+    nodes get the correct root association.
+    """
+
+    def __init__(self, mem_home: str, root_id: str):
+        # root_id is REQUIRED — caller must explicitly tag this watcher with
+        # the configured root. start_watcher pulls it from roots.py / env.
         super().__init__()
         self.mem_home = mem_home
+        self.root_id = root_id
         self._ignore_patterns = None
         self._memignore_mtime = None
 
@@ -73,7 +81,12 @@ class MemfsEventHandler(FileSystemEventHandler):
         if rel_dir == ".":
             rel_dir = ""
         try:
-            result = write_index_if_drifted(graph, self.mem_home, rel_dir)
+            # Pass root_id so the renderer queries only THIS root's nodes —
+            # critical when MEM_HOMEs overlap (e.g., alfred-state nested
+            # inside alfred-home).
+            result = write_index_if_drifted(
+                graph, self.mem_home, rel_dir, root_id=self.root_id
+            )
             if result == "wrote":
                 self._log("index_rendered", os.path.join(self.mem_home, rel_dir, "index.md"))
         except Exception as e:
@@ -95,8 +108,8 @@ class MemfsEventHandler(FileSystemEventHandler):
         rel = self._rel_path(abs_path)
         graph = connect()
         try:
-            index_file(graph, self.mem_home, rel)
-            upgraded = upgrade_broken_links(graph, rel)
+            index_file(graph, self.mem_home, rel, root_id=self.root_id)
+            upgraded = upgrade_broken_links(graph, rel, root_id=self.root_id)
             self._log("created", abs_path, indexed=True, broken_links_upgraded=upgraded)
             # M4 hook: contradiction detection for layer >= 3 nodes
             _maybe_detect_contradictions(graph, self.mem_home, rel)
@@ -111,7 +124,7 @@ class MemfsEventHandler(FileSystemEventHandler):
         rel = self._rel_path(abs_path)
         graph = connect()
         try:
-            changed = update_node(graph, self.mem_home, rel)
+            changed = update_node(graph, self.mem_home, rel, root_id=self.root_id)
             if changed:
                 self._log("modified", abs_path, indexed=True)
                 _maybe_detect_contradictions(graph, self.mem_home, rel)
@@ -126,7 +139,7 @@ class MemfsEventHandler(FileSystemEventHandler):
         rel = self._rel_path(abs_path)
         graph = connect()
         try:
-            remove_file(graph, rel)
+            remove_file(graph, rel, root_id=self.root_id)
             self._log("deleted", abs_path, indexed=True)
             # Parent index now references a missing file — re-render.
             self._maybe_render_dir_index(graph, abs_path)
@@ -144,10 +157,10 @@ class MemfsEventHandler(FileSystemEventHandler):
         new_rel = self._rel_path(dest_abs)
         graph = connect()
         try:
-            remove_file(graph, old_rel)
+            remove_file(graph, old_rel, root_id=self.root_id)
             if os.path.exists(dest_abs):
-                index_file(graph, self.mem_home, new_rel)
-                upgrade_broken_links(graph, new_rel)
+                index_file(graph, self.mem_home, new_rel, root_id=self.root_id)
+                upgrade_broken_links(graph, new_rel, root_id=self.root_id)
             self._log("moved", dest_abs, from_path=old_rel)
             # Re-render BOTH old and new parent dirs (could be the same dir).
             self._maybe_render_dir_index(graph, src_abs)
@@ -214,28 +227,58 @@ def _maybe_detect_contradictions(graph, mem_home: str, rel_path: str) -> None:
 
 
 def start_watcher(mem_home: str, daemon: bool = False) -> None:
-    """Start the filesystem watcher."""
+    """Start the filesystem watcher.
+
+    Multi-root support (2026-05-01): when MEM_HOME is unset and a config file
+    exists at ~/.config/memfs/roots.json, watches every configured root with
+    one Observer per root. Each Observer's handler is bound to its own
+    `root_id` so events route correctly. When MEM_HOME IS set (legacy
+    callers), behaves as before — single-root.
+
+    `mem_home` arg is the legacy single-root path. If it's set (env-var
+    fallback in CLI), we honor it as a single root. Otherwise consult
+    load_roots() for the multi-root config.
+    """
+    from memfs.roots import load_roots
+
+    # Determine roots: legacy-arg takes precedence (preserves existing service
+    # behavior); else read multi-root config.
+    if os.environ.get("MEM_HOME"):
+        # Legacy single-root: derive id from path basename
+        from memfs.roots import _id_from_path
+        roots = [type("R", (), {"id": _id_from_path(mem_home), "path": mem_home})]
+    else:
+        roots = load_roots()
+
     if daemon:
-        pid_file = os.path.join(mem_home, ".mem", "watch.pid")
+        # PID file lives in the FIRST root's .mem dir (so stop_watcher knows
+        # where to look); single PID controls all observers.
+        pid_root = roots[0].path
+        pid_file = os.path.join(pid_root, ".mem", "watch.pid")
         os.makedirs(os.path.dirname(pid_file), exist_ok=True)
         pid = os.fork()
         if pid > 0:
             with open(pid_file, "w") as f:
                 f.write(str(pid))
             print(
-                json.dumps({"action": "watch", "daemon": True, "pid": pid}),
+                json.dumps({"action": "watch", "daemon": True, "pid": pid,
+                            "roots": [r.id for r in roots]}),
                 flush=True,
             )
             return
         os.setsid()
 
-    handler = MemfsEventHandler(mem_home)
     observer = Observer()
-    observer.schedule(handler, mem_home, recursive=True)
+    handlers = []
+    for r in roots:
+        h = MemfsEventHandler(r.path, root_id=r.id)
+        observer.schedule(h, r.path, recursive=True)
+        handlers.append((r.id, r.path))
     observer.start()
 
     print(
-        json.dumps({"action": "watch", "mem_home": mem_home, "daemon": daemon}),
+        json.dumps({"action": "watch", "roots": [{"id": rid, "path": p} for rid, p in handlers],
+                    "daemon": daemon}),
         file=sys.stderr,
         flush=True,
     )

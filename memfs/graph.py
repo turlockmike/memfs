@@ -145,7 +145,7 @@ def connect(uri: str | None = None) -> Graph:
 
 _SCHEMA_STATEMENTS = [
     # Node path must be unique
-    "CREATE CONSTRAINT node_path_unique IF NOT EXISTS FOR (n:Node) REQUIRE n.path IS UNIQUE",
+    "CREATE CONSTRAINT node_root_path_unique IF NOT EXISTS FOR (n:Node) REQUIRE (n.root_id, n.path) IS UNIQUE",
     "CREATE CONSTRAINT query_id_unique IF NOT EXISTS FOR (q:Query) REQUIRE q.id IS UNIQUE",
     "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (c:Claim) REQUIRE c.id IS UNIQUE",
     "CREATE CONSTRAINT access_id_unique IF NOT EXISTS FOR (a:Access) REQUIRE a.id IS UNIQUE",
@@ -168,7 +168,8 @@ _SCHEMA_STATEMENTS = [
 ]
 
 _DROP_STATEMENTS = [
-    "DROP CONSTRAINT node_path_unique IF EXISTS",
+    "DROP CONSTRAINT node_root_path_unique IF EXISTS",
+    "DROP CONSTRAINT node_path_unique IF EXISTS",  # legacy single-key constraint, kept in drop list for clean reinstalls
     "DROP CONSTRAINT query_id_unique IF EXISTS",
     "DROP CONSTRAINT claim_id_unique IF EXISTS",
     "DROP CONSTRAINT access_id_unique IF EXISTS",
@@ -225,6 +226,9 @@ def add_node(
         raise RuntimeError(f"failed to create node: {path}")
 
 
+DEFAULT_ROOT_ID = "default"  # generic fallback for callers not supplying root_id; configured roots use ids from ~/.config/memfs/roots.json
+
+
 def upsert_node(
     graph: Graph,
     path: str,
@@ -240,17 +244,22 @@ def upsert_node(
     freshness_source_url: str | None = None,
     freshness_stale_after_days: int | None = None,
     is_handcrafted: bool = False,
+    root_id: str = DEFAULT_ROOT_ID,
 ) -> None:
-    """Insert or update a node (merge on path).
+    """Insert or update a node (merge on (root_id, path) composite key).
+
+    `root_id` identifies which configured root the file lives under.
+    Composite key with `path` allows the same relative path to exist in
+    multiple roots (e.g. each of two configured roots can have its own
+    top-level `index.md`).
 
     `is_handcrafted` (added 2026-05-01): true when the file body contains the
     `<!-- handcrafted -->` marker. Used by the index-render machinery to skip
-    auto-overwriting human-curated index.md files. Queryable so the auditor
-    can list curated vs auto-generated files.
+    auto-overwriting human-curated index.md files.
     """
     now = _now()
     graph.run(
-        """MERGE (n:Node {path: $path})
+        """MERGE (n:Node {root_id: $root_id, path: $path})
            ON CREATE SET
              n.title = $title, n.description = $description,
              n.content = $content, n.content_hash = $content_hash, n.date_hint = $date_hint,
@@ -268,7 +277,8 @@ def upsert_node(
              n.freshness_stale_after_days = $fd,
              n.is_handcrafted = $is_handcrafted,
              n.modified_at = $now""",
-        path=path, title=title, description=description,
+        root_id=root_id, path=path,
+        title=title, description=description,
         content=content, content_hash=content_hash, date_hint=date_hint,
         layer=layer, source=source,
         fv=freshness_verified_at, fs=freshness_source_url, fd=freshness_stale_after_days,
@@ -277,10 +287,12 @@ def upsert_node(
     )
 
 
-def get_node(graph: Graph, path: str) -> dict | None:
+def get_node(
+    graph: Graph, path: str, root_id: str = DEFAULT_ROOT_ID
+) -> dict | None:
     record = graph.run_one(
-        "MATCH (n:Node {path: $path}) RETURN n",
-        path=path,
+        "MATCH (n:Node {root_id: $root_id, path: $path}) RETURN n",
+        root_id=root_id, path=path,
     )
     if not record:
         return None
@@ -288,9 +300,12 @@ def get_node(graph: Graph, path: str) -> dict | None:
     return dict(n)
 
 
-def remove_node(graph: Graph, path: str) -> None:
+def remove_node(graph: Graph, path: str, root_id: str = DEFAULT_ROOT_ID) -> None:
     """Delete a node and all its incident relationships."""
-    graph.run("MATCH (n:Node {path: $path}) DETACH DELETE n", path=path)
+    graph.run(
+        "MATCH (n:Node {root_id: $root_id, path: $path}) DETACH DELETE n",
+        root_id=root_id, path=path,
+    )
 
 
 def get_all_nodes(graph: Graph) -> list[dict]:
@@ -318,8 +333,10 @@ def count_queries(graph: Graph) -> int:
 
 # -------- Link edge operations --------
 
-def clear_link_edges_from(graph: Graph, source_path: str) -> None:
-    """Delete LINK edges originating from a given node.
+def clear_link_edges_from(
+    graph: Graph, source_path: str, root_id: str = DEFAULT_ROOT_ID
+) -> None:
+    """Delete LINK edges originating from a given node (within a single root).
 
     Only clears edges created from parsed ``[[wikilinks]]`` in the file itself
     — i.e. edges whose ``source`` property is either ``"authored"`` or missing
@@ -330,10 +347,10 @@ def clear_link_edges_from(graph: Graph, source_path: str) -> None:
     edges are dropped and the current file's wikilinks are re-added.
     """
     graph.run(
-        """MATCH (s:Node {path: $path})-[r:LINK]->()
+        """MATCH (s:Node {root_id: $root_id, path: $path})-[r:LINK]->()
            WHERE coalesce(r.source, 'authored') = 'authored'
            DELETE r""",
-        path=source_path,
+        root_id=root_id, path=source_path,
     )
 
 
@@ -344,9 +361,16 @@ def upsert_link_edge(
     *,
     strength: float = 1.0,
     source: str = "authored",
+    src_root_id: str = DEFAULT_ROOT_ID,
+    tgt_root_id: str = DEFAULT_ROOT_ID,
 ) -> None:
-    """Create or update a LINK edge. Creates a placeholder target node if
-    missing (``strength`` indicates broken vs alive).
+    """Create or update a LINK edge between two nodes (potentially in different roots).
+
+    Creates a placeholder target node if missing (``strength`` indicates
+    broken vs alive).
+
+    For v1 multi-root: most LINKs stay within a single root (wikilinks rarely
+    cross roots), but the parameters allow cross-root edges if needed.
 
     The ``source`` property distinguishes authored wikilinks ("authored")
     from graph-derived edges ("content_similarity", "cosearch", ...) so
@@ -357,26 +381,29 @@ def upsert_link_edge(
     """
     now = _now()
     graph.run(
-        """MERGE (s:Node {path: $src})
-           MERGE (t:Node {path: $tgt})
+        """MERGE (s:Node {root_id: $src_root, path: $src})
+           MERGE (t:Node {root_id: $tgt_root, path: $tgt})
            MERGE (s)-[r:LINK]->(t)
            ON CREATE SET r.strength = $strength, r.created_at = $now,
                          r.last_activated = $now, r.access_count = 0,
                          r.source = $source
            ON MATCH  SET r.strength = $strength""",
-        src=source_path, tgt=target_path, strength=strength, now=now,
-        source=source,
+        src_root=src_root_id, src=source_path,
+        tgt_root=tgt_root_id, tgt=target_path,
+        strength=strength, now=now, source=source,
     )
 
 
-def upgrade_broken_links(graph: Graph, target_path: str) -> int:
+def upgrade_broken_links(
+    graph: Graph, target_path: str, root_id: str = DEFAULT_ROOT_ID
+) -> int:
     """When a file is created, upgrade LINK edges pointing to it from strength=0 to 1.0."""
     result = graph.run(
-        """MATCH ()-[r:LINK]->(t:Node {path: $tgt})
+        """MATCH ()-[r:LINK]->(t:Node {root_id: $root_id, path: $tgt})
            WHERE r.strength = 0
            SET r.strength = 1.0
            RETURN count(r) AS upgraded""",
-        tgt=target_path,
+        root_id=root_id, tgt=target_path,
     )
     return int(result[0]["upgraded"]) if result else 0
 
@@ -400,12 +427,13 @@ def upsert_search_edge(
     target_path: str,
     rank: int,
     rank_weight: float,
+    target_root_id: str = DEFAULT_ROOT_ID,
 ) -> float:
     """Create or strengthen a SEARCH edge from query to target. Returns new strength."""
     now = _now()
     result = graph.run(
         """MATCH (q:Query {id: $qid})
-           MATCH (n:Node {path: $tgt})
+           MATCH (n:Node {root_id: $root_id, path: $tgt})
            MERGE (q)-[r:SEARCH]->(n)
            ON CREATE SET r.strength = $weight, r.rank = $rank,
                          r.created_at = $now, r.last_activated = $now, r.access_count = 1
@@ -417,25 +445,31 @@ def upsert_search_edge(
                          r.last_activated = $now,
                          r.access_count = r.access_count + 1
            RETURN r.strength AS s""",
-        qid=query_id, tgt=target_path, weight=rank_weight, rank=rank, now=now,
+        qid=query_id, root_id=target_root_id, tgt=target_path,
+        weight=rank_weight, rank=rank, now=now,
     )
     return float(result[0]["s"]) if result else 0.0
 
 
-def update_node_search_tracking(graph: Graph, path: str) -> None:
+def update_node_search_tracking(
+    graph: Graph, path: str, root_id: str = DEFAULT_ROOT_ID
+) -> None:
     graph.run(
-        """MATCH (n:Node {path: $path})
+        """MATCH (n:Node {root_id: $root_id, path: $path})
            SET n.last_searched = $now,
                n.search_count = coalesce(n.search_count, 0) + 1""",
-        path=path, now=_now(),
+        root_id=root_id, path=path, now=_now(),
     )
 
 
-def get_search_edge_strength(graph: Graph, query_id: str, target_path: str) -> float:
+def get_search_edge_strength(
+    graph: Graph, query_id: str, target_path: str,
+    target_root_id: str = DEFAULT_ROOT_ID,
+) -> float:
     val = graph.run_scalar(
-        """MATCH (:Query {id: $qid})-[r:SEARCH]->(:Node {path: $tgt})
+        """MATCH (:Query {id: $qid})-[r:SEARCH]->(:Node {root_id: $root_id, path: $tgt})
            RETURN r.strength AS s""",
-        qid=query_id, tgt=target_path,
+        qid=query_id, root_id=target_root_id, tgt=target_path,
     )
     return float(val) if val is not None else 0.0
 
@@ -445,13 +479,14 @@ def get_search_edge_strength(graph: Graph, query_id: str, target_path: str) -> f
 def fulltext_search(graph: Graph, query: str, limit: int = 20,
                     layer: int | None = None) -> list[dict]:
     """Run a BM25-ranked full-text search. Returns list of dicts with
-    path, title, score, snippet."""
+    path, title, score, snippet, root_id."""
     # Neo4j fulltext accepts Lucene syntax. Use simple query for now.
     cypher = (
         "CALL db.index.fulltext.queryNodes('node_content', $q) "
         "YIELD node, score "
         + ("WHERE node.layer = $layer " if layer is not None else "")
         + "RETURN node.path AS path, node.title AS title, "
+        "node.root_id AS root_id, "
         "node.description AS description, node.content AS content, "
         "node.layer AS layer, node.date_hint AS date_hint, "
         "node.modified_at AS modified_at, "

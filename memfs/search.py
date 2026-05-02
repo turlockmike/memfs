@@ -92,7 +92,8 @@ def _freshness_status(node: dict) -> str:
 
 
 def grep(graph, query: str, limit: int = 20, layer: int | None = None,
-         fresh_only: bool = False) -> list[dict]:
+         fresh_only: bool = False, no_siblings: bool = False,
+         siblings_top_n: int = 3) -> list[dict]:
     """Neo4j fulltext search, creates search edges for top-3, returns ranked results.
 
     Parameters
@@ -102,6 +103,11 @@ def grep(graph, query: str, limit: int = 20, layer: int | None = None,
     limit : max results
     layer : if set, restrict to nodes with this layer
     fresh_only : if True, drop results whose freshness == 'stale'
+    no_siblings : if True, omit directory siblings from all results (big JSON
+        trim — a sibling list adds ~1KB per result × limit).
+    siblings_top_n : when no_siblings is False, only attach siblings to the
+        first N ranked results (default 3). Others still get directory,
+        links_to, linked_from, and index — just not the sibling listing.
     """
     # Extract date for temporal boosting (before sanitization strips digits)
     query_date = _extract_date(query)
@@ -161,6 +167,7 @@ def grep(graph, query: str, limit: int = 20, layer: int | None = None,
 
         results.append({
             "path": row["path"],
+            "root_id": row.get("root_id"),
             "title": row.get("title"),
             "rank": i + 1,  # will be rewritten after re-rank
             "score": score,
@@ -175,9 +182,14 @@ def grep(graph, query: str, limit: int = 20, layer: int | None = None,
     for i, r in enumerate(results):
         r["rank"] = i + 1
 
-    # Enrich with neighborhood
-    for r in results:
+    # Enrich with neighborhood. Siblings are the biggest per-result payload,
+    # so by default we only attach them to the top `siblings_top_n` results.
+    # `no_siblings=True` strips them entirely. Directory/links/index stay on
+    # every result since they're small and load-bearing for ranking context.
+    for idx, r in enumerate(results):
         nbh = graph_mod.neighborhood(graph, r["path"])
+        if no_siblings or idx >= siblings_top_n:
+            nbh.pop("siblings", None)
         r.update(nbh)
 
     # Create / strengthen query node + search edges for top 3

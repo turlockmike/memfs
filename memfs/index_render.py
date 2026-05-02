@@ -40,8 +40,11 @@ HANDCRAFTED_MARKER = "<!-- handcrafted -->"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _list_immediate_children(graph: graph_mod.Graph, rel_dir: str) -> tuple[list[dict], set[str]]:
-    """Return (files_in_dir, subdirs_with_indexed_descendants).
+def _list_immediate_children(
+    graph: graph_mod.Graph, rel_dir: str,
+    root_id: str = graph_mod.DEFAULT_ROOT_ID,
+) -> tuple[list[dict], set[str]]:
+    """Return (files_in_dir, subdirs_with_indexed_descendants) within a single root.
 
     Files: list of node dicts (path, title, description, is_handcrafted).
     Subdirs: set of immediate subdirectory names that contain at least one
@@ -51,13 +54,14 @@ def _list_immediate_children(graph: graph_mod.Graph, rel_dir: str) -> tuple[list
     rel_dir = rel_dir.strip("/")
     prefix = "" if rel_dir in ("", ".") else rel_dir + "/"
 
-    # Pull all nodes whose path starts with this prefix. For the root case,
-    # that's every node. For deeper dirs, this scopes naturally.
+    # Pull all nodes whose path starts with this prefix WITHIN this root.
+    # Without root_id scoping, multi-root indexes would mix content from
+    # different roots that happen to share path prefixes.
     rows = graph.run(
-        "MATCH (n:Node) WHERE n.path STARTS WITH $prefix RETURN n.path AS path, "
-        "n.title AS title, n.description AS description, n.is_handcrafted AS is_handcrafted "
-        "ORDER BY n.path",
-        prefix=prefix,
+        "MATCH (n:Node) WHERE n.root_id = $root_id AND n.path STARTS WITH $prefix "
+        "RETURN n.path AS path, n.title AS title, n.description AS description, "
+        "n.is_handcrafted AS is_handcrafted ORDER BY n.path",
+        root_id=root_id, prefix=prefix,
     )
 
     files: list[dict] = []
@@ -111,22 +115,26 @@ def _clean(s: str) -> str:
     return s
 
 
-def render_index_for_dir(graph: graph_mod.Graph, mem_home: str, rel_dir: str) -> str:
-    """Return the markdown content that should be at `<rel_dir>/index.md`.
+def render_index_for_dir(
+    graph: graph_mod.Graph, mem_home: str, rel_dir: str,
+    root_id: str = graph_mod.DEFAULT_ROOT_ID,
+) -> str:
+    """Return the markdown content that should be at `<rel_dir>/index.md`
+    within the given root.
 
     Pure function — does not write to disk. Caller decides whether to write
     based on handcrafted-marker check or drift detection.
     """
     rel_dir_norm = rel_dir.strip("/")
     title = _title_for_dir(rel_dir_norm)
-    files, subdirs = _list_immediate_children(graph, rel_dir_norm)
+    files, subdirs = _list_immediate_children(graph, rel_dir_norm, root_id=root_id)
 
     # Subdirs are rendered with `index.md` if they have one tracked, otherwise
     # plain. We also note whether the subdir's own index is handcrafted.
     subdir_meta: list[dict] = []
     for sd in sorted(subdirs):
         sd_index_path = (rel_dir_norm + "/" + sd + "/index.md").lstrip("/")
-        sd_index_node = graph_mod.get_node(graph, sd_index_path)
+        sd_index_node = graph_mod.get_node(graph, sd_index_path, root_id=root_id)
         subdir_meta.append({
             "name": sd,
             "has_index": sd_index_node is not None,
@@ -192,7 +200,8 @@ def _is_handcrafted_on_disk(abs_index_path: str) -> bool:
 
 
 def write_index_if_drifted(
-    graph: graph_mod.Graph, mem_home: str, rel_dir: str
+    graph: graph_mod.Graph, mem_home: str, rel_dir: str,
+    root_id: str = graph_mod.DEFAULT_ROOT_ID,
 ) -> str:
     """Render this directory's index.md if drifted from graph view.
 
@@ -210,13 +219,13 @@ def write_index_if_drifted(
     if _is_handcrafted_on_disk(abs_index):
         return "skipped-handcrafted"
 
-    files, subdirs = _list_immediate_children(graph, rel_dir_norm)
+    files, subdirs = _list_immediate_children(graph, rel_dir_norm, root_id=root_id)
     if not files and not subdirs:
         # Nothing indexed under this dir → no index.md needed. If one exists
         # on disk and isn't handcrafted, leave it alone (could be a stub).
         return "no-content"
 
-    new_text = render_index_for_dir(graph, mem_home, rel_dir_norm) + "\n"
+    new_text = render_index_for_dir(graph, mem_home, rel_dir_norm, root_id=root_id) + "\n"
 
     # Compare to existing.
     if os.path.isfile(abs_index):
