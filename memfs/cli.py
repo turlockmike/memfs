@@ -87,6 +87,8 @@ def cmd_grep(args):
         results = do_grep(
             graph, args.query, limit=args.limit,
             layer=args.layer, fresh_only=args.fresh_only,
+            no_siblings=getattr(args, "no_siblings", False),
+            siblings_top_n=getattr(args, "siblings_top_n", 3),
         )
     finally:
         graph.close()
@@ -145,6 +147,9 @@ def cmd_ls(args):
 
 
 def cmd_status(args):
+    from memfs.index_render import check_all as check_all_indexes
+
+    mem_home = get_mem_home(args)
     graph = _connect_or_die()
     try:
         nodes = count_nodes(graph)
@@ -153,6 +158,22 @@ def cmd_status(args):
         queries = count_queries(graph)
         last_index = get_meta(graph, "last_index")
         last_decay = get_meta(graph, "last_decay")
+        # Index health (added 2026-05-01): per-directory `index.md` drift.
+        # See memfs/index_render.py — memfs is the holistic memory system,
+        # so index.md files are part of its responsibility.
+        try:
+            handcrafted_count = graph.run_one(
+                "MATCH (n:Node) WHERE n.is_handcrafted = true RETURN count(n) AS c"
+            )["c"]
+        except Exception:
+            handcrafted_count = 0
+        try:
+            drift_map = check_all_indexes(graph, mem_home)
+            drift_count = sum(len(v) for v in drift_map.values())
+            drift_dirs = len(drift_map)
+        except Exception as e:
+            drift_count = -1
+            drift_dirs = -1
     finally:
         graph.close()
 
@@ -162,6 +183,11 @@ def cmd_status(args):
         "queries": queries,
         "last_index": last_index,
         "last_decay": last_decay,
+        "indexes": {
+            "handcrafted": handcrafted_count,
+            "drift_findings": drift_count,
+            "drifted_dirs": drift_dirs,
+        },
     })
 
 
@@ -297,15 +323,60 @@ def _setup_generic(skills_dir: str):
 
 
 def cmd_reindex(args):
+    from memfs.index_render import render_all
+
     mem_home = get_mem_home(args)
     graph = _connect_or_die()
     try:
         count = do_reindex(graph, mem_home)
         edges = count_edges(graph)
+        # After the graph is rebuilt, re-render every directory's index.md
+        # (added 2026-05-01 — memfs is the holistic memory system; index files
+        # are a first-class output, not a peripheral renderer).
+        index_results = render_all(graph, mem_home)
     finally:
         graph.close()
 
-    out({"action": "reindex", "nodes": count, "edges": edges})
+    out({
+        "action": "reindex",
+        "nodes": count,
+        "edges": edges,
+        "indexes": index_results,
+    })
+
+
+def cmd_check_indexes(args):
+    """Check per-directory index.md files for drift against graph view.
+
+    With --fix, auto-render any drifted non-handcrafted indexes.
+    Exit code: 0 if clean, 1 if any drift remains after optional --fix.
+    """
+    from memfs.index_render import check_all, render_all
+
+    mem_home = get_mem_home(args)
+    graph = _connect_or_die()
+    try:
+        if getattr(args, "fix", False):
+            results = render_all(graph, mem_home)
+            # Re-check after fixing.
+            drift_map = check_all(graph, mem_home)
+        else:
+            results = None
+            drift_map = check_all(graph, mem_home)
+    finally:
+        graph.close()
+
+    payload = {
+        "action": "check-indexes",
+        "drifted_dirs": len(drift_map),
+        "drift_findings": sum(len(v) for v in drift_map.values()),
+        "details": drift_map,
+    }
+    if results is not None:
+        payload["fixed"] = results
+    out(payload)
+    if drift_map:
+        sys.exit(1)
 
 
 # --- M4 commands (calibration ledger + contradictions) ---
@@ -784,6 +855,16 @@ def main():
     p_grep.add_argument("--limit", type=int, default=20, help="Max results")
     p_grep.add_argument("--layer", type=int, default=None, help="Filter by layer (1-5)")
     p_grep.add_argument("--fresh-only", action="store_true", help="Drop stale results")
+    p_grep.add_argument("--no-siblings", dest="no_siblings", action="store_true",
+                        help="Omit directory siblings from all results. Cuts "
+                             "JSON payload ~10x on bulk queries — use when "
+                             "piping grep output to downstream tools.")
+    p_grep.add_argument("--siblings-top-n", dest="siblings_top_n", type=int,
+                        default=3,
+                        help="Attach sibling listings only to the first N "
+                             "ranked results (default 3). Lower ranks keep "
+                             "directory/links/index context but drop "
+                             "siblings. Set to 0 to match --no-siblings.")
 
     p_ls = sub.add_parser("ls", help="List indexed files")
     p_ls.add_argument("subdir", nargs="?", default=None, help="Subdirectory to list")
@@ -805,6 +886,16 @@ def main():
     p_decay.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("reindex", help="Rebuild index from files")
+
+    # Index health (added 2026-05-01) — drift detection over per-directory
+    # `index.md` files. memfs is the holistic memory system; index files are
+    # part of its responsibility. See memfs/index_render.py.
+    p_check = sub.add_parser(
+        "check-indexes",
+        help="Check per-directory index.md files for drift against graph view",
+    )
+    p_check.add_argument("--fix", action="store_true",
+                         help="Auto-render any drifted (non-handcrafted) indexes")
 
     # Calibration ledger (M4)
     p_claim = sub.add_parser(
@@ -1056,6 +1147,7 @@ def main():
         "skills": cmd_skills,
         "_decay": cmd_decay,
         "reindex": cmd_reindex,
+        "check-indexes": cmd_check_indexes,
         "claim": cmd_claim,
         "verify": cmd_verify,
         "calibration": cmd_calibration,

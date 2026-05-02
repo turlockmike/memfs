@@ -1,4 +1,11 @@
-"""Filesystem watcher daemon — keeps Neo4j graph in sync with file changes."""
+"""Filesystem watcher daemon — keeps Neo4j graph in sync with file changes.
+
+Also (added 2026-05-01) keeps per-directory `index.md` files in sync with the
+graph view via `index_render.write_index_if_drifted`. memfs is the holistic
+memory system: indexes are a first-class output surface, not a peripheral
+renderer. Render is synchronous-per-event in v1; if perf becomes an issue,
+add a debounce window over a "dirty directories" set.
+"""
 
 import json
 import os
@@ -18,6 +25,7 @@ from memfs.indexer import (
     is_ignored,
     update_node,
 )
+from memfs.index_render import write_index_if_drifted
 
 
 class MemfsEventHandler(FileSystemEventHandler):
@@ -49,6 +57,29 @@ class MemfsEventHandler(FileSystemEventHandler):
     def _is_md(self, path: str) -> bool:
         return path.endswith(".md") or path.endswith(".jsonl")
 
+    def _maybe_render_dir_index(self, graph, abs_path: str) -> None:
+        """Re-render the parent directory's `index.md` if drifted.
+
+        Skips the case where the changed file IS the index.md itself (would be
+        a self-trigger; `write_index_if_drifted` would return 'no-change'
+        anyway, but skipping avoids the round trip). Skips JSONL files —
+        indexes only cover markdown.
+        """
+        if not abs_path.endswith(".md"):
+            return
+        if os.path.basename(abs_path) == "index.md":
+            return
+        rel_dir = os.path.relpath(os.path.dirname(abs_path), self.mem_home)
+        if rel_dir == ".":
+            rel_dir = ""
+        try:
+            result = write_index_if_drifted(graph, self.mem_home, rel_dir)
+            if result == "wrote":
+                self._log("index_rendered", os.path.join(self.mem_home, rel_dir, "index.md"))
+        except Exception as e:
+            # Don't let an index render failure break the indexing flow.
+            self._log("index_render_error", abs_path, error=str(e))
+
     def _log(self, event: str, path: str, **kwargs):
         print(
             json.dumps({"event": event, "path": self._rel_path(path), **kwargs}),
@@ -69,6 +100,8 @@ class MemfsEventHandler(FileSystemEventHandler):
             self._log("created", abs_path, indexed=True, broken_links_upgraded=upgraded)
             # M4 hook: contradiction detection for layer >= 3 nodes
             _maybe_detect_contradictions(graph, self.mem_home, rel)
+            # Index-render hook (2026-05-01): refresh parent dir's index.md
+            self._maybe_render_dir_index(graph, abs_path)
         finally:
             graph.close()
 
@@ -82,6 +115,8 @@ class MemfsEventHandler(FileSystemEventHandler):
             if changed:
                 self._log("modified", abs_path, indexed=True)
                 _maybe_detect_contradictions(graph, self.mem_home, rel)
+                # Description/title may have changed → re-render parent's index.
+                self._maybe_render_dir_index(graph, abs_path)
         finally:
             graph.close()
 
@@ -93,6 +128,8 @@ class MemfsEventHandler(FileSystemEventHandler):
         try:
             remove_file(graph, rel)
             self._log("deleted", abs_path, indexed=True)
+            # Parent index now references a missing file — re-render.
+            self._maybe_render_dir_index(graph, abs_path)
         finally:
             graph.close()
 
@@ -112,6 +149,10 @@ class MemfsEventHandler(FileSystemEventHandler):
                 index_file(graph, self.mem_home, new_rel)
                 upgrade_broken_links(graph, new_rel)
             self._log("moved", dest_abs, from_path=old_rel)
+            # Re-render BOTH old and new parent dirs (could be the same dir).
+            self._maybe_render_dir_index(graph, src_abs)
+            if os.path.dirname(src_abs) != os.path.dirname(dest_abs):
+                self._maybe_render_dir_index(graph, dest_abs)
         finally:
             graph.close()
 

@@ -16,6 +16,58 @@ _TEXT_KEYS = {"msg", "message", "content", "text", "description", "title", "name
               "question", "answer", "summary", "body", "comment", "note"}
 HEADING_PATTERN = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 
+# Frontmatter prefixes to strip when resolving links_to: targets to mem_home-relative
+# paths. Journals and other artifacts often write home-relative paths
+# (`.config/karpathy/areas/USER.md`) for human readability; memfs indexes
+# paths relative to MEM_HOME (which IS `~/.config/karpathy/`), so the prefix
+# must be stripped or the edge target won't resolve to an existing node.
+# Configurable via MEMFS_FRONTMATTER_LINK_PREFIXES env (colon-separated).
+_DEFAULT_LINK_PREFIXES = (".config/karpathy/",)
+
+
+def _link_prefixes() -> tuple[str, ...]:
+    raw = os.environ.get("MEMFS_FRONTMATTER_LINK_PREFIXES", "").strip()
+    if not raw:
+        return _DEFAULT_LINK_PREFIXES
+    return tuple(p.strip() for p in raw.split(":") if p.strip())
+
+
+def extract_frontmatter_links(frontmatter: dict) -> list[str]:
+    """Extract link targets from frontmatter `links_to:` array.
+
+    Strips configured home-relative prefixes (e.g. `.config/karpathy/`) so the
+    targets resolve against MEM_HOME paths. Skips non-string entries, paths
+    starting with `~` (un-resolvable here), and paths containing parens or
+    other annotation noise (`USER.md (PREDICTIONS LEDGER #90)`).
+    Deduplicates while preserving order.
+    """
+    fm = frontmatter or {}
+    raw = fm.get("links_to")
+    if not isinstance(raw, list):
+        return []
+    prefixes = _link_prefixes()
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        t = entry.strip()
+        if not t:
+            continue
+        # Hard skips: tilde paths, directory-trailing-slash, parenthetical
+        # annotations are noise, not parseable link targets.
+        if t.startswith("~") or t.endswith("/") or "(" in t:
+            continue
+        for prefix in prefixes:
+            if t.startswith(prefix):
+                t = t[len(prefix):]
+                break
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
 
 def _parse_jsonl(filepath: str, raw: str, content_hash: str) -> dict:
     """Parse a JSONL file — extract text fields from each line for indexing."""
@@ -109,14 +161,29 @@ def parse_file(filepath: str) -> dict:
     if description:
         description = str(description)[:200]
 
+    # Detect handcrafted-index marker. The string `<!-- handcrafted -->` in the
+    # first 200 chars of the BODY (after frontmatter) marks an index.md file
+    # that humans curate intentionally; memfs's index renderer must NOT
+    # auto-overwrite these. The flag becomes a Node property so it's queryable.
+    is_handcrafted = "<!-- handcrafted -->" in content[:200]
+
     # Extract date hint
     date_hint: Optional[str] = None
     date_val = frontmatter.get("date")
     if date_val is not None:
         date_hint = str(date_val)
 
-    # Extract links
-    links = extract_links(content)
+    # Extract links: wikilinks from body + targets from frontmatter `links_to:`.
+    # Frontmatter links are appended after wikilinks; dedup preserves first-seen order.
+    body_links = extract_links(content)
+    fm_links = extract_frontmatter_links(frontmatter)
+    seen_links: set[str] = set()
+    links: list[str] = []
+    for t in body_links + fm_links:
+        if t in seen_links:
+            continue
+        seen_links.add(t)
+        links.append(t)
 
     # M2: Extract layer + source (validation happens in indexer.index_file)
     layer = frontmatter.get("layer")
@@ -149,4 +216,5 @@ def parse_file(filepath: str) -> dict:
         "freshness_verified_at": freshness_verified_at,
         "freshness_source_url": freshness_source_url,
         "freshness_stale_after_days": freshness_stale_after_days,
+        "is_handcrafted": is_handcrafted,
     }

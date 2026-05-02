@@ -239,8 +239,15 @@ def upsert_node(
     freshness_verified_at: str | None = None,
     freshness_source_url: str | None = None,
     freshness_stale_after_days: int | None = None,
+    is_handcrafted: bool = False,
 ) -> None:
-    """Insert or update a node (merge on path)."""
+    """Insert or update a node (merge on path).
+
+    `is_handcrafted` (added 2026-05-01): true when the file body contains the
+    `<!-- handcrafted -->` marker. Used by the index-render machinery to skip
+    auto-overwriting human-curated index.md files. Queryable so the auditor
+    can list curated vs auto-generated files.
+    """
     now = _now()
     graph.run(
         """MERGE (n:Node {path: $path})
@@ -250,6 +257,7 @@ def upsert_node(
              n.layer = $layer, n.source = $source,
              n.freshness_verified_at = $fv, n.freshness_source_url = $fs,
              n.freshness_stale_after_days = $fd,
+             n.is_handcrafted = $is_handcrafted,
              n.created_at = $now, n.modified_at = $now,
              n.last_searched = null, n.search_count = 0
            ON MATCH SET
@@ -258,11 +266,13 @@ def upsert_node(
              n.layer = $layer, n.source = $source,
              n.freshness_verified_at = $fv, n.freshness_source_url = $fs,
              n.freshness_stale_after_days = $fd,
+             n.is_handcrafted = $is_handcrafted,
              n.modified_at = $now""",
         path=path, title=title, description=description,
         content=content, content_hash=content_hash, date_hint=date_hint,
         layer=layer, source=source,
         fv=freshness_verified_at, fs=freshness_source_url, fd=freshness_stale_after_days,
+        is_handcrafted=is_handcrafted,
         now=now,
     )
 
