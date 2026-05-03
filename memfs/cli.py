@@ -375,26 +375,78 @@ def _setup_generic(skills_dir: str):
             out({"skill": f"memfs-{name}", "content": content})
 
 
-def cmd_reindex(args):
+def reindex_all_roots(
+    graph, scopes: list[tuple[str, str]],
+) -> dict:
+    """Multi-root-aware reindex. For each ``(root_id, mem_home)`` scope:
+
+    1. ``clear_root_data(graph, root_id)`` — purge that root's Node nodes
+       (DETACH DELETE removes attached LINK/SEARCH edges).
+    2. ``index_directory(graph, mem_home, root_id=root_id)`` — walk that
+       root's filesystem, re-index files under that root_id.
+    3. Re-render every directory's ``index.md`` for that root.
+
+    Other roots are untouched.
+
+    Added 2026-05-03 to fix the multi-root-unaware ``cmd_reindex`` bug
+    (drift_findings escalating 363 → 640 → 923 → 1702 on the alfred
+    substrate). Shared scope resolution with ``cmd_status`` and
+    ``cmd_check_indexes`` via ``_resolve_index_scopes`` is the regression
+    guard.
+
+    Returns aggregated counts: ``{"per_root": [...], "total_nodes": N,
+    "total_indexes_wrote": N}``.
+    """
+    from memfs.indexer import reindex as _reindex
     from memfs.index_render import render_all
 
-    mem_home = get_mem_home(args)
+    per_root = []
+    total_nodes = 0
+    total_wrote = 0
+    for root_id, mem_home in scopes:
+        node_count = _reindex(graph, mem_home, root_id=root_id)
+        index_results = render_all(graph, mem_home, root_id=root_id)
+        per_root.append({
+            "root_id": root_id,
+            "mem_home": mem_home,
+            "nodes": node_count,
+            "indexes": index_results,
+        })
+        total_nodes += node_count
+        total_wrote += index_results.get("wrote", 0)
+    return {
+        "per_root": per_root,
+        "total_nodes": total_nodes,
+        "total_indexes_wrote": total_wrote,
+    }
+
+
+def cmd_reindex(args):
+    """Reindex the graph from filesystem.
+
+    Default (no ``--dir``, no ``MEM_HOME`` env): iterate ALL configured
+    roots from ``~/.config/memfs/roots.json`` plus a synthetic default
+    scope at $HOME, reindex each independently. This is the multi-root-
+    aware path added 2026-05-03 — see ``reindex_all_roots`` docstring.
+
+    With explicit ``--dir`` or ``MEM_HOME``: legacy single-root behavior
+    against ``DEFAULT_ROOT_ID``. Useful for one-off corpora.
+    """
+    scopes, explicit_dir = _resolve_index_scopes(args)
     graph = _connect_or_die()
     try:
-        count = do_reindex(graph, mem_home)
+        result = reindex_all_roots(graph, scopes)
         edges = count_edges(graph)
-        # After the graph is rebuilt, re-render every directory's index.md
-        # (added 2026-05-01 — memfs is the holistic memory system; index files
-        # are a first-class output, not a peripheral renderer).
-        index_results = render_all(graph, mem_home)
     finally:
         graph.close()
 
     out({
         "action": "reindex",
-        "nodes": count,
+        "scopes": [{"root_id": rid, "mem_home": mh} for rid, mh in scopes],
+        "explicit_dir": explicit_dir,
+        "per_root": result["per_root"],
+        "total_nodes": result["total_nodes"],
         "edges": edges,
-        "indexes": index_results,
     })
 
 

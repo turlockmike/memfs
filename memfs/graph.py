@@ -667,6 +667,31 @@ def rename_prefix(graph: Graph, old_prefix: str, new_prefix: str) -> None:
 # -------- Full reset (for reindex) --------
 
 def clear_data(graph: Graph) -> None:
-    """Delete all Node, Query, LINK, SEARCH. Preserves Meta and Claims."""
+    """Delete all Node, Query, LINK, SEARCH. Preserves Meta and Claims.
+
+    NOTE: this wipes ALL roots. For multi-root deployments use
+    ``clear_root_data`` to wipe only one root.
+    """
     graph.run("MATCH (n:Node) DETACH DELETE n")
     graph.run("MATCH (q:Query) DETACH DELETE q")
+
+
+def clear_root_data(graph: Graph, root_id: str) -> None:
+    """Delete all Node nodes (and their incident LINK/SEARCH edges) tagged
+    with the given ``root_id``. Other roots are untouched.
+
+    Query nodes are global (no root_id) and survive — they're cheap and
+    a Query orphaned by this delete will simply have zero SEARCH edges
+    until the next search resurrects it.
+
+    Added 2026-05-03 to support multi-root-aware ``cmd_reindex``. The
+    indexer.reindex docstring previously claimed this primitive existed
+    "added 2026-05-01" — it did not, until now. That documentation lie
+    was the silent failure underlying the drift_findings escalation
+    (363 → 640 → 923 → 1702) on the alfred substrate after legitimate
+    symlink cleanup.
+    """
+    graph.run(
+        "MATCH (n:Node {root_id: $rid}) DETACH DELETE n",
+        rid=root_id,
+    )

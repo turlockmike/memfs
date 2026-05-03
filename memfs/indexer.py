@@ -225,13 +225,21 @@ def reindex(
     graph, mem_home: str,
     root_id: str = graph_mod.DEFAULT_ROOT_ID,
 ) -> int:
-    """Drop all node/query/edge data and reindex from scratch. Preserves Claims + Meta.
+    """Drop the target root's nodes/edges and reindex it from scratch.
 
-    NOTE: clear_data() wipes ALL nodes across ALL roots. For multi-root
-    callers, reindex must be invoked once per root AFTER an initial clear, OR
-    use clear_root_data() (added 2026-05-01) to wipe a single root.
+    Scoped to ``root_id`` only — other roots' nodes survive. Preserves
+    Claims and Meta globally (those are not Node-typed).
+
+    History: prior to 2026-05-03 this called ``clear_data`` (which wipes
+    ALL roots) and then walked one root with ``index_directory``. On
+    multi-root deployments that left every other configured root empty
+    in the graph until the watcher daemon slowly repopulated it, AND
+    re-tagged the walked root's nodes with ``root_id`` (correct), but
+    silently destroyed alfred-state / alfred-home node sets that no
+    subsequent reindex would recover. ``test_reindex_multiroot.py`` pins
+    the new contract.
     """
-    graph_mod.clear_data(graph)
+    graph_mod.clear_root_data(graph, root_id=root_id)
     return index_directory(graph, mem_home, root_id=root_id)
 
 
