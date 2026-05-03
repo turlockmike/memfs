@@ -212,7 +212,17 @@ def write_index_if_drifted(
       "no-content"          — directory has no indexed markdown; no index needed
     """
     rel_dir_norm = rel_dir.strip("/")
+    # Guard against escaping the root (e.g. paths starting with "..", which
+    # appear when a symlink inside the tree points outside it). Don't try to
+    # write outside the configured root.
+    if rel_dir_norm.startswith("..") or "/.." in rel_dir_norm:
+        return "no-content"
     abs_dir = os.path.join(mem_home, rel_dir_norm) if rel_dir_norm else mem_home
+    # Resolve and re-check (catches symlink escapes)
+    abs_dir_real = os.path.realpath(abs_dir)
+    mem_home_real = os.path.realpath(mem_home)
+    if not abs_dir_real.startswith(mem_home_real):
+        return "no-content"
     abs_index = os.path.join(abs_dir, "index.md")
 
     # If on-disk file is handcrafted, leave it alone regardless of drift.
@@ -251,25 +261,48 @@ def write_index_if_drifted(
 
 
 def check_drift_for_dir(
-    graph: graph_mod.Graph, mem_home: str, rel_dir: str
+    graph: graph_mod.Graph, mem_home: str, rel_dir: str,
+    root_id: str = graph_mod.DEFAULT_ROOT_ID,
 ) -> list[str]:
     """Return list of drift findings for this directory's index.md.
 
     Empty list = no drift. Findings are short, human-readable strings.
+
+    Three drift directions are checked:
+
+    1. Forward (graph → index): every file/subdir the graph knows about
+       should be mentioned in index.md.
+    2. Reverse (index → filesystem): every backticked `name.md` or
+       `subdir/` reference in index.md should exist on disk. **Filesystem
+       is ground truth** — graph membership does not absolve a missing
+       file. (Pre-2026-05-03 the detector silently filtered out
+       index references that the graph also knew about, which made
+       phantom-on-disk drift invisible — the n=1 watch
+       `memfs-detector-blind-to-fs-drift`.)
+    3. Index existence: if the directory has graph content OR an
+       index.md on disk, scan. Pre-fix: an empty graph view caused
+       early-exit even when index.md held phantom references.
+
+    External references (slash-commands like `/telegram`, bare command
+    names like `gog`, home-relative paths like `~/mail/outbox/`, and
+    nested paths like `sub/file.md`) are heuristically excluded — they
+    appear in handcrafted indexes as documentation, not as local-file
+    claims. Only `name.md` and `name/` shapes are checked.
     """
     findings: list[str] = []
     rel_dir_norm = rel_dir.strip("/")
     abs_dir = os.path.join(mem_home, rel_dir_norm) if rel_dir_norm else mem_home
     abs_index = os.path.join(abs_dir, "index.md")
 
-    files, subdirs = _list_immediate_children(graph, rel_dir_norm)
+    files, subdirs = _list_immediate_children(graph, rel_dir_norm, root_id=root_id)
+    index_exists = os.path.isfile(abs_index)
 
-    if not files and not subdirs:
-        # No indexed content. If an index.md exists, that's not drift per se —
-        # might be a placeholder. Don't flag.
+    # If the graph has nothing AND there's no index.md, nothing to check.
+    if not files and not subdirs and not index_exists:
         return findings
 
-    if not os.path.isfile(abs_index):
+    # Graph has content but no index → flag missing.
+    if not index_exists:
         findings.append(f"MISSING: {abs_index}")
         return findings
 
@@ -280,8 +313,7 @@ def check_drift_for_dir(
         findings.append(f"UNREADABLE: {abs_index} ({e})")
         return findings
 
-    # Each indexed file should appear in the index.md, identified by its
-    # filename in backticks (the canonical form rendered by this module).
+    # Forward (graph → index): graph-known items should be mentioned.
     for fmeta in files:
         if f"`{fmeta['name']}`" not in text:
             findings.append(f"FILE NOT IN INDEX: {fmeta['path']}")
@@ -290,20 +322,40 @@ def check_drift_for_dir(
         if f"`{sd}/`" not in text and f"`{sd}`" not in text:
             findings.append(f"SUBDIR NOT IN INDEX: {sd}")
 
-    # Check for stale references — files mentioned in index that no longer
-    # exist on disk. (We use existence check, not graph membership, because a
-    # file could be on disk but ignored by .memignore.)
-    for m in re.finditer(r"`([^`]+\.md)`", text):
-        name = m.group(1)
-        if "/" in name:
-            continue  # path-like reference, skip
-        if name == "index.md":
+    # Reverse (index → filesystem): every backticked local-file or
+    # local-subdir reference must exist on disk. Filesystem is ground
+    # truth; graph state is irrelevant to this check.
+    for m in re.finditer(r"`([^`]+)`", text):
+        name = m.group(1).strip()
+        if not name or name == "index.md":
             continue
-        if not os.path.exists(os.path.join(abs_dir, name)):
-            # Check it's not a known indexed file with a different naming
-            indexed_names = {f["name"] for f in files}
-            if name not in indexed_names:
+        # Skip refs that aren't claims about local files/subdirs:
+        #   - absolute paths (/foo) — slash-commands or system paths
+        #   - home-relative (~/...) — external resources
+        #   - parent-relative (../foo) — outside scope
+        #   - dot-relative current dir, OK after stripping
+        if name.startswith(("/", "~", "..")):
+            continue
+        if name.startswith("./"):
+            name = name[2:]
+        # After this normalization, an inner "/" means a nested path
+        # like "sub/file.md" — out of scope for this directory's check.
+        if name.rstrip("/").count("/") > 0:
+            continue
+        # Skip command-like refs (contain spaces, quotes, flags).
+        if any(ch in name for ch in (" ", '"', "'", "*", "$", "|", "(")):
+            continue
+        if name.endswith("/"):
+            subdir_name = name.rstrip("/")
+            if not os.path.isdir(os.path.join(abs_dir, subdir_name)):
+                findings.append(f"INDEX REFERENCES MISSING SUBDIR: {name}")
+        elif name.endswith(".md"):
+            if not os.path.exists(os.path.join(abs_dir, name)):
                 findings.append(f"INDEX REFERENCES MISSING FILE: {name}")
+        # else: bare token (e.g. `gog`, `tg`) — ambiguous between local
+        # subdir-ref and external CLI command; skip to avoid false
+        # positives. The graph→index forward check still catches missing
+        # mentions of known subdirs.
 
     return findings
 
@@ -313,10 +365,15 @@ def check_drift_for_dir(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _walk_indexed_dirs(graph: graph_mod.Graph) -> Iterator[str]:
+def _walk_indexed_dirs(
+    graph: graph_mod.Graph, root_id: str = graph_mod.DEFAULT_ROOT_ID,
+) -> Iterator[str]:
     """Yield every directory path (relative to mem_home) that contains at least
-    one indexed file. Includes the root ("")."""
-    rows = graph.run("MATCH (n:Node) RETURN DISTINCT n.path AS path")
+    one indexed file under the given root. Includes the root ("")."""
+    rows = graph.run(
+        "MATCH (n:Node) WHERE n.root_id = $root_id RETURN DISTINCT n.path AS path",
+        root_id=root_id,
+    )
     seen: set[str] = set()
     for row in rows:
         path = row["path"]
@@ -336,23 +393,29 @@ def _walk_indexed_dirs(graph: graph_mod.Graph) -> Iterator[str]:
                 yield ""
 
 
-def render_all(graph: graph_mod.Graph, mem_home: str) -> dict[str, int]:
+def render_all(
+    graph: graph_mod.Graph, mem_home: str,
+    root_id: str = graph_mod.DEFAULT_ROOT_ID,
+) -> dict[str, int]:
     """Re-render index.md across every directory containing indexed content.
 
     Returns counts: {"wrote": N, "skipped-handcrafted": N, "no-change": N, "no-content": N}.
     """
     counts = {"wrote": 0, "skipped-handcrafted": 0, "no-change": 0, "no-content": 0}
-    for rel_dir in _walk_indexed_dirs(graph):
-        result = write_index_if_drifted(graph, mem_home, rel_dir)
+    for rel_dir in _walk_indexed_dirs(graph, root_id=root_id):
+        result = write_index_if_drifted(graph, mem_home, rel_dir, root_id=root_id)
         counts[result] = counts.get(result, 0) + 1
     return counts
 
 
-def check_all(graph: graph_mod.Graph, mem_home: str) -> dict[str, list[str]]:
+def check_all(
+    graph: graph_mod.Graph, mem_home: str,
+    root_id: str = graph_mod.DEFAULT_ROOT_ID,
+) -> dict[str, list[str]]:
     """Return drift findings across the entire indexed tree, keyed by directory."""
     out: dict[str, list[str]] = {}
-    for rel_dir in _walk_indexed_dirs(graph):
-        findings = check_drift_for_dir(graph, mem_home, rel_dir)
+    for rel_dir in _walk_indexed_dirs(graph, root_id=root_id):
+        findings = check_drift_for_dir(graph, mem_home, rel_dir, root_id=root_id)
         if findings:
             out[rel_dir or "."] = findings
     return out
