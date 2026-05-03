@@ -125,6 +125,84 @@ class TestStatusCli:
         assert status["nodes"] == 2
         assert "edges" in status
 
+    def test_status_drift_matches_check_indexes_in_multi_root_mode(
+        self, tmp_path, graph
+    ):
+        """Regression: cmd_status had the same single-root bug cmd_check_indexes
+        had pre-2026-05-03 — calling check_all() once with DEFAULT_ROOT_ID and
+        ignoring every other configured scope. Surfaced 2026-05-03 by status
+        reporting drift_findings: 235 while check-indexes reported 704 on the
+        same graph. status MUST iterate scopes the same way check-indexes does.
+        """
+        from memfs.indexer import index_directory
+
+        home = tmp_path / "fakehome"
+        home.mkdir()
+        root_a = tmp_path / "root_a"
+        root_b = tmp_path / "root_b"
+        root_a.mkdir()
+        root_b.mkdir()
+        config_dir = home / ".config" / "memfs"
+        config_dir.mkdir(parents=True)
+        (config_dir / "roots.json").write_text(json.dumps({
+            "roots": [
+                {"id": "root-a", "path": str(root_a)},
+                {"id": "root-b", "path": str(root_b)},
+            ]
+        }))
+
+        # Each root has drift: index.md references a file that doesn't exist.
+        (root_a / "real_a.md").write_text("# Real A\n")
+        (root_a / "index.md").write_text(
+            "# Root A index\n\n- [missing-a.md](missing-a.md)\n"
+        )
+        (root_b / "real_b.md").write_text("# Real B\n")
+        (root_b / "index.md").write_text(
+            "# Root B index\n\n- [missing-b.md](missing-b.md)\n"
+        )
+
+        # Populate the graph with each root tagged distinctly.
+        index_directory(graph, str(root_a), root_id="root-a")
+        index_directory(graph, str(root_b), root_id="root-b")
+
+        # Subprocess inherits HOME=fakehome → load_roots() picks up roots.json.
+        # MEM_HOME must NOT be set or both commands fall back to single-scope.
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env.pop("MEM_HOME", None)
+
+        def run(*args):
+            cmd = [sys.executable, "-m", "memfs.cli"] + list(args)
+            return subprocess.run(
+                cmd, capture_output=True, text=True, env=env
+            )
+
+        status_result = run("status")
+        check_result = run("check-indexes")
+
+        assert status_result.returncode == 0, status_result.stderr
+        # check-indexes exits 1 on drift; that's expected.
+        status_payload = json.loads(status_result.stdout.strip())
+        check_payload = json.loads(check_result.stdout.strip())
+
+        # If the fixture is sound, drift exists.
+        assert check_payload["drift_findings"] > 0, (
+            "fixture broken: check-indexes found no drift"
+        )
+
+        # Both commands must report the SAME drift across configured roots.
+        assert status_payload["indexes"]["drift_findings"] == check_payload[
+            "drift_findings"
+        ], (
+            f"status reports {status_payload['indexes']['drift_findings']} "
+            f"findings, check-indexes reports "
+            f"{check_payload['drift_findings']} — status is not iterating "
+            f"configured roots"
+        )
+        assert status_payload["indexes"]["drifted_dirs"] == check_payload[
+            "drifted_dirs"
+        ]
+
 
 class TestReindexCli:
     def test_reindex_rebuilds(self, tmp_path):

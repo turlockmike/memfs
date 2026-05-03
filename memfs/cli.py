@@ -146,10 +146,54 @@ def cmd_ls(args):
         graph.close()
 
 
+def _resolve_index_scopes(args) -> tuple[list[tuple[str, str]], bool]:
+    """Resolve the list of (root_id, mem_home) scopes for index-drift checks.
+
+    Index discipline is by-construction global: drift in any indexed tree is
+    a problem regardless of which "primary" root a caller pinned. So when no
+    explicit scope is set, iterate every configured root in
+    ``~/.config/memfs/roots.json`` AND a synthetic "default" scope rooted at
+    ``$HOME`` (covers legacy nodes ingested before multi-root tagging).
+
+    With explicit ``--dir`` or ``MEM_HOME`` env, honor the caller's
+    single-scope intent and use ``DEFAULT_ROOT_ID`` against that path only.
+
+    Returns ``(scopes, explicit_dir)`` where ``explicit_dir`` is True if the
+    caller asked for single-scope behavior (so callers can drop the
+    ``root_id:`` key prefix when aggregating).
+
+    Shared by ``cmd_status`` and ``cmd_check_indexes`` — keeping the scope
+    resolution in one place is the regression guard for the 2026-05-03
+    "status drift_findings: 0 while check-indexes: 702" divergence.
+    """
+    from memfs.roots import load_roots
+    from memfs.graph import DEFAULT_ROOT_ID
+
+    explicit_dir = bool(
+        (args and getattr(args, "dir", None))
+        or os.environ.get("MEM_HOME")
+    )
+
+    if explicit_dir:
+        return [(DEFAULT_ROOT_ID, get_mem_home(args))], True
+
+    scopes: list[tuple[str, str]] = []
+    try:
+        for r in load_roots():
+            scopes.append((r.id, r.path))
+    except RuntimeError:
+        pass
+    home = os.path.expanduser("~")
+    if not any(rid == DEFAULT_ROOT_ID and path == home for rid, path in scopes):
+        scopes.append((DEFAULT_ROOT_ID, home))
+    if not scopes:
+        scopes = [(DEFAULT_ROOT_ID, get_mem_home(args))]
+    return scopes, False
+
+
 def cmd_status(args):
     from memfs.index_render import check_all as check_all_indexes
 
-    mem_home = get_mem_home(args)
     graph = _connect_or_die()
     try:
         nodes = count_nodes(graph)
@@ -160,7 +204,10 @@ def cmd_status(args):
         last_decay = get_meta(graph, "last_decay")
         # Index health (added 2026-05-01): per-directory `index.md` drift.
         # See memfs/index_render.py — memfs is the holistic memory system,
-        # so index.md files are part of its responsibility.
+        # so index.md files are part of its responsibility. Iterate every
+        # configured root (added 2026-05-03 — see _resolve_index_scopes
+        # docstring; status was previously single-scope and silently
+        # under-counted drift on multi-root substrates).
         try:
             handcrafted_count = graph.run_one(
                 "MATCH (n:Node) WHERE n.is_handcrafted = true RETURN count(n) AS c"
@@ -168,10 +215,16 @@ def cmd_status(args):
         except Exception:
             handcrafted_count = 0
         try:
-            drift_map = check_all_indexes(graph, mem_home)
-            drift_count = sum(len(v) for v in drift_map.values())
-            drift_dirs = len(drift_map)
-        except Exception as e:
+            scopes, explicit_dir = _resolve_index_scopes(args)
+            aggregated_drift: dict[str, list[str]] = {}
+            for root_id, mh in scopes:
+                drift_map = check_all_indexes(graph, mh, root_id=root_id)
+                for d, findings in drift_map.items():
+                    key = d if explicit_dir else f"{root_id}:{d}"
+                    aggregated_drift[key] = findings
+            drift_count = sum(len(v) for v in aggregated_drift.values())
+            drift_dirs = len(aggregated_drift)
+        except Exception:
             drift_count = -1
             drift_dirs = -1
     finally:
@@ -350,32 +403,46 @@ def cmd_check_indexes(args):
 
     With --fix, auto-render any drifted non-handcrafted indexes.
     Exit code: 0 if clean, 1 if any drift remains after optional --fix.
+
+    Scope resolution (single-scope vs multi-root iteration) is delegated to
+    ``_resolve_index_scopes`` — same helper ``cmd_status`` uses. Keeping the
+    two commands sharing one resolver is the regression guard for the
+    2026-05-03 divergence (status reported drift_findings: 0 while
+    check-indexes reported 702 on the same substrate).
     """
     from memfs.index_render import check_all, render_all
 
-    mem_home = get_mem_home(args)
+    scopes, explicit_dir = _resolve_index_scopes(args)
+    aggregated_drift: dict[str, list[str]] = {}
+    aggregated_fixed: dict[str, int] = {}
+    do_fix = getattr(args, "fix", False)
     graph = _connect_or_die()
     try:
-        if getattr(args, "fix", False):
-            results = render_all(graph, mem_home)
-            # Re-check after fixing.
-            drift_map = check_all(graph, mem_home)
-        else:
-            results = None
-            drift_map = check_all(graph, mem_home)
+        for root_id, mem_home in scopes:
+            if do_fix:
+                fixed = render_all(graph, mem_home, root_id=root_id)
+                drift_map = check_all(graph, mem_home, root_id=root_id)
+                for k, v in fixed.items():
+                    aggregated_fixed[k] = aggregated_fixed.get(k, 0) + v
+            else:
+                drift_map = check_all(graph, mem_home, root_id=root_id)
+            for d, findings in drift_map.items():
+                key = d if explicit_dir else f"{root_id}:{d}"
+                aggregated_drift[key] = findings
     finally:
         graph.close()
 
     payload = {
         "action": "check-indexes",
-        "drifted_dirs": len(drift_map),
-        "drift_findings": sum(len(v) for v in drift_map.values()),
-        "details": drift_map,
+        "scopes": [{"root_id": rid, "mem_home": mh} for rid, mh in scopes],
+        "drifted_dirs": len(aggregated_drift),
+        "drift_findings": sum(len(v) for v in aggregated_drift.values()),
+        "details": aggregated_drift,
     }
-    if results is not None:
-        payload["fixed"] = results
+    if do_fix:
+        payload["fixed"] = aggregated_fixed
     out(payload)
-    if drift_map:
+    if aggregated_drift:
         sys.exit(1)
 
 
@@ -896,6 +963,8 @@ def main():
     )
     p_check.add_argument("--fix", action="store_true",
                          help="Auto-render any drifted (non-handcrafted) indexes")
+    p_check.add_argument("--dir", default=None,
+                         help="Scope to a single root path (overrides multi-root walk)")
 
     # Calibration ledger (M4)
     p_claim = sub.add_parser(
