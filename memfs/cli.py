@@ -158,8 +158,9 @@ def _resolve_index_scopes(args) -> tuple[list[tuple[str, str]], bool]:
     Index discipline is by-construction global: drift in any indexed tree is
     a problem regardless of which "primary" root a caller pinned. So when no
     explicit scope is set, iterate every configured root in
-    ``~/.config/memfs/roots.json`` AND a synthetic "default" scope rooted at
-    ``$HOME`` (covers legacy nodes ingested before multi-root tagging).
+    ``~/.config/memfs/roots.json``. If $HOME is not yet covered by any
+    configured root, append a synthetic ``default`` scope at $HOME (covers
+    legacy nodes ingested before multi-root tagging).
 
     With explicit ``--dir`` or ``MEM_HOME`` env, honor the caller's
     single-scope intent and use ``DEFAULT_ROOT_ID`` against that path only.
@@ -171,6 +172,18 @@ def _resolve_index_scopes(args) -> tuple[list[tuple[str, str]], bool]:
     Shared by ``cmd_status`` and ``cmd_check_indexes`` — keeping the scope
     resolution in one place is the regression guard for the 2026-05-03
     "status drift_findings: 0 while check-indexes: 702" divergence.
+
+    Synthetic-default guard (added 2026-05-03 — n=2 in
+    `verify-detector-premise` watch): the original guard checked
+    ``rid == DEFAULT_ROOT_ID and path == home`` — but in production the
+    root at $HOME is ``alfred-home`` (not ``default``). The predicate was
+    always False, so a synthetic ``default`` scope at $HOME got appended on
+    top of alfred-home. Reindex then walked /home/mike under TWO root_ids
+    and produced two parallel Node populations mirroring each other
+    byte-for-byte (alfred substrate: 4848+4848 nodes; check-indexes:
+    1351 drift findings of which 607 were exact alfred-home/default
+    duplicates). New guard: skip synthesis whenever ANY existing scope's
+    path equals $HOME, regardless of root_id.
     """
     from memfs.roots import load_roots
     from memfs.graph import DEFAULT_ROOT_ID
@@ -190,7 +203,7 @@ def _resolve_index_scopes(args) -> tuple[list[tuple[str, str]], bool]:
     except RuntimeError:
         pass
     home = os.path.expanduser("~")
-    if not any(rid == DEFAULT_ROOT_ID and path == home for rid, path in scopes):
+    if not any(path == home for _, path in scopes):
         scopes.append((DEFAULT_ROOT_ID, home))
     if not scopes:
         scopes = [(DEFAULT_ROOT_ID, get_mem_home(args))]

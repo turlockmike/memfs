@@ -195,3 +195,125 @@ class TestClearRootData:
         assert "gamma.md" in remaining, (
             f"clear_root_data wiped rootB too. remaining: {remaining}"
         )
+
+
+class TestResolveIndexScopesNoDuplicate:
+    """Contract: ``_resolve_index_scopes`` must not add a synthetic ``default``
+    scope at $HOME when an existing configured root already covers $HOME.
+
+    Bug shape (n=2 in `verify-detector-premise` watch — sibling of the
+    2026-05-03 multi-root reindex bug):
+
+    The synthetic-default branch was guarded by
+
+        if not any(rid == DEFAULT_ROOT_ID and path == home for rid, path in scopes):
+            scopes.append((DEFAULT_ROOT_ID, home))
+
+    But the production roots.json configures ``alfred-home`` (not
+    ``default``) at ``$HOME``. The predicate is False — a synthetic
+    ``default`` scope at the same $HOME is appended on top. The reindex
+    walks /home/mike under TWO root_ids and produces two parallel Node
+    populations that mirror each other byte-for-byte.
+
+    Empirical evidence (alfred substrate, 2026-05-03):
+      - alfred-home root: 4567 real nodes, 281 stubs
+      - default root:     4567 real nodes, 281 stubs (4542 are byte-
+                          identical hash-mirrors of alfred-home)
+      - check-indexes:    1351 drift findings; alfred-home and default
+                          report identical 607-finding sets across all
+                          119 directories. 100% duplicated work.
+
+    Contract pinned by these tests: if ANY configured root already covers
+    $HOME (regardless of root_id), do not add the synthetic default scope.
+    """
+
+    def test_no_synthetic_default_when_other_root_covers_home(
+        self, monkeypatch, tmp_path
+    ):
+        """Production-shape config: alfred-home at $HOME → no default scope."""
+        # Stub HOME so the test is deterministic.
+        fake_home = str(tmp_path / "home")
+        os.makedirs(fake_home)
+        monkeypatch.setenv("HOME", fake_home)
+        monkeypatch.delenv("MEM_HOME", raising=False)
+
+        # Stub load_roots to return one root at $HOME with non-default id.
+        from memfs.roots import Root
+        from memfs import cli as cli_mod
+        monkeypatch.setattr(
+            cli_mod, "load_roots",  # not yet imported at module level
+            lambda: [Root(id="alfred-home", path=fake_home)],
+            raising=False,
+        )
+        # Also patch the source module that cli imports lazily.
+        import memfs.roots as roots_mod
+        monkeypatch.setattr(
+            roots_mod, "load_roots",
+            lambda: [Root(id="alfred-home", path=fake_home)],
+        )
+
+        class A:
+            dir = None
+        scopes, explicit = cli_mod._resolve_index_scopes(A())
+
+        paths = [p for _, p in scopes]
+        assert paths.count(fake_home) == 1, (
+            f"Synthetic default scope was added even though alfred-home "
+            f"already covers $HOME. scopes={scopes}"
+        )
+        assert ("default", fake_home) not in scopes, (
+            f"Synthetic default scope at $HOME duplicates alfred-home root. "
+            f"scopes={scopes}"
+        )
+        assert explicit is False
+
+    def test_synthetic_default_added_when_no_root_covers_home(
+        self, monkeypatch, tmp_path
+    ):
+        """Non-overlapping config: roots elsewhere → default IS added."""
+        fake_home = str(tmp_path / "home")
+        elsewhere = str(tmp_path / "elsewhere")
+        os.makedirs(fake_home)
+        os.makedirs(elsewhere)
+        monkeypatch.setenv("HOME", fake_home)
+        monkeypatch.delenv("MEM_HOME", raising=False)
+
+        from memfs.roots import Root
+        from memfs import cli as cli_mod
+        import memfs.roots as roots_mod
+        monkeypatch.setattr(
+            roots_mod, "load_roots",
+            lambda: [Root(id="elsewhere", path=elsewhere)],
+        )
+
+        class A:
+            dir = None
+        scopes, explicit = cli_mod._resolve_index_scopes(A())
+
+        from memfs.graph import DEFAULT_ROOT_ID
+        # The configured root is preserved …
+        assert (("elsewhere", elsewhere)) in scopes
+        # … and the synthetic default is added because nothing covers $HOME.
+        assert (DEFAULT_ROOT_ID, fake_home) in scopes
+        assert explicit is False
+
+    def test_explicit_dir_short_circuits_synthetic_default(
+        self, monkeypatch, tmp_path
+    ):
+        """Caller asked for single-scope (--dir or MEM_HOME): no synthesis."""
+        fake_home = str(tmp_path / "home")
+        explicit_root = str(tmp_path / "explicit")
+        os.makedirs(fake_home)
+        os.makedirs(explicit_root)
+        monkeypatch.setenv("HOME", fake_home)
+        monkeypatch.delenv("MEM_HOME", raising=False)
+
+        from memfs import cli as cli_mod
+
+        class A:
+            dir = explicit_root
+        scopes, explicit = cli_mod._resolve_index_scopes(A())
+
+        from memfs.graph import DEFAULT_ROOT_ID
+        assert scopes == [(DEFAULT_ROOT_ID, explicit_root)]
+        assert explicit is True
