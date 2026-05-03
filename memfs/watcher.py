@@ -226,6 +226,61 @@ def _maybe_detect_contradictions(graph, mem_home: str, rel_path: str) -> None:
         )
 
 
+def _resolve_watch_roots(env_mem_home: str | None, fallback_mem_home: str):
+    """Resolve which roots to watch, given an optional MEM_HOME env value.
+
+    Returns a list of objects with ``.id`` and ``.path`` attributes (Root or
+    duck-typed equivalent).
+
+    Resolution rules:
+      1. MEM_HOME unset → use ``load_roots()`` (multi-root from
+         ``~/.config/memfs/roots.json``).
+      2. MEM_HOME set AND its abspath matches a configured root's path →
+         use THAT root (with its configured id). This is the bug fix added
+         2026-05-03: previously the watcher always derived id from basename
+         (``_id_from_path``) when MEM_HOME was set, producing ghost nodes
+         tagged with the wrong root_id (e.g. ``alfred`` instead of
+         ``alfred-state`` for ``/home/mike/.local/state/alfred``). Each
+         file event then created a Node that ``clear_root_data`` couldn't
+         reach during reindex, accumulating drift indefinitely.
+      3. MEM_HOME set BUT no configured root matches → fall back to
+         basename-derived id (true legacy ad-hoc single-root).
+
+    IMPORTANT: when ``env_mem_home`` is set we CANNOT call ``load_roots()``
+    to enumerate configured roots, because ``load_roots()`` itself
+    short-circuits on MEM_HOME and returns a single basename-derived root
+    (the very bug we are fixing). Instead, read ``CONFIG_PATH`` directly.
+    Detected 2026-05-03 by end-to-end empirical verification — the unit
+    test had monkeypatch-deleted MEM_HOME and silently bypassed the bug
+    path. Watch: ``test-mocks-away-the-bug`` n=1.
+    """
+    from memfs.roots import Root, _id_from_path, CONFIG_PATH
+    import json as _json
+
+    if not env_mem_home:
+        from memfs.roots import load_roots
+        return load_roots()
+
+    abs_mem = os.path.abspath(os.path.expanduser(env_mem_home))
+
+    # Read CONFIG_PATH directly — bypass load_roots()'s MEM_HOME shortcut.
+    if CONFIG_PATH.is_file():
+        try:
+            data = _json.loads(CONFIG_PATH.read_text())
+            for entry in (data.get("roots") or []):
+                rid = entry.get("id")
+                path = entry.get("path")
+                if rid and path:
+                    abs_p = os.path.abspath(os.path.expanduser(path))
+                    if abs_p == abs_mem:
+                        return [Root(id=rid, path=abs_p)]
+        except (OSError, _json.JSONDecodeError):
+            pass
+
+    # No configured root matches — true ad-hoc single-root mode.
+    return [type("R", (), {"id": _id_from_path(fallback_mem_home), "path": fallback_mem_home})]
+
+
 def start_watcher(mem_home: str, daemon: bool = False) -> None:
     """Start the filesystem watcher.
 
@@ -238,17 +293,10 @@ def start_watcher(mem_home: str, daemon: bool = False) -> None:
     `mem_home` arg is the legacy single-root path. If it's set (env-var
     fallback in CLI), we honor it as a single root. Otherwise consult
     load_roots() for the multi-root config.
-    """
-    from memfs.roots import load_roots
 
-    # Determine roots: legacy-arg takes precedence (preserves existing service
-    # behavior); else read multi-root config.
-    if os.environ.get("MEM_HOME"):
-        # Legacy single-root: derive id from path basename
-        from memfs.roots import _id_from_path
-        roots = [type("R", (), {"id": _id_from_path(mem_home), "path": mem_home})]
-    else:
-        roots = load_roots()
+    See ``_resolve_watch_roots`` docstring for the 2026-05-03 ghost-node fix.
+    """
+    roots = _resolve_watch_roots(os.environ.get("MEM_HOME"), mem_home)
 
     if daemon:
         # PID file lives in the FIRST root's .mem dir (so stop_watcher knows
