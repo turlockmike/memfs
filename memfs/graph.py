@@ -313,8 +313,39 @@ def get_all_nodes(graph: Graph) -> list[dict]:
     return [dict(r["n"]) for r in rows]
 
 
-def count_nodes(graph: Graph) -> int:
-    return int(graph.run_scalar("MATCH (n:Node) RETURN count(n)") or 0)
+def count_nodes(graph: Graph, root_id: str | None = None) -> int:
+    """Count real nodes — those backed by a parsed file on disk.
+
+    A node is "real" iff it has a non-null ``content_hash`` (set by
+    ``upsert_node`` from the parsed file body). Stubs synthesized by
+    ``upsert_link_edge`` for broken wikilink targets have no content_hash
+    and are excluded.
+
+    Why filter (added 2026-05-03 — n=2 in `verify-detector-premise` watch):
+    every broken wikilink in a corpus produces exactly one stub :Node entry
+    via ``MERGE (t:Node {root_id, path})`` in upsert_link_edge. On the alfred
+    substrate this produced ~278 ghost nodes per root after a clean reindex,
+    and the stub paths (relative path traversals like ``../../areas/USER.md``,
+    absolutes like ``/home/mike/journal.md``, and ``.py.md``/``.jsonl.md``
+    artifacts from broken-link resolution) polluted ``_walk_indexed_dirs``
+    with bogus "directories", inflating drift_findings.
+
+    Real-node semantics are what callers nearly always want — drift checks,
+    substrate health stats, file-system parity. Stubs remain in the graph
+    (still :Node-labeled) so existing patterns like
+    ``MATCH (t:Node {path:'broken.md'})`` keep working for upgrade lookups.
+
+    Use ``root_id`` to scope per-root. ``None`` → global count.
+    """
+    if root_id is None:
+        return int(graph.run_scalar(
+            "MATCH (n:Node) WHERE n.content_hash IS NOT NULL RETURN count(n)"
+        ) or 0)
+    return int(graph.run_scalar(
+        "MATCH (n:Node) WHERE n.root_id = $rid AND n.content_hash IS NOT NULL "
+        "RETURN count(n)",
+        rid=root_id,
+    ) or 0)
 
 
 def count_edges(graph: Graph, type: str | None = None) -> int:

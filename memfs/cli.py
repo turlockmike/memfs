@@ -109,17 +109,23 @@ def cmd_ls(args):
             return
 
         subdir = args.subdir
+        # Filter out :Node stubs (broken wikilink placeholders) — content_hash
+        # is null on stubs, set on every real upsert_node. Without this filter
+        # `memfs ls` lists bogus entries with title=null/layer=null that
+        # don't correspond to any file.
         if subdir:
             subdir = subdir.rstrip("/")
             rows = graph.run(
                 "MATCH (n:Node) WHERE n.path STARTS WITH $prefix "
+                "AND n.content_hash IS NOT NULL "
                 "RETURN n.path AS path, n.title AS title, n.layer AS layer "
                 "ORDER BY n.path",
                 prefix=subdir + "/",
             )
         else:
             rows = graph.run(
-                "MATCH (n:Node) RETURN n.path AS path, n.title AS title, n.layer AS layer "
+                "MATCH (n:Node) WHERE n.content_hash IS NOT NULL "
+                "RETURN n.path AS path, n.title AS title, n.layer AS layer "
                 "ORDER BY n.path"
             )
 

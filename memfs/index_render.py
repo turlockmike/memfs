@@ -57,8 +57,16 @@ def _list_immediate_children(
     # Pull all nodes whose path starts with this prefix WITHIN this root.
     # Without root_id scoping, multi-root indexes would mix content from
     # different roots that happen to share path prefixes.
+    #
+    # ``content_hash IS NOT NULL`` filters out :Node stubs synthesized by
+    # ``upsert_link_edge`` for broken wikilink targets. Without this filter
+    # an auto-rendered index.md could list bogus entries like
+    # ``../../areas/USER.md`` or ``/home/mike/journal.md`` (cross-root or
+    # never-existed paths) — which then triggered "INDEX REFERENCES MISSING
+    # FILE" findings in a chain reaction. n=2 in verify-detector-premise.
     rows = graph.run(
         "MATCH (n:Node) WHERE n.root_id = $root_id AND n.path STARTS WITH $prefix "
+        "AND n.content_hash IS NOT NULL "
         "RETURN n.path AS path, n.title AS title, n.description AS description, "
         "n.is_handcrafted AS is_handcrafted ORDER BY n.path",
         root_id=root_id, prefix=prefix,
@@ -370,8 +378,16 @@ def _walk_indexed_dirs(
 ) -> Iterator[str]:
     """Yield every directory path (relative to mem_home) that contains at least
     one indexed file under the given root. Includes the root ("")."""
+    # Filter out :Node stubs synthesized by upsert_link_edge for broken
+    # wikilink targets (content_hash IS NULL). Without this filter, stub
+    # paths like '../../areas/USER.md' or '/home/mike/journal.md' generate
+    # bogus "directories" via the rsplit logic below, and check_drift_for_dir
+    # then emits "INDEX REFERENCES MISSING FILE" findings against fictional
+    # parent dirs. Was the n=2 sibling of verify-detector-premise watch
+    # discovered 2026-05-03 in heartbeat ghost-node investigation.
     rows = graph.run(
-        "MATCH (n:Node) WHERE n.root_id = $root_id RETURN DISTINCT n.path AS path",
+        "MATCH (n:Node) WHERE n.root_id = $root_id AND n.content_hash IS NOT NULL "
+        "RETURN DISTINCT n.path AS path",
         root_id=root_id,
     )
     seen: set[str] = set()
