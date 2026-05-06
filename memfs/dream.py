@@ -94,19 +94,90 @@ def find_orphans(graph, orphan_days: int = 30) -> list[dict]:
     return out
 
 
-def find_near_duplicates(graph, limit: int = 10) -> list[dict]:
+_TIME_SERIES_PATH_PREFIXES = (
+    # All of these are template-driven, dated, append-only series. Their
+    # title+content tokens overlap by construction (shared frontmatter,
+    # shared section headers like "## Session N (sid)"), driving jaccard
+    # to 1.00 on pairs whose actual content is *different events*. Merging
+    # them destroys forward history.
+    "sessions/",                          # Added 2026-04-17 (stop-hook sessions)
+    "journals/",                          # Added 2026-05-06 (date-stamped journal entries)
+    "areas/orient-predictions/",          # Added 2026-05-06 (per-session predictions)
+    "areas/consolidate-log/",             # Added 2026-05-06 (daily consolidate logs)
+    "areas/proactive-findings/",          # Added 2026-05-06 (date-stamped finding reports)
+    "evals/",                             # Added 2026-05-06 (eval cycle templates: cycle-N-clone-answer, cycle-N-organize-probe, etc.)
+    "projects/evals/",                    # Added 2026-05-06 (cycle-NN-prediction templates)
+    "job-runs/",                          # Added 2026-05-06 (per-day cron logs)
+    "resources/poe2/canonical/db/",       # Added 2026-05-06 (scraped item DB — tiered variants like biting-frost-i/ii share scaffolding but represent distinct items)
+)
+
+
+def _same_inode(a_abs: str, b_abs: str) -> bool:
+    """True if a and b are the same physical file (symlink or hardlink).
+    Defensive: returns False on any stat failure."""
+    try:
+        sa = os.stat(a_abs)
+        sb = os.stat(b_abs)
+    except OSError:
+        return False
+    return sa.st_dev == sb.st_dev and sa.st_ino == sb.st_ino
+
+
+def _all_known_roots(primary: str) -> list[str]:
+    """Return the list of mem_home paths to check inode equality against.
+    Includes the primary root and any roots configured in roots.json — needed
+    because a candidate pair may span roots (e.g. an ``alfred-state`` symlink
+    that targets a file in the ``alfred-home`` root).
+
+    Reads the roots.json config DIRECTLY rather than via load_roots() — when
+    MEM_HOME is set in the env (as the memfs shim does for dream-briefing),
+    load_roots() returns only the pinned root, but the briefing's graph
+    spans every configured root. Falls back gracefully on any failure.
+    """
+    paths = [primary]
+    try:
+        import json
+        from memfs.roots import CONFIG_PATH
+        if CONFIG_PATH.is_file():
+            data = json.loads(CONFIG_PATH.read_text())
+            for entry in data.get("roots") or []:
+                p = entry.get("path")
+                if not p:
+                    continue
+                p_abs = os.path.abspath(os.path.expanduser(p))
+                if p_abs not in paths:
+                    paths.append(p_abs)
+    except Exception:
+        pass
+    return paths
+
+
+def _resolve_in_any_root(rel_path: str, roots: list[str]) -> str | None:
+    """Try each root in turn until a real file is found at root/rel_path.
+    Returns the absolute path of the first match, or None."""
+    for root in roots:
+        candidate = os.path.join(root, rel_path)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def find_near_duplicates(graph, limit: int = 10, mem_home: str | None = None) -> list[dict]:
     """Cheap heuristic: compare every pair of nodes whose title-token overlap
     passes a Jaccard threshold OR whose description is identical. Caps at
     `limit` candidates to avoid quadratic blow-up on huge graphs.
 
     Exclusions:
-    - Session transcripts (paths starting with ``sessions/``) are time-series
-      records, not semantic notes. They frequently share template-heavy
-      prefixes (wake prompts, Stop-hook error templates) that drive title
-      + content jaccard to 1.0 despite having different session IDs, dates,
-      and actual session content. Merging them would destroy the forward
-      ingest flow. Added 2026-04-17 03:00 CDT after dream briefing flagged
-      10+ false-positive merges from Apr 11–16 stop-hook sessions.
+    - Time-series template-driven directories (see ``_TIME_SERIES_PATH_PREFIXES``)
+      are excluded because their content shares fixed scaffolding (frontmatter,
+      session-id headers, prediction templates) that drives jaccard to 1.00
+      despite the actual events being different. Originally added for
+      ``sessions/`` on 2026-04-17 after stop-hook templates triggered 10+
+      false-positive merges; extended on 2026-05-06 (this dream cycle) after
+      ``areas/orient-predictions/``, ``areas/consolidate-log/``,
+      ``evals/active-inference-predictions/``, ``projects/evals/``,
+      ``journals/``, and ``job-runs/`` all surfaced as Jaccard=1.00 false
+      positives in a single dream-briefing run.
     """
     nodes = graph.run(
         "MATCH (n:Node) "
@@ -117,9 +188,23 @@ def find_near_duplicates(graph, limit: int = 10) -> list[dict]:
     if len(nodes) > 2000:
         nodes = nodes[:2000]  # safety cap
 
-    # Filter out session transcripts — they're time-series, not semantic
-    # duplicates. See docstring.
-    nodes = [n for n in nodes if not (n.get("path") or "").startswith("sessions/")]
+    # Filter out time-series template-driven directories — they're not
+    # semantic duplicates even when jaccard==1.00. See docstring.
+    nodes = [
+        n for n in nodes
+        if not (n.get("path") or "").startswith(_TIME_SERIES_PATH_PREFIXES)
+    ]
+    # Filter out auto-rendered index.md files. memfs/index hooks regenerate
+    # these from directory contents on every reindex; they share boilerplate
+    # ("# <Dir Name>", auto-rendered footer) which drives jaccard high
+    # whenever two unrelated directories happen to have similar names. Cross-
+    # directory index.md merges destroy the very routing structure they
+    # exist to provide. Added 2026-05-06.
+    nodes = [
+        n for n in nodes
+        if not (n.get("path") or "").endswith("/index.md")
+        and (n.get("path") or "") != "index.md"
+    ]
 
     # Pre-tokenize titles (cheap) and content heads
     title_tokens = {n["path"]: _normalized_tokens((n.get("title") or "") + " " + (n.get("description") or "")) for n in nodes}
@@ -155,7 +240,21 @@ def find_near_duplicates(graph, limit: int = 10) -> list[dict]:
                 if score >= 0.55:
                     pair_scores[(a, b)] = score
 
-    for (a, b), score in sorted(pair_scores.items(), key=lambda x: -x[1])[:limit]:
+    roots = _all_known_roots(mem_home) if mem_home else []
+    for (a, b), score in sorted(pair_scores.items(), key=lambda x: -x[1]):
+        if len(out) >= limit:
+            break
+        # Skip pairs that are the same physical file (symlink/hardlink). The
+        # canonical case: areas/USER.md is a symlink to areas/mike-state.md
+        # (alfred-state ↔ alfred-home dual-rooted memfs), so they index as two
+        # nodes pointing at the same inode. Merging would `rm` the file both
+        # paths share. Resolves each rel_path against ALL configured roots
+        # because the pair may span scopes. Added 2026-05-06.
+        if roots:
+            a_abs = _resolve_in_any_root(a, roots)
+            b_abs = _resolve_in_any_root(b, roots)
+            if a_abs and b_abs and _same_inode(a_abs, b_abs):
+                continue
         seen.add((a, b))
         out.append({
             "candidate_type": "merge",
@@ -167,7 +266,14 @@ def find_near_duplicates(graph, limit: int = 10) -> list[dict]:
 
 
 def find_bloated_files(mem_home: str, bloat_lines: int, bloat_bytes: int) -> list[dict]:
-    """Files exceeding line-count or byte-size thresholds."""
+    """Files exceeding line-count or byte-size thresholds.
+
+    Exclusions:
+    - ``job-runs/**/*.jsonl`` — per-day cron run logs. Append-only; "splitting
+      by thematic section" is meaningless for append-only event streams. They
+      will always grow past the byte threshold within a day. Filtered here
+      so they don't dominate the dream briefing every night. Added 2026-05-06.
+    """
     out: list[dict] = []
     # Walk filesystem directly (memfs content field may be trimmed)
     for dirpath, dirnames, filenames in os.walk(mem_home):
@@ -178,6 +284,9 @@ def find_bloated_files(mem_home: str, bloat_lines: int, bloat_bytes: int) -> lis
                 continue
             abs_path = os.path.join(dirpath, fn)
             rel = os.path.relpath(abs_path, mem_home)
+            # Skip per-day cron event logs — append-only by design.
+            if rel.startswith("job-runs/") and rel.endswith(".jsonl"):
+                continue
             info = _file_size_and_lines(mem_home, rel)
             if info is None:
                 continue
@@ -471,7 +580,7 @@ def run_briefing(graph, *, mem_home: str, args) -> list[dict]:
 
     candidates: list[dict] = []
     candidates.extend(find_orphans(graph, orphan_days=orphan_days))
-    candidates.extend(find_near_duplicates(graph))
+    candidates.extend(find_near_duplicates(graph, mem_home=mem_home))
     candidates.extend(find_bloated_files(mem_home, bloat_lines=bloat_lines, bloat_bytes=bloat_bytes))
     candidates.extend(find_dirs_missing_index(mem_home))
     candidates.extend(find_cosearched_unlinked(graph))
