@@ -1,9 +1,9 @@
+# memfs / mvm — tool + skills repo. KB is regenerable (`mvm index`) and the
+# resources slice is mirrored into alfred-home's ~/resources. State is local.
+knowledge/
+state/
+.pytest_cache/
 __pycache__/
 *.pyc
-*.egg-info/
-dist/
-build/
-.mem/
-*.db
-.venv/
-.pytest_cache/
+*.pyo
+.DS_Store
