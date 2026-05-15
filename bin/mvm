@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""mvm — entry point. Adds project root to sys.path and dispatches.
+
+Loads ~/.config/mvm/env if present (KEY=VALUE lines, # comments allowed).
+
+ISOLATION (post-2026-05-10 rewrite):
+  Cold-clone verify subprocesses now isolate via HOME redirect + clean cwd
+  + defensive flags (see mvm/verify.py module docstring). This works on
+  OAuth-only hosts and is the default path. No ANTHROPIC_API_KEY required.
+
+  Legacy --bare fast path is opt-in: set MVM_FORCE_BARE=1 (and ensure
+  ANTHROPIC_API_KEY is in env) to engage it. --bare strictly requires the
+  API key (refuses OAuth/keychain), so it does not work on this host.
+  The auto-engage-on-API-key behavior was removed because it confused the
+  default isolation path.
+"""
+import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+
+# --- Auto-load ~/.config/mvm/env (Mike-provided secrets) -------------------
+_env_file = Path.home() / ".config" / "mvm" / "env"
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        # Don't clobber an explicit override from the parent shell
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+# --- Optional informational note when a verify command runs ----------------
+# Default isolation (HOME redirect + clean cwd) is on automatically. Only
+# print a hint if --bare is force-requested but unusable, so the user knows
+# why the default path is engaging instead.
+if (len(sys.argv) > 1
+        and sys.argv[1] == "verify"
+        and (os.environ.get("MVM_FORCE_BARE") == "1" or os.environ.get("MVM_BARE") == "1")
+        and not os.environ.get("ANTHROPIC_API_KEY")):
+    print(
+        "WARN: MVM_FORCE_BARE=1 set but ANTHROPIC_API_KEY missing — --bare "
+        "strictly requires an API key (refuses OAuth). Falling back to the "
+        "default clean-HOME isolation path.",
+        file=sys.stderr,
+    )
+
+from mvm.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

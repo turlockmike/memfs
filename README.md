@@ -1,145 +1,223 @@
-# memfs
+# mvm — minimum viable memory
 
-Unix-native memory filesystem for LLM agents.
+A self-verifying, self-growing memory for LLM agents. Markdown KB, cold-clone verification on every claim, tri-mode retrieval (text + graph + hierarchy). Two skills, three CLI primitives. Ask any question — the system either returns a cold-clone-verified answer from the KB, or fetches it from the web, gives it to you, and grows the KB in the background. Recall miss = curriculum signal.
 
-Files are truth. SQLite is the index. Search is the only verb.
+## Thesis
 
-## Architecture
+A memory system is **viable** iff it can do three things in a closed loop:
+
+1. **Encode** — take information from the world and put it somewhere
+2. **Retrieve** — get it back on demand
+3. **Verify** — prove the retrieval matches what was encoded
+
+Below this floor, you have a write-only log (no retrieval check) or hopeful retrieval (no verification). The minimum is closing those three.
+
+`mvm` is the smallest thing that does all three honestly.
+
+## What's in v0
 
 ```
-Any LLM Agent / Human / IDE
-        |  normal file I/O
-        v
-   Filesystem (MEM_HOME)
-   projects/  people/  concepts/
-        |  FSEvents / inotify
-        v
-   memfs daemon (background)
-   - watches file changes
-   - updates .mem/memory.db (FTS5 + edges)
-   - parses [[links]] into graph edges
-   - runs decay on schedule
+~/mvm/
+├── README.md
+├── knowledge/                # the user-curated KB
+└── state/                    # tool-managed indexes
+    ├── index.db              # SQLite + FTS5 over content
+    └── graph.db              # adjacency from md-links + frontmatter refs
+
+~/.local/bin/                 # CLI primitives (PATH-resident)
+├── mvm verify                  # cold-clone subprocess; the load-bearing measurement
+├── mvm index                    # rebuild graph + FTS
+└── mvm search                # tri-mode retrieval (text + graph + hierarchy)
+
+~/.claude/skills/             # Claude Code skills (orchestrators)
+├── mvm-ingest/SKILL.md       # closed-loop write
+└── mvm-recall/SKILL.md       # grounded retrieval with refusal
 ```
 
-- **Files are source of truth** — `.mem/memory.db` is a derived cache, rebuildable via `memfs reindex`
-- **One agent command** — `memfs grep <query>` is all an agent needs
-- **Harness-agnostic** — works with any LLM agent that can read/write files
-- **Neuroscience-informed** — power-law decay (not exponential), fan-effect-limited edges, spacing-effect increments
+## The cold-clone primitive — two paths
 
-## Quick Start
+**Inside a Claude Code session (canonical path):** the skills use the **Agent tool** to spawn a subagent as the cold-clone. Main session is the grader (it has the source/doc in context). One generative model performs both action and inference — FEP-aligned, no separate evaluator needed.
+
+```
+main session (you)               agent-tool subagent (cold-clone)
+  │                                  │
+  ├── reads source                   │
+  ├── writes canonical               │
+  ├── authors tests                  │
+  ├── spawns -------- Q + content -> │
+  │                                  ├── answers from doc only
+  │  <---- answer ------------------ │
+  ├── grades answer vs ground truth  │
+  └── commits or refuses             ⊥
+```
+
+**Outside a session — `mvm verify` CLI** (cron, CI, automation): falls back to `claude --print --no-session-persistence --tools "" --system-prompt "..."` subprocess. Two-stage retriever + grader because there's no main session to grade. Less FEP-aligned but self-contained.
+
+The CLI is the **outside-session fallback**, not the primary mechanism. Inside a session, the skills use Agent tool natively.
+
+## The differential framework (`--lift`)
+
+`mvm verify <doc> --lift` runs each test in **two modes** and reports the delta:
+
+- **naked** — no file, no tools. Pure weight prior.
+- **injected** — file content in prompt, no tools. The cold-clone.
+
+```
+=== KB LIFT REPORT ===
+Naked    (weights only):       1/5
+Injected (file in prompt):     4/5
+KB lift  (delta):              +3
+```
+
+This is the **Hassabis weight-leakage detector**. If `kb_lift == 0` and all tests pass, the tests are too easy or the KB overlaps weight knowledge — the substrate isn't actually doing work. If `kb_lift < 0`, the KB is misleading the retriever.
+
+## Tri-mode retrieval
+
+`mvm search` combines three signals:
+
+| Signal | Source | Default weight |
+|---|---|---|
+| **text**       | SQLite FTS5 (BM25 ranking)                   | 0.60 |
+| **graph**      | BFS over markdown-link adjacency             | 0.25 |
+| **hierarchy**  | path edit-distance from a seed/subtree       | 0.15 |
 
 ```bash
-pip install memfs
-
-# Initialize a memory directory
-memfs init ~/memory
-
-# Search (creates search edges to top-3 results)
-export MEM_HOME=~/memory
-memfs grep "kanji curriculum"
-
-# Start the filesystem watcher (keeps index current as files change)
-memfs watch --daemon
-
-# Check index health
-memfs status
+mvm search "leech overhaul"                          # text only
+mvm search "leech overhaul" --in poe2/0.5            # subtree filter
+mvm search "moonlaif damage" --near moonlaif.md      # graph proximity
+mvm search "calguran" --kind canonical               # frontmatter filter
 ```
 
-## Agent System Prompt (3 sentences)
+The filesystem is treated as a graph database — folder hierarchy carries semantic information (`logs/` vs `wiki/` vs `canonical/`), markdown links are explicit edges, and external URLs are first-class destinations.
 
-> Your memory lives in `$MEM_HOME`. Read and write files normally with any tool. Use `memfs grep <query>` to search — connections between files strengthen when you search for them and weaken over time.
+## File conventions
 
-## How It Works
-
-### Two Edge Types
-
-| Type | Source | Target | Created by | Decay |
-|------|--------|--------|------------|-------|
-| `link` | file A | file B | `[[B]]` in A's content | Power-law, floor 0.5 |
-| `search` | query node | file | `memfs grep` top-3 results | Power-law, full decay |
-
-Per [Anderson's fan effect](https://en.wikipedia.org/wiki/Fan_effect): edges connect **query to result only**, never result to result. This prevents graph noise from O(n^2) spurious associations.
-
-### Search Edges
-
-Each `memfs grep` call:
-1. Normalizes the query (lowercase, strip punctuation, Porter stem, sort tokens, SHA-256)
-2. Creates/strengthens edges from query node to rank 1, 2, 3 results only
-3. Rank-weighted: rank 1 = full increment, rank 2 = 0.66x, rank 3 = 0.33x
-4. Repeated queries strengthen existing edges with spacing-effect weighting
-
-### Power-Law Decay
+Each KB entry is a pair:
 
 ```
-strength = initial_strength * (1 + 0.1 * days_since_last_activation) ^ -0.5
+<topic>.md                # canonical content with frontmatter
+<topic>.tests.yaml        # locked Q/A test cases
 ```
 
-| Days inactive | Retained strength |
-|---------------|-------------------|
-| 1 | 95% |
-| 7 | 77% |
-| 30 | 50% |
-| 90 | 32% |
-| 365 | 16% |
-
-### File Format
-
-Plain markdown with optional YAML frontmatter:
-
-```markdown
+Frontmatter:
+```yaml
 ---
-title: Kanji Learning
-date: 2026-04-12
+source: <URL or path>           # provenance backpointer (Hassabis)
+kind: canonical|log|opinion|reference|synthesis
+ingested_at: YYYY-MM-DD
 ---
-# Kanji Learning
-
-Studying kanji with spaced repetition. See [[srs-methods]] and [[people/ken]].
 ```
 
-`[[wikilinks]]` become graph edges. `[[Target|Alias]]` supported.
-
-## Commands
-
-### Agent-facing
-
-| Command | What it does |
-|---------|--------------|
-| `memfs grep <query>` | FTS5 search, returns ranked NDJSON, creates search edges |
-
-### Operator-facing
-
-| Command | What it does |
-|---------|--------------|
-| `memfs init [dir]` | Create index, scan all .md files |
-| `memfs watch [--daemon]` | Filesystem watcher (keeps index current) |
-| `memfs reindex` | Rebuild index from scratch |
-| `memfs status` | Node/edge counts, index health |
-| `memfs ls [dir] [-v]` | List indexed files |
-
-## Output Format
-
-All output is NDJSON (one JSON object per line):
-
-```jsonc
-// memfs grep
-{"path": "projects/satori.md", "title": "Satori", "rank": 1, "score": 0.82, "edge_strength": 1.2, "snippet": "...kanji curriculum..."}
-
-// memfs ls
-{"path": "projects/satori.md"}
-
-// memfs status
-{"nodes": 142, "edges": {"link": 87, "search": 310}, "queries": 45}
+Tests:
+```yaml
+- id: 1
+  q: "What's the leech overhaul cap based on?"
+  a: "single-source, biggest-hit only"
+- id: 2
+  q: "Negative test: what's the maximum number of curses?"
+  a: "DONT-KNOW"
 ```
 
-## Documentation
+**Tests are immutable post-authoring.** During a verify-failure rewrite cycle, only the doc is edited. If you find yourself rewriting tests to make them pass, that's the Goodhart collapse — stop.
 
-- [Design Document](docs/design/mem-cli-design.md) — full architecture, schema, decay model, implementation plan
-- [Research: Memory Architectures](docs/research/llm-memory-architectures.md) — MemGPT, GraphRAG, Mem0, Zep, Cognee, LangGraph comparison
-- [Research: Neuroscience Principles](docs/research/neuroscience-memory-principles.md) — power-law decay, spacing effect, engram networks, fan effect
-- [Research: Filesystem Search](docs/research/filesystem-memory-search.md) — FTS5, embedding models, graph structure in filesystems
-- [Research: Mastra Memory](docs/research/mastra-memory-system.md) — Observable Memory architecture analysis
-- [Research: Eval Benchmarks](docs/research/memory-eval-benchmarks.md) — LongMemEval, LoCoMo, MemoryAgentBench, and 12 others
+## Install
 
-## License
+```bash
+# 1. Make sure ~/.local/bin is on PATH
+echo $PATH | grep -q "$HOME/.local/bin" || echo 'add ~/.local/bin to PATH'
 
-MIT
+# 2. Install Python deps
+pip install --break-system-packages pyyaml fastembed sqlite-vec pytest
+
+# 3. Symlink the single mvm CLI
+ln -sf ~/mvm/bin/mvm ~/.local/bin/mvm
+
+# 4. Verify the install
+mvm --help
+cd ~/mvm && python3 -m pytest tests/  # 31 tests, ~0.2s
+
+# 5. Skills are in place at ~/.claude/skills/mvm-{ingest,recall,dream}
+#    They auto-load in any new Claude Code session.
+```
+
+## Usage
+
+### Add knowledge
+
+```
+/mvm-ingest https://youtube.com/watch?v=...
+```
+
+Or directly:
+```bash
+# write knowledge/<topic>.md and knowledge/<topic>.tests.yaml manually
+mvm verify knowledge/<topic>.md          # gate the write
+mvm index                                # register in graph + FTS
+```
+
+### Recall
+
+```
+/mvm-recall "what's the leech cap based on?"
+```
+
+Or directly:
+```bash
+mvm search "leech cap"
+mvm verify knowledge/<top-result>.md
+```
+
+### Diagnostics
+
+```bash
+mvm verify <doc>           # all tests, injected mode
+mvm verify <doc> --mode naked   # weight-prior baseline
+mvm verify <doc> --lift    # differential (KB lift)
+mvm search "<query>" --json     # machine-readable
+```
+
+## The viability test
+
+Install. Then:
+
+1. `/mvm-ingest <some source>` — get a verified canonical written.
+2. `/mvm-recall "<question whose answer is in that source>"` — get the answer back, verified.
+3. Wait two weeks. Run `mvm verify <topic>.md` again. Trust the pass/fail.
+4. Re-run `/mvm-recall` — confirm the answer is unchanged unless you ingested an update.
+
+If those four steps work end-to-end, the system is viable. Everything else is hardening.
+
+## Roadmap
+
+**v0 (this version):** the closed loop. SQLite FTS5 for text. Markdown link parsing for the graph. Cold-clone via subprocess. Differential KB-lift framework.
+
+**v0.1 (planned):**
+- Vector embeddings (Voyage AI) replacing FTS5 for semantic search
+- `--bare` strict isolation mode (requires `ANTHROPIC_API_KEY`)
+- Two test cohorts (source-derived + blind)
+- Free-recall grader mode (Tulving's recognition-vs-recall fix)
+- Recency penalty + decay timestamps (Hassabis's stale-but-confident defense)
+
+**v0.2 (planned):**
+- `/mvm-dream` — offline pass: replay, consolidate, status-tag (current/superseded/archived)
+- Calibration monitoring + algedonic alarm on inversion
+- Cohort regeneration during dream
+
+**v0.3 (planned):**
+- Reconstruction-mode verify (canonical → source claims, entailment-graded)
+- Hooks for auto-fire on curated domains
+- Pressure-index dashboard
+
+## Theory
+
+Built on three converging frames:
+
+- **FEP (Friston):** /ingest is the action arm (substrate update). /recall is the perception arm (belief update). The cold-clone measures prediction error directly.
+- **RL (Sutton):** the LLM is a frozen policy. The filesystem is the parameter store. Cold-clone scores are the reward signal. File writes are the gradient updates.
+- **VSM (Beer):** kb-verify is the comparator. /ingest is the effector. The dream daemon (v0.2+) is the proprioceptive loop. Algedonic signal = calibration inversion.
+
+These aren't competing frames — they're the same closed loop in different vocabularies. Pick whichever lands for your audience.
+
+## Naming
+
+`mvm` = minimum viable memory. The name is the thesis.
