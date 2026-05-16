@@ -37,9 +37,20 @@ description: "MVM unified question-answering. Spawns 3 parallel haiku probes (na
    HARD CAP: 3 tool calls total. Stop after 3 even if you haven't found the answer.
    If KB doesn't contain the answer, output a refusal with that explicit signal.
 
+   KB SURFACE SCOPE (decided 2026-05-15, sync-gap-doctrine.md):
+   The recall KB surface is ~/mvm/knowledge/resources/ (canonical mechanics —
+   mirrored & current via mvm-mirror) plus ~/mvm/knowledge/{areas,topics,
+   topics-alfred-state}/. ~/mvm/knowledge/projects/ is NOT a recall surface and
+   no longer exists: project deliverables are post-DAG syntheses retrieved by the
+   ORCHESTRATOR via direct Read of ~/projects/<path>, never recalled. If the
+   question targets a project deliverable / recommendation doc, output a KB-miss
+   refusal that names the ~/projects/ path to Read directly — do NOT treat any
+   stale project copy as a KB hit.
+
    Procedure:
    1. ONE `mvm search "<query>"` to find candidates.
-   2. Read top 2 candidates if needed.
+   2. Read top 2 candidates if needed. Ignore any candidate under a
+      knowledge/projects/ path (stale-snapshot artifact) — treat as KB-miss.
    3. If candidates conflict on this question, list each one's claim in RATIONALE.
 
    QUESTION: <q>
