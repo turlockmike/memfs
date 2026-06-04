@@ -293,7 +293,9 @@ def verify_test(doc_path: Path, test: dict, model: str, mode: str = "injected") 
     grader_prompt = (
         f"CANDIDATE: {candidate}\n\n"
         f"EXPECTED: {expected}\n\n"
-        "Are they semantically equivalent?"
+        "Does the CANDIDATE convey every fact stated in EXPECTED, without "
+        "contradicting any of them? The CANDIDATE may include additional correct "
+        "detail — that does not change the verdict. Output PASS or FAIL."
     )
     try:
         grade = claude_subprocess(GRADER_SYSTEM, grader_prompt, model=model)
