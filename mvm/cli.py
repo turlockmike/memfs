@@ -12,6 +12,7 @@ SUBCOMMANDS = {
     "stats": "mvm.stats",
     "watch": "mvm.watch",
     "backlinks": "mvm.backlinks",
+    "relations": "mvm.relations",
     "log": "mvm.log",
 }
 
@@ -29,6 +30,7 @@ Subcommands:
   stats   Decoherence dashboard from recall-log.jsonl
   watch     Daemon: passively embed new/changed docs after a debounce window
   backlinks List files that link TO a given path (used by /mvm-ingest cascade)
+  relations Show a doc's typed semantic relation neighborhood (superseded_by, ...)
   log       Show recall-log or dream-log entries
 
 Run `mvm <subcommand> --help` for subcommand usage.

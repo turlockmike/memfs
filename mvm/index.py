@@ -58,6 +58,38 @@ MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+# Frontmatter relation keys that emit typed `frontmatter_<key>` edges. Widened
+# S721 to include the forward/peer relations supersedes / in_tension_with /
+# derived_from (Gap 1). Edge of any of these types is consumed by `mvm relations`.
+RELATION_KEYS = (
+    "see_also", "prereq", "superseded_by", "episodic_source",
+    "supersedes", "in_tension_with", "derived_from",
+)
+
+
+def normalize_relation_target(item: str, root: Path) -> str:
+    """Normalize a frontmatter relation target to knowledge-root-relative form.
+
+    Authors habitually write `~/resources/X.md` (the mirror path) or
+    `~/mvm/knowledge/resources/X.md`; both refer to the node stored as
+    `resources/X.md` (since ~/resources <-> ~/mvm/knowledge/resources is mirrored
+    and root = ~/mvm/knowledge). Without this, the edge dst never matches a node
+    and BFS can't traverse it (the S720 dangling-edge data bug). URLs and
+    already-relative targets pass through unchanged.
+    """
+    if URL_RE.match(item):
+        return item
+    expanded = Path(os.path.expanduser(item))
+    if not expanded.is_absolute():
+        return item  # already relative — preserve verbatim
+    # root/resources/X  and  ~/resources/X (mirror) both -> resources/X
+    for base in (root, Path.home()):
+        try:
+            return str(expanded.relative_to(base))
+        except ValueError:
+            continue
+    return item
+
 
 def parse_markdown(path: Path) -> tuple[dict, str]:
     """Return (frontmatter_dict, body)."""
@@ -101,14 +133,15 @@ def extract_edges(src_path: Path, body: str, fm: dict, root: Path) -> list[tuple
         edge_type = "source_url" if URL_RE.match(src_fm) else "source_ref"
         edges.append((src_rel, src_fm, edge_type))
 
-    for key in ("see_also", "prereq", "superseded_by", "episodic_source"):
+    for key in RELATION_KEYS:
         val = fm.get(key)
         if val is None:
             continue
         items = val if isinstance(val, list) else [val]
         for item in items:
             if isinstance(item, str):
-                edges.append((src_rel, item, f"frontmatter_{key}"))
+                dst = normalize_relation_target(item, root)
+                edges.append((src_rel, dst, f"frontmatter_{key}"))
     return edges
 
 
