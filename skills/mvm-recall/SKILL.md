@@ -1,13 +1,15 @@
 ---
 name: mvm-recall
-description: "MVM unified question-answering. Spawns 3 parallel haiku probes (naked / KB / web), reconciles via trust hierarchy KB>web>weights, auto-spawns /mvm-ingest on web hits, logs every recall to ~/mvm/state/recall-log.jsonl. Triggers: '/mvm-recall', 'recall <question>', any factual question routed to mvm."
+description: "MVM unified question-answering. Runs KB + web retrieval INLINE (orchestrator does the searches itself) plus ONE naked-baseline haiku probe for prior-contamination signal; reconciles via trust hierarchy KB>web>weights, auto-spawns /mvm-ingest on web hits, logs every recall to ~/mvm/state/recall-log.jsonl. Triggers: '/mvm-recall', 'recall <question>', any factual question routed to mvm."
 ---
 
 # /mvm-recall
 
 ## Steps
 
-1. **Spawn 3 parallel Agent calls (`model: haiku`, all in one batch). Tool restriction is STRUCTURAL via dedicated subagent_type — not prompt-level.** Use `subagent_type: mvm-naked-clone` (tools: []), `subagent_type: mvm-kb-clone` (tools: [Bash, Read, Grep]), `subagent_type: mvm-web-clone` (tools: [WebSearch, WebFetch]). Each agent's frontmatter enforces its tool envelope at the harness level — they can't break it even if the prompt is buggy. Prompt-level CRITICAL CONSTRAINTS blocks are still useful as a second layer (and to forbid prior-knowledge use, which isn't a tool), but tool gating is structural now. The orchestrator still validates tool-use counts as a sanity assert; structural enforcement should make that always pass. (Switched from `general-purpose` 2026-05-09 telegram-1851 — recall-log entry #2 'contaminated probe — did web/KB' was the smoking gun for prompt-only restriction failure.)
+**Architecture (changed 2026-06-04 S753, Mike-requested):** KB and web retrieval are run **INLINE by the orchestrator** (you do the `mvm search` / `WebSearch` calls yourself in this turn). Only the **naked baseline stays a subagent** — measuring weight-prior requires an isolated, uncontaminated context, and your own context is contaminated the moment you do the inline KB/web searches. So: one subagent (naked), two inline retrieval passes (KB, web). The trust hierarchy, reconciliation, ingest-on-supersession, and logging are unchanged.
+
+1. **Spawn the naked probe FIRST — the only subagent.** Issue it in the SAME message as your first inline KB `mvm search` so it runs concurrently. `subagent_type: mvm-naked-clone` (tools: [], structural), `model: haiku`. Its job is the contamination signal: it tells you whether your weight-prior alone would have answered (and whether that prior is wrong/PoE1-contaminated/etc.). **Validation:** its task notification must show `tool_uses: 0`; if > 0, the measurement is invalid — re-spawn with stricter wording or mark the probe failed in reconciliation.
 
    **Naked probe prompt:**
    ```
@@ -26,60 +28,21 @@ description: "MVM unified question-answering. Spawns 3 parallel haiku probes (na
    RATIONALE: <one sentence; if you wanted a tool, name it here>
    ```
 
-   **KB probe prompt:**
-   ```
-   [CRITICAL CONSTRAINTS — READ FIRST]
-   You are a KB RETRIEVAL INSTRUMENT.
-   ALLOWED tools: ONLY Bash for `mvm search` (no other Bash commands), Read on files
-   inside ~/mvm/knowledge/, Grep on files inside ~/mvm/knowledge/.
-   FORBIDDEN: any other Bash; WebSearch; WebFetch; any web tool; Skill; Agent; ToolSearch;
-   prior knowledge.
-   HARD CAP: 3 tool calls total. Stop after 3 even if you haven't found the answer.
-   If KB doesn't contain the answer, output a refusal with that explicit signal.
+2. **KB retrieval — INLINE (you run it; no subagent).** Apply this procedure yourself with your own Bash/Read/Grep, capturing a `kb.ans` + `kb.rationale` (with cited path) for the log.
 
-   KB SURFACE SCOPE (decided 2026-05-15, sync-gap-doctrine.md):
-   The recall KB surface is ~/mvm/knowledge/resources/ (canonical mechanics —
-   mirrored & current via mvm-mirror) plus ~/mvm/knowledge/{areas,topics,
-   topics-alfred-state}/. ~/mvm/knowledge/projects/ is NOT a recall surface and
-   no longer exists: project deliverables are post-DAG syntheses retrieved by the
-   ORCHESTRATOR via direct Read of ~/projects/<path>, never recalled. If the
-   question targets a project deliverable / recommendation doc, output a KB-miss
-   refusal that names the ~/projects/ path to Read directly — do NOT treat any
-   stale project copy as a KB hit.
+   **KB SURFACE SCOPE** (decided 2026-05-15, sync-gap-doctrine.md): the recall KB surface is `~/mvm/knowledge/resources/` (canonical mechanics — mirrored & current via mvm-mirror) plus `~/mvm/knowledge/{areas,topics,topics-alfred-state}/`. `~/mvm/knowledge/projects/` is NOT a recall surface and no longer exists: project deliverables are retrieved by direct Read of `~/projects/<path>`, never recalled. If the question targets a project deliverable / recommendation doc, treat KB as a miss and Read the `~/projects/` path directly — never treat a stale project copy as a KB hit.
 
    Procedure:
-   1. ONE `mvm search "<query>"` to find candidates.
-   2. Read top 2 candidates if needed. Ignore any candidate under a
-      knowledge/projects/ path (stale-snapshot artifact) — treat as KB-miss.
-   3. If candidates conflict on this question, list each one's claim in RATIONALE.
+   1. `mvm search` is a TEXT-MATCH index, NOT semantic — a verbose multi-term query (e.g. "PoE2 0.5 league name expansion patch version") scores near-zero and produces a FALSE KB-miss even when the fact is in substrate. FIRST extract 1–3 TIGHT key terms — proper nouns, distinctive multi-word phrases, canonical entity names (e.g. "Runes of Aldur", "Ice Shot Deadeye") — and issue ONE `mvm search "<tight term>"` per term (up to 3). Tight key-term queries hit text=1.000; verbose strings do not. Only if no tight term exists, fall back to one trimmed noun-phrase query.
+   2. Read the single best candidate if the snippet is insufficient. Ignore any candidate under a `knowledge/projects/` path (stale-snapshot artifact) — treat as KB-miss.
+   3. Conclude a KB-miss ONLY after tight key-term queries also came up empty — a verbose-query zero-hit is NOT sufficient evidence of a real gap.
+   4. If candidates conflict, record each one's claim in the rationale.
 
-   QUESTION: <q>
+   Keep it tight — aim for ≤4 retrieval calls (the old subagent cap, now a self-discipline, not a hard wall since you control the budget).
 
-   Output exactly:
-   ANSWER: <best answer drawn from KB, or refusal>
-   RATIONALE: <cite file path(s) and passage; note conflicts>
-   ```
+3. **Web retrieval — INLINE (you run it; no subagent).** Run web **by default** with your own WebSearch/WebFetch (~1 WebSearch + 1 WebFetch on the top result; one extra WebFetch if inconclusive), capturing `web.ans` + `web.rationale` (with URL). **You MAY skip web** only when KB returns a grounded hit in a declared curated domain AND you have no staleness concern (KB wins there regardless, per the curated-domain override) — but still run web whenever you suspect the KB doc may be stale, since web is how supersession (step 4) is detected. Note: low-trust SEO/gold-seller domains (aoeah, u4gm, mmoexp, etc.) are weak sources — discount them, especially against a grounded KB hit.
 
-   **Web probe prompt:**
-   ```
-   [CRITICAL CONSTRAINTS — READ FIRST]
-   You are a WEB RETRIEVAL INSTRUMENT.
-   ALLOWED tools: ONLY WebSearch and WebFetch.
-   FORBIDDEN: Bash; Read; Grep; Glob; mvm search; any KB access; Skill; Agent;
-   ToolSearch; prior knowledge.
-   HARD CAP: 3 tool calls total. Typically: 1 WebSearch + 1 WebFetch (top result).
-   If inconclusive, ONE more WebFetch on the second result. Then answer or refuse.
-
-   QUESTION: <q>
-
-   Output exactly:
-   ANSWER: <best answer from fetched source>
-   RATIONALE: <one sentence including the source URL>
-   ```
-
-   **Orchestrator validation:** when reading each probe's response, check the reported tool-use count (visible in the Agent task notification). If naked > 0 tool calls or any probe exceeds 3, treat that probe's result as invalid and re-spawn with even stricter wording, OR mark the probe failed and note in reconciliation.
-
-2. **Reconcile** by reading all three results. Trust hierarchy: **KB > web > weights**. The rationale is the diagnostic — it tells you whether each probe actually had grounding or was guessing.
+4. **Reconcile** across the naked probe result and your inline KB + web findings. Trust hierarchy: **KB > web > weights**. The rationale is the diagnostic — it tells you whether each source actually had grounding or was guessing.
 
    - **KB rationale cites a file/passage** → KB grounded; trust it (default).
    - **KB rationale says "no relevant doc found" or similar** → KB silent; fall through to web.
@@ -89,20 +52,31 @@ description: "MVM unified question-answering. Spawns 3 parallel haiku probes (na
 
    Curated-domain override: if the question is in a declared curated domain, KB always wins over web/weights as long as it has grounded rationale.
 
-3. **Auto-spawn `/mvm-ingest`** in background (`run_in_background: true`) when web answered but KB didn't, OR when web supersedes stale KB. Pass `q`, `a`, source URL as a seed.
+5. **Auto-spawn `/mvm-ingest`** in background (`run_in_background: true`) when web answered but KB didn't, OR when web supersedes stale KB. Pass `q`, `a`, source URL as a seed.
 
-4. **Append to `~/mvm/state/recall-log.jsonl`** (single-line JSON per recall):
-   ```json
-   {"ts":"...", "session_id":"...", "question":"...", "topic_hint":"...",
+6. **Log via the `recall-log` CLI — NOT a hand-built file append.** This step is
+   mandatory and non-skippable: the fail-closed `pretool-curated-write-gate`
+   uses this ledger as its ONLY evidence source, and a stop-hook
+   (`stop-recall-log-enforce.sh`) will BLOCK session end if a recall ran without
+   a logged entry. Pipe the reconciled entry as one JSON object on stdin:
+   ```bash
+   echo '{"question":"...", "topic_hint":"...",
     "probes":{"naked":{"ans":"...","rationale":"..."},
               "kb":{"ans":"...","rationale":"...","top_score":N},
               "web":{"ans":"...","rationale":"...","url":"..."}},
     "reconciliation_pattern":"...", "decided_source":"kb|web|weights|none",
-    "decided_answer":"...", "ingested":bool, "ingested_path":"...",
-    "duration_ms":N}
+    "decided_answer":"...", "ingested":false, "ingested_path":null,
+    "duration_ms":N}' | recall-log add
    ```
+   The CLI auto-fills `ts` (local-tz now) and `session_id`, validates that
+   `question`+`decided_answer` are present, and appends atomically (flock).
+   Required keys: `question`, `decided_answer`. Everything else is optional but
+   include `topic_hint` (the gate matches its curated subdomain token against it).
+   Why a CLI and not a prose append: the prose step was silently dropped across
+   sessions (ledger frozen 2026-05-25..27, ≥2 confirmed unlogged recalls →
+   auditor cycle #172). A single command can't be malformed and is enforced.
 
-5. **Output to user:**
+7. **Output to user:**
    ```
    <answer>
 
@@ -110,7 +84,7 @@ description: "MVM unified question-answering. Spawns 3 parallel haiku probes (na
    [substrate updated: <what changed>]
    ```
 
-6. **Substrate-confusion signal — handle walkback as a substrate-update event.**
+8. **Substrate-confusion signal — handle walkback as a substrate-update event.**
    If the user pushes back on a confident claim during this turn ("wait, who said that?", "are you sure?", "where did that come from?") and you have to **revise the answer** after re-checking, that revision is NOT just a conversational correction — it's evidence the substrate enabled the conflation by commingling things that should be visually separable (e.g., GGG-direct quote vs creator-speculation; old version vs new; observation vs prediction).
 
    Before exit:

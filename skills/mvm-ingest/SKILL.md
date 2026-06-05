@@ -110,7 +110,12 @@ Place the new canonical under the appropriate folder. Curated domain → `areas/
 
 7. **If any injected test FAILS → rewrite the doc** (not the test). Up to 3 retries. Then commit or refuse.
 
-8. **On all-pass:** Bash `mvm index`. Report lift table:
+8. **On all-pass:** index in two phases so the ingest doesn't block >2min on vector embeddings (S683):
+   ```bash
+   mvm index --no-embed --quiet                          # fast: FTS+graph only, rc=0 in seconds → `mvm search` works immediately
+   mvm index --embed-only --quiet &                       # backfill embeddings detached; idempotent, semantic recall catches up
+   ```
+   Run the second command with `run_in_background: true` (Bash) — never foreground-block on it. **Never fire a concurrent `mvm index` / `mvm search` while the backfill runs — SQLite lock contention deadlocks on `.index.lock`** (S683). The `--no-embed` pass already makes the doc retrievable, so verification/cascade steps below can proceed without waiting for the backfill. Report lift table:
    ```
    Naked  pass: N/total
    Injected pass: N/total

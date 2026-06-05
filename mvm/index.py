@@ -147,7 +147,7 @@ def extract_edges(src_path: Path, body: str, fm: dict, root: Path) -> list[tuple
 
 def init_db(state: Path) -> tuple[sqlite3.Connection, sqlite3.Connection]:
     state.mkdir(parents=True, exist_ok=True)
-    idx = sqlite3.connect(state / "index.db")
+    idx = sqlite3.connect(state / "index.db", timeout=30.0)
     # Load sqlite-vec extension for vector search
     idx.enable_load_extension(True)
     import sqlite_vec
@@ -173,7 +173,7 @@ def init_db(state: Path) -> tuple[sqlite3.Connection, sqlite3.Connection]:
         );
     """)
 
-    g = sqlite3.connect(state / "graph.db")
+    g = sqlite3.connect(state / "graph.db", timeout=30.0)
     g.executescript("""
         CREATE TABLE IF NOT EXISTS edges (
             src TEXT NOT NULL,
@@ -203,7 +203,7 @@ def _embed_only_main(args) -> int:
     """Backfill embeddings on existing index.db files. Idempotent — only embeds docs
     not already in files_vec. Doesn't touch FTS or graph."""
     state = args.state
-    idx = sqlite3.connect(state / "index.db")
+    idx = sqlite3.connect(state / "index.db", timeout=30.0)
     idx.enable_load_extension(True)
     import sqlite_vec
     sqlite_vec.load(idx)

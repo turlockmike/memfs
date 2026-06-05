@@ -24,24 +24,29 @@ Selection rule for quality + staleness: **oldest mtime first**, never random. v0
 2. **Coverage — proactive ingest** (max 3 per cycle):
    For each top-fallback topic, find the most-frequent web URL in `recall-log.jsonl`. Spawn `/mvm-ingest <URL>` in background.
 
+   **RECALL-LOG APPEND (mandatory, steps 3+4) — the `mvm-(kb|web)-clone` spawns below trip the fail-closed Stop hook `stop-recall-log-enforce.sh`, which BLOCKS at session end if the ledger got zero appends (it can't tell dream-QA clones from recall-skill probes; ingest is exempted by using naked-only clones, dream cannot — it needs kb/web).** Each verification probe IS a genuine kb/web retrieval with a decided answer, so log one line PER probe as you grade it: `echo '{"question":"<test q>","topic_hint":"dream-quality-verify|dream-staleness-verify","decided_source":"kb","decided_answer":"<answer> — <doc> PASS/FAIL"}' | recall-log add`. Use **`decided_source":"kb"`** even for staleness web-corroboration (the KB canonical is the trust-hierarchy winner when it holds) so these don't register as false `web`/`none` fallbacks that spuriously trigger next cycle's coverage ingest. ts/session_id auto-fill.
+
 3. **Quality — re-verify + repair** (oldest 5 canonicals):
-   For each, pick a random test. Spawn injected-mode cold-clone (haiku, ANSWER/RATIONALE format). Grade.
+   For each, pick a random test. Spawn injected-mode cold-clone (haiku, ANSWER/RATIONALE format). Grade. **Log the probe to recall-log (see RECALL-LOG APPEND above).**
    - **PASS** → done.
    - **FAIL** → spawn second cold-clone immediately for cross-check.
      - **Both fail** → spawn `/mvm-ingest` on the doc's original `source:` URL (overwriting re-ingest).
      - **Second passes** → record as transient in dream-log; no action.
 
 4. **Staleness — spot-check + supersede** (oldest 3 not in step 3):
-   For each, take the first test's `q`, run KB-clone (Read doc) + web-clone (WebSearch) in parallel.
+   **Typed-edge skip-guard (mechanical, runs FIRST per candidate):** Bash `mvm relations <doc> --rel superseded_by --json`. If it returns a non-empty `out`-direction edge, the doc is ALREADY superseded → SKIP it (don't burn web probes re-validating a known-dead canonical; pick the next-oldest instead). This is the typed-edge CONSUMER replacing a prose re-read.
+   For each surviving candidate, take the first test's `q`, run KB-clone (Read doc) + web-clone (WebSearch) in parallel. **Log the probe to recall-log (see RECALL-LOG APPEND above).**
    - **Agree** → done.
    - **Disagree, web has fresher-source markers** → run second web probe with different phrasing.
-     - **Second web probe confirms** → spawn `/mvm-ingest` on fresh URL; mark old canonical `status: superseded` in frontmatter; add `superseded_by:` pointer.
+     - **Second web probe confirms** → spawn `/mvm-ingest` on fresh URL; mark old canonical `status: superseded` in frontmatter; add `superseded_by: resources/...` pointer (knowledge-root-relative, NOT `~/` — index.py normalizes either, but write root-relative). **Then `mvm index` and VERIFY the edge resolved: `mvm relations <old-doc> --rel superseded_by` MUST list the new canonical. Empty output = the pointer dangled (Gap-0 regression) → fix the path and re-index before moving on.**
      - **Second web probe disconfirms** → record as transient; no action.
 
 5. **Contested + gap follow-up + cross-contradiction sweep** (from `recall-log.jsonl` + KB):
    - Entries with `decided_source: "contested"` since last dream → spawn 5 web probes with paraphrased queries; if convergence emerges, ingest the consensus; if still split, escalate to user.
    - Entries with `decided_source: "none"` (hard misses) → propose to user as curriculum items.
-   - **Cross-contradiction sweep (5 vector-near pairs):** Bash `mvm search "<random topic-keyword from a recent canonical>" --top-k 3` → if top-2 results have similarity > 0.7 to each other, spawn 2 Agent cold-clones asking each doc the same probing question; if answers contradict → flag both with `status: cross-contested` and surface to user.
+   - **Cross-contradiction sweep (typed-edge consumer FIRST, then 5 vector-near pairs):**
+     - **(a) Consume known tensions:** for each doc touched in steps 3–4, Bash `mvm relations <doc> --rel in_tension_with --json`. Any non-empty result is a previously-recorded contradiction pair — re-probe THAT pair first (one cold-clone each); if they now AGREE, the tension resolved → remove the `in_tension_with:` frontmatter from both + re-index (don't leave a stale tension edge); if still contradict, leave it (durable record holds).
+     - **(b) Discover new tensions:** Bash `mvm search "<random topic-keyword from a recent canonical>" --top-k 3` → if top-2 results have similarity > 0.7, spawn 2 Agent cold-clones asking each doc the same probing question; if answers contradict → flag both with `status: cross-contested`, **AND add a reciprocal `in_tension_with: resources/<other-doc>` frontmatter edge to BOTH docs (root-relative), then `mvm index`** so the contradiction becomes a queryable typed edge (consumed by (a) next cycle — closes the no-sinks producer→consumer loop), and surface to user.
 
 6. **Log cycle** (one line) to `~/mvm/state/dream-log.jsonl`:
    ```json
@@ -59,6 +64,7 @@ Selection rule for quality + staleness: **oldest mtime first**, never random. v0
        "predictions_accuracy":{"new_predictions":N,"evaluable":N,"score":"...","resolution":"..."},
        "mistakes_2plus_30d_assessment":"INLINE per-root-class FIX-C string — see MANDATE below",
        "s4_initiatives":{"total":N,"unratified":["..."],"past_expiry_dropped":["..."],"flagged_for_attention":["..."],"notes":"..."},
+       // S4 PATH PIN (added 2026-06-04 dream cycle 30; entry-12 recommended this, never shipped → path re-confused in entries 8 & 11). The s4-initiatives ledger lives at ~/.local/state/alfred/areas/s4-initiatives/ (the .md files + index.md + archived/). The path ~/areas/s4-initiatives/ holds ONLY auto-generated INDEX.md/index.md stubs — reading it reports a false "0 active". Always read the .local/state path.
        "session_capsule_check":{"exists":bool,"action":"skip|compress"}},
     "escalations":[{"severity":"...","kind":"...","finding":"..."}],
     "duration_ms":N}
