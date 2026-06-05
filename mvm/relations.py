@@ -28,6 +28,33 @@ DEFAULT_STATE = Path(os.environ.get("MVM_STATE", str(Path.home() / "mvm" / "stat
 SEMANTIC_PREFIX = "frontmatter_"
 
 
+def _heal_hot_journal(graph_db: Path) -> bool:
+    """Best-effort recovery of a stale rollback/WAL journal left by an interrupted
+    writer (e.g. a killed `mvm index`). A read-only (mode=ro) connection CANNOT
+    replay a hot journal — SQLite needs write access to roll it back, so the first
+    query raises OperationalError("attempt to write a readonly database"). Opening
+    the db read-WRITE once forces that recovery and removes the journal, after
+    which the ro read path works. Guarded so it only acts when a non-empty journal
+    actually exists; returns True if a heal was attempted. Safe: if a live writer
+    holds the db, the rw open simply blocks/fails and we fall through unchanged.
+    """
+    healed = False
+    for suffix in ("-journal", "-wal"):
+        j = graph_db.with_name(graph_db.name + suffix)
+        try:
+            if j.exists() and j.stat().st_size > 0:
+                conn = sqlite3.connect(str(graph_db), timeout=10.0)
+                try:
+                    conn.execute("PRAGMA quick_check")
+                    conn.commit()
+                finally:
+                    conn.close()
+                healed = True
+        except (OSError, sqlite3.Error):
+            pass
+    return healed
+
+
 def query_relations(graph_db: Path, path: str, rel: str | None = None) -> list[tuple[str, str, str]]:
     """Return [(edge_type, direction, other)] for <path>'s semantic relations.
 
@@ -46,25 +73,35 @@ def query_relations(graph_db: Path, path: str, rel: str | None = None) -> list[t
         type_arg = (f"{SEMANTIC_PREFIX.replace('_', chr(92) + '_')}%",)
 
     uri = f"file:{graph_db}?mode=ro"
+
+    def _read() -> list[tuple[str, str, str]]:
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+        except sqlite3.OperationalError:
+            return []
+        rows: list[tuple[str, str, str]] = []
+        try:
+            for et, dst in conn.execute(
+                f"SELECT edge_type, dst FROM edges WHERE src = ? AND {type_clause} ORDER BY edge_type, dst",
+                (path, *type_arg),
+            ):
+                rows.append((et, "out", dst))
+            for et, src in conn.execute(
+                f"SELECT edge_type, src FROM edges WHERE dst = ? AND {type_clause} ORDER BY edge_type, src",
+                (path, *type_arg),
+            ):
+                rows.append((et, "in", src))
+        finally:
+            conn.close()
+        return rows
+
     try:
-        conn = sqlite3.connect(uri, uri=True, timeout=10.0)
-    except sqlite3.OperationalError:
-        return []
-    rows: list[tuple[str, str, str]] = []
-    try:
-        for et, dst in conn.execute(
-            f"SELECT edge_type, dst FROM edges WHERE src = ? AND {type_clause} ORDER BY edge_type, dst",
-            (path, *type_arg),
-        ):
-            rows.append((et, "out", dst))
-        for et, src in conn.execute(
-            f"SELECT edge_type, src FROM edges WHERE dst = ? AND {type_clause} ORDER BY edge_type, src",
-            (path, *type_arg),
-        ):
-            rows.append((et, "in", src))
-    finally:
-        conn.close()
-    return rows
+        return _read()
+    except sqlite3.OperationalError as e:
+        # A hot journal from an interrupted writer blocks the ro path. Heal once, retry.
+        if "readonly" in str(e).lower() and _heal_hot_journal(graph_db):
+            return _read()
+        raise
 
 
 def main(argv=None) -> int:
