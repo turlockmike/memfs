@@ -217,8 +217,10 @@ def main(argv = None) -> int:
 
     # Vector search first (semantic); FTS fallback if vector returns nothing
     text_results = vec_search(index_db, args.query, args.kind, args.in_prefix, limit=50)
+    retriever = "sem"  # which retriever produced text_results (sem=vector, fts=keyword fallback)
     if not text_results:
         text_results = fts_search(index_db, args.query, args.kind, args.in_prefix, limit=50)
+        retriever = "fts"
     if not text_results:
         if args.json:
             print(json.dumps({"query": args.query, "results": []}))
@@ -256,6 +258,7 @@ def main(argv = None) -> int:
     if args.json:
         print(json.dumps({
             "query": args.query,
+            "retriever": retriever,
             "filters": {"in": args.in_prefix, "near": args.near, "kind": args.kind},
             "weights": {"text": W_TEXT, "graph": W_GRAPH, "hier": W_HIER},
             "results": [
@@ -277,7 +280,7 @@ def main(argv = None) -> int:
             kind_str = f" [{m['kind']}]" if m.get("kind") else ""
             tests_str = f" tests={m['n_tests']}" if m.get("n_tests") else ""
             print(f"  {score:.3f}  {path}{kind_str}{tests_str}")
-            print(f"          text={comp['text']:.3f} graph={comp['graph']:.3f} hier={comp['hier']:.3f}")
+            print(f"          {retriever}={comp['text']:.3f} graph={comp['graph']:.3f} hier={comp['hier']:.3f}")
     return 0
 
 
