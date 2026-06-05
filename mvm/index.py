@@ -346,7 +346,15 @@ def main(argv = None) -> int:
     idx, g = init_db(args.state)
     idx.execute("DELETE FROM files")
     idx.execute("DELETE FROM files_fts")
-    idx.execute("DELETE FROM files_vec")
+    # Preserve files_vec on --no-embed rebuilds. The mirror cron runs `mvm index
+    # --no-embed` on every resource change; wiping files_vec there (with no embed
+    # phase to repopulate) left the vector index permanently empty, silently
+    # demoting recall to FTS-only (search.py is vector-first). Only wipe when we
+    # will actually re-embed. Orphan rows (deleted files) are harmless — vec_search
+    # joins files_vec→files, so they never surface; a daily full `mvm index`
+    # (embed) re-wipes + refreshes everything, clearing orphans and staleness.
+    if not args.no_embed:
+        idx.execute("DELETE FROM files_vec")
     g.execute("DELETE FROM edges")
 
     md_files = [p for p in args.root.rglob("*.md") if not p.name.endswith(".tests.md")]
