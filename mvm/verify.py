@@ -122,6 +122,19 @@ PASS if the candidate states the same atomic facts as the expected. PASS cases:
       EXPECTED: "The biggest single hit that landed across all sources is what counts"
       CANDIDATE: "The biggest single hit landed"
       → PASS — same atomic claim about which hit counts.
+  - **Incidental enumeration sub-detail omission.** EXPECTED enumerates members
+    of a list as supporting detail for a broader claim; CANDIDATE conveys the
+    broader claim but omits some or all of the enumerated members. PASS ONLY
+    when EXPECTED's claim does not turn on the omitted member — the enumeration
+    illustrates the claim rather than being the claim. If the claim IS the
+    enumeration (an explicit count, or the question asks WHICH members), the
+    distinct-fact-omission rule below governs and the omission FAILs.
+      EXPECTED: "each class has two ascendancies (e.g. Warbringer and Titan for Warrior)"
+      CANDIDATE: "each class has two ascendancies"
+      → PASS — the per-class member list illustrates the count claim; the count is intact.
+      EXPECTED: "the two Witch ascendancies are Infernalist and Blood Mage"
+      CANDIDATE: "Infernalist"
+      → FAIL — the claim IS the enumeration; each member is a distinct fact.
 
 FAIL if:
   - The candidate gives a different number, name, date, or proper noun.
@@ -301,8 +314,10 @@ def verify_test(doc_path: Path, test: dict, model: str, mode: str = "injected") 
     grader_prompt = (
         f"CANDIDATE: {candidate}\n\n"
         f"EXPECTED: {expected}\n\n"
-        "Does the CANDIDATE convey every fact stated in EXPECTED, without "
-        "contradicting any of them? The CANDIDATE may include additional correct "
+        "Does the CANDIDATE convey every DISTINCT fact stated in EXPECTED, without "
+        "contradicting any of them? Elaborations, mechanism parentheticals, and "
+        "enumerable sub-details of a single claim do not count as distinct facts "
+        "(see system rubric). The CANDIDATE may include additional correct "
         "detail — that does not change the verdict. Output PASS or FAIL."
     )
     try:

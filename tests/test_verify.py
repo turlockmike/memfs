@@ -104,3 +104,66 @@ def test_naked_retriever_system_forbids_tool_use():
     event."""
     p = verify.NAKED_RETRIEVER_SYSTEM
     assert "no tools" in p.lower() or "Do not invoke tools" in p
+
+
+# Grader-rubric substance/distinct-fact boundary locks (dream-20260610-0100,
+# auditor APPROVE-WITH-CHANGES sign-off). These are ANTI-DELETION locks: the
+# grader-pathology fix (substance-over-completeness) is only safe while the
+# distinct-fact FAIL + materially-different-learner test remain in the rubric.
+# A future "loosen the grader" edit that drops them must break these tests.
+
+def test_grader_system_retains_distinct_fact_fail():
+    """The distinct-fact-omission FAIL branch is the oracle's genuine-defect
+    detector — its deletion is the HC#4 weakening the auditor rejected."""
+    p = verify.GRADER_SYSTEM
+    assert "omits a DISTINCT fact" in p
+    assert "materially-different-learner" in p
+    # Canonical FAIL examples stay encoded verbatim.
+    assert "Memphis, Tennessee" in p          # city+state distinct-fact FAIL
+    assert "explicit count differs" in p      # count-differs FAIL
+
+
+def test_grader_system_retains_substance_pass_carveouts():
+    """The three calibrated PASS carve-outs (elaboration / rewording /
+    incidental enumeration) — the substance-over-completeness side."""
+    p = verify.GRADER_SYSTEM
+    assert "Elaboration-clause omission" in p
+    assert "Same-fact rewording" in p
+    assert "Incidental enumeration sub-detail omission" in p
+
+
+def test_grader_system_enumeration_clause_is_bounded():
+    """The enumeration PASS is subordinated to the learner test: it must carry
+    both branches — PASS-when-incidental AND FAIL-when-the-claim-IS-the-
+    enumeration. An unbounded version would let stale docs verify clean."""
+    p = verify.GRADER_SYSTEM
+    assert "claim IS the enumeration" in p
+    assert "Infernalist" in p  # the load-bearing-member FAIL example
+
+
+def test_grader_user_turn_says_distinct_fact():
+    """The grader user-turn must align with the system rubric: 'every DISTINCT
+    fact', not 'every fact' — the old wording contradicted the elaboration
+    carve-outs and drove residual false-FAILs (auditor finding #3)."""
+    import inspect
+    src = inspect.getsource(verify.verify_test)
+    assert "every DISTINCT fact" in src
+    assert "do not count as distinct facts" in src
+
+
+def test_grader_flow_passes_incidental_enumeration_omission(tmp_path):
+    """Mocked end-to-end: a terse-but-correct candidate graded PASS flows
+    through to rc=0 (the false-FAIL class this fix targets)."""
+    doc = tmp_path / "doc.md"
+    doc.write_text("Each class has two ascendancies.")
+    (tmp_path / "doc.tests.yaml").write_text(
+        "- id: 1\n  q: 'how many ascendancies per class?'\n  a: 'two'\n"
+    )
+    responses = ["each class has two ascendancies", "PASS"]
+
+    def fake_subproc(system, user, model="haiku", timeout=120):
+        return responses.pop(0)
+
+    with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
+        rc = verify.main([str(doc)])
+    assert rc == 0
