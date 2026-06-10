@@ -9,9 +9,16 @@ v0 uses SQLite FTS5 for text search (BM25-ranked). v0.1 will add a vector
 column via sqlite-vec. The schema reserves space for embeddings.
 
 Usage:
-  mvm-index                          # index ~/mvm/knowledge by default
+  mvm-index                          # INCREMENTAL: only added/changed/deleted docs (default)
+  mvm-index --full                   # full rebuild: wipe + reindex + re-embed everything
   mvm-index --root /path/to/kb       # custom root
   mvm-index --root . --state ./state
+
+Incremental (default since 2026-06-10): diffs disk mtimes against the
+files.mtime manifest (max of .md and its .tests.yaml), touches only the
+delta. A zero-delta run never loads the embedding model — sub-second,
+~30MB RSS, vs ~10min/2.5GB for a full re-embed (the OOM-storm suspect
+that motivated this).
 """
 from __future__ import annotations
 
@@ -188,6 +195,43 @@ def init_db(state: Path) -> tuple[sqlite3.Connection, sqlite3.Connection]:
     return idx, g
 
 
+def _doc_mtime(md: Path) -> float:
+    """Change-detection mtime for a doc unit: max of the .md and its
+    .tests.yaml — n_tests derives from the yaml, so a tests-only change
+    must mark the doc dirty or n_tests goes stale until the next --full."""
+    m = md.stat().st_mtime
+    t = md.with_suffix(".tests.yaml")
+    if t.exists():
+        m = max(m, t.stat().st_mtime)
+    return m
+
+
+def index_doc(idx: sqlite3.Connection, g: sqlite3.Connection,
+              md: Path, root: Path) -> tuple[str, str, int]:
+    """Parse one md file and insert its files + files_fts rows and edges.
+    Caller is responsible for having deleted stale rows first (incremental)
+    or wiped the tables (full). Returns (rel, body, n_edges)."""
+    fm, body = parse_markdown(md)
+    rel = str(md.relative_to(root))
+    idx.execute(
+        "INSERT INTO files (path, kind, source, ingested_at, last_modified_at, mtime, n_tests, frontmatter) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (rel, str(fm.get("kind", "")), str(fm.get("source", "")),
+         str(fm.get("ingested_at", "")), str(fm.get("last_modified_at", "")),
+         _doc_mtime(md), count_tests(md), yaml.safe_dump(fm)),
+    )
+    idx.execute("INSERT INTO files_fts (path, body) VALUES (?, ?)", (rel, body))
+    n_edges = 0
+    for src, dst, etype in extract_edges(md, body, fm, root):
+        try:
+            g.execute("INSERT OR IGNORE INTO edges (src, dst, edge_type) VALUES (?, ?, ?)",
+                      (src, dst, etype))
+            n_edges += 1
+        except sqlite3.Error:
+            pass
+    return rel, body, n_edges
+
+
 def count_tests(md_path: Path) -> int:
     tests_path = md_path.with_suffix(".tests.yaml")
     if not tests_path.exists():
@@ -300,7 +344,14 @@ def regenerate_folder_indexes(root: Path) -> int:
             lines.append("## Subfolders")
             for sub in subs:
                 lines.append(f"- [{sub.name}/]({sub.name}/)")
-        (d / "INDEX.md").write_text("\n".join(lines) + "\n")
+        content = "\n".join(lines) + "\n"
+        out = d / "INDEX.md"
+        # Write-if-changed: an unconditional rewrite bumps mtime every run,
+        # which would make every INDEX.md look dirty to the incremental
+        # delta detector and trigger pointless re-embeds.
+        if out.exists() and out.read_text() == content:
+            continue
+        out.write_text(content)
         written += 1
     return written
 
@@ -316,6 +367,11 @@ def main(argv = None) -> int:
                         help="Skip vector embeddings (FTS+graph only). Useful for bulk migration; backfill later.")
     parser.add_argument("--embed-only", action="store_true",
                         help="Backfill embeddings on existing files without rebuilding FTS/graph. Idempotent.")
+    parser.add_argument("--full", action="store_true",
+                        help="Force a full rebuild (wipe + reindex + re-embed the entire corpus, "
+                             "~minutes + ~2.5GB RAM). Default is incremental: only added/changed/"
+                             "deleted docs are touched (seconds; embedding model not even loaded "
+                             "on a zero-delta run).")
     args = parser.parse_args(argv)
 
     # Backfill-only path: read existing files table, embed docs that don't have embeddings yet.
@@ -344,53 +400,65 @@ def main(argv = None) -> int:
     n_indexes = regenerate_folder_indexes(args.root)
 
     idx, g = init_db(args.state)
-    idx.execute("DELETE FROM files")
-    idx.execute("DELETE FROM files_fts")
-    # Preserve files_vec on --no-embed rebuilds. The mirror cron runs `mvm index
-    # --no-embed` on every resource change; wiping files_vec there (with no embed
-    # phase to repopulate) left the vector index permanently empty, silently
-    # demoting recall to FTS-only (search.py is vector-first). Only wipe when we
-    # will actually re-embed. Orphan rows (deleted files) are harmless — vec_search
-    # joins files_vec→files, so they never surface; a daily full `mvm index`
-    # (embed) re-wipes + refreshes everything, clearing orphans and staleness.
-    if not args.no_embed:
-        idx.execute("DELETE FROM files_vec")
-    g.execute("DELETE FROM edges")
-
     md_files = [p for p in args.root.rglob("*.md") if not p.name.endswith(".tests.md")]
-    n_files = 0
-    n_edges = 0
     t0 = time.time()
 
-    # Phase 1: parse all files + insert FTS rows + collect graph edges
-    parsed = []  # list of (rel, body, fm) for embedding pass
-    for md in md_files:
-        fm, body = parse_markdown(md)
-        rel = str(md.relative_to(args.root))
-        kind = fm.get("kind", "")
-        source = fm.get("source", "")
-        ingested_at = fm.get("ingested_at", "")
-        last_modified_at = fm.get("last_modified_at", "")
-        mtime = md.stat().st_mtime
-        n_tests = count_tests(md)
+    # Mode selection: incremental by default (delta vs the files.mtime manifest);
+    # --full forces the old wipe-everything path; an empty files table degrades
+    # to full automatically (nothing to diff against).
+    existing = dict(idx.execute("SELECT path, mtime FROM files").fetchall())
+    full = args.full or not existing
+    n_deleted = 0
 
-        idx.execute(
-            "INSERT INTO files (path, kind, source, ingested_at, last_modified_at, mtime, n_tests, frontmatter) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (rel, str(kind), str(source), str(ingested_at), str(last_modified_at), mtime, n_tests, yaml.safe_dump(fm)),
-        )
-        idx.execute("INSERT INTO files_fts (path, body) VALUES (?, ?)", (rel, body))
+    if full:
+        idx.execute("DELETE FROM files")
+        idx.execute("DELETE FROM files_fts")
+        # Preserve files_vec on --no-embed rebuilds. Wiping it with no embed
+        # phase to repopulate left the vector index permanently empty, silently
+        # demoting recall to FTS-only (search.py is vector-first). Only wipe
+        # when we will actually re-embed. Orphan rows are harmless — vec_search
+        # joins files_vec→files, so they never surface.
+        if not args.no_embed:
+            idx.execute("DELETE FROM files_vec")
+        g.execute("DELETE FROM edges")
+        to_index = md_files
+    else:
+        disk = {str(p.relative_to(args.root)): p for p in md_files}
+        added = [r for r in disk if r not in existing]
+        changed = [r for r, p in disk.items()
+                   if r in existing and _doc_mtime(p) != existing[r]]
+        deleted = [r for r in existing if r not in disk]
+        if not added and not changed and not deleted:
+            idx.close()
+            g.close()
+            if not args.quiet:
+                print(f"index up to date ({len(existing)} files, "
+                      f"{time.time() - t0:.2f}s) — nothing to do")
+            return 0
+        for rel in deleted:
+            idx.execute("DELETE FROM files WHERE path = ?", (rel,))
+            idx.execute("DELETE FROM files_fts WHERE path = ?", (rel,))
+            idx.execute("DELETE FROM files_vec WHERE path = ?", (rel,))
+            g.execute("DELETE FROM edges WHERE src = ?", (rel,))
+        for rel in changed:
+            idx.execute("DELETE FROM files WHERE path = ?", (rel,))
+            idx.execute("DELETE FROM files_fts WHERE path = ?", (rel,))
+            g.execute("DELETE FROM edges WHERE src = ?", (rel,))
+            # The stale vec row is NOT deleted here. Embed mode replaces it
+            # atomically in Phase 2 (delete-just-before-insert), so a failed
+            # batch embed leaves the old embedding in place — stale-but-present
+            # ranks roughly right; missing drops the doc from vector search.
+            # --no-embed keeps it for the same reason.
+        n_deleted = len(deleted)
+        to_index = [disk[r] for r in added + changed]
 
-        edges = extract_edges(md, body, fm, args.root)
-        for src, dst, etype in edges:
-            try:
-                g.execute(
-                    "INSERT OR IGNORE INTO edges (src, dst, edge_type) VALUES (?, ?, ?)",
-                    (src, dst, etype),
-                )
-                n_edges += 1
-            except sqlite3.Error:
-                pass
+    # Phase 1: parse dirty files + insert FTS rows + graph edges
+    n_files = 0
+    n_edges = 0
+    parsed = []  # list of (rel, body) for embedding pass
+    for md in to_index:
+        rel, body, ne = index_doc(idx, g, md, args.root)
+        n_edges += ne
         parsed.append((rel, body))
         n_files += 1
 
@@ -408,6 +476,11 @@ def main(argv = None) -> int:
                 continue
             for (rel, _), blob in zip(chunk, blobs):
                 try:
+                    # Delete-just-before-insert: replaces a changed doc's old
+                    # embedding only once its new one is in hand (vec0 has no
+                    # ON CONFLICT, so this is the upsert). No-op in full mode
+                    # (table wiped) and for added docs (no prior row).
+                    idx.execute("DELETE FROM files_vec WHERE path = ?", (rel,))
                     idx.execute(
                         "INSERT INTO files_vec (path, embedding) VALUES (?, ?)",
                         (rel, blob),
@@ -424,7 +497,10 @@ def main(argv = None) -> int:
 
     if not args.quiet:
         dt = time.time() - t0
-        print(f"indexed {n_files} files, {n_edges} edges, regenerated {n_indexes} INDEX.md in {dt:.2f}s")
+        mode = "full" if full else "incremental"
+        extra = f", removed {n_deleted}" if n_deleted else ""
+        print(f"[{mode}] indexed {n_files} files, {n_edges} edges{extra}, "
+              f"regenerated {n_indexes} INDEX.md in {dt:.2f}s")
         print(f"  index.db: {args.state / 'index.db'}")
         print(f"  graph.db: {args.state / 'graph.db'}")
 
