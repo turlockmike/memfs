@@ -77,9 +77,9 @@ RULES (follow exactly):
    If you would otherwise emit any of these or similar — output DONT-KNOW instead. The literal string is a contract, not a suggestion.
 3. ANSWERABLE CASE — output ONLY the answer. No preamble. No caveats. No markdown. No quotes around the answer."""
 
-GRADER_SYSTEM = """You are a grader. You will receive two answers: a CANDIDATE and an EXPECTED.
+GRADER_SYSTEM = """You are a grader. You will receive the QUESTION that was asked, and two answers: a CANDIDATE and an EXPECTED.
 
-Decide whether the CANDIDATE conveys the same factual content as EXPECTED.
+Decide whether the CANDIDATE conveys the same factual content as EXPECTED, judged against what the QUESTION asked for.
 
 CORE PRINCIPLE — match on facts, not on prose.
 A "fact" is a distinct atomic claim (a number, name, date, proper noun, identity,
@@ -135,6 +135,18 @@ PASS if the candidate states the same atomic facts as the expected. PASS cases:
       EXPECTED: "the two Witch ascendancies are Infernalist and Blood Mage"
       CANDIDATE: "Infernalist"
       → FAIL — the claim IS the enumeration; each member is a distinct fact.
+  - **Question-scope bounding.** EXPECTED may carry facts the QUESTION did not
+    ask for (extra context the test author recorded alongside the answer).
+    EXPECTED facts outside the QUESTION's scope do not count as distinct required facts.
+    Facts WITHIN the question's scope are still governed by the distinct-fact-omission FAIL rule — a candidate that omits or contradicts an in-scope fact still FAILs.
+      QUESTION: "On what date is the May 2026 reference-month CPI data released by the BLS?"
+      EXPECTED: "June 10, 2026 (at 08:30 AM ET)."
+      CANDIDATE: "June 10, 2026"
+      → PASS — the time-of-day is outside the asked date scope; the in-scope date matches.
+      QUESTION: "When was the current target range set, and has it changed in 2026?"
+      EXPECTED: "Set 2025-12-10; HELD with no change at every 2026 meeting so far."
+      CANDIDATE: "Set 2025-12-10"
+      → FAIL — the question asked two things; "has it changed in 2026" is in-scope and unanswered.
 
 FAIL if:
   - The candidate gives a different number, name, date, or proper noun.
@@ -312,12 +324,15 @@ def verify_test(doc_path: Path, test: dict, model: str, mode: str = "injected") 
         }
 
     grader_prompt = (
+        f"QUESTION: {question}\n\n"
         f"CANDIDATE: {candidate}\n\n"
         f"EXPECTED: {expected}\n\n"
         "Does the CANDIDATE convey every DISTINCT fact stated in EXPECTED, without "
         "contradicting any of them? Elaborations, mechanism parentheticals, and "
         "enumerable sub-details of a single claim do not count as distinct facts "
-        "(see system rubric). The CANDIDATE may include additional correct "
+        "(see system rubric). EXPECTED facts outside the QUESTION's scope do not "
+        "count as distinct required facts; in-scope omissions and contradictions "
+        "still FAIL (see system rubric). The CANDIDATE may include additional correct "
         "detail — that does not change the verdict. Output PASS or FAIL."
     )
     try:
@@ -403,6 +418,17 @@ def main(argv = None) -> int:
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     args = parser.parse_args(argv)
+
+    # Knowledge-root fallback: dream-verify-pick and the dream skill pass
+    # KB-root-relative paths; resolve them from any cwd. Prefer the
+    # cwd-relative path only when its tests file also exists (a mirror copy
+    # of the doc without tests, e.g. ~/resources/, must not shadow the KB
+    # pair). Path resolution only — grading semantics untouched.
+    if not args.doc.is_absolute():
+        kb_doc = Path(os.path.expanduser("~/mvm/knowledge")) / args.doc
+        cwd_pair_ok = args.doc.exists() and args.doc.with_suffix(".tests.yaml").exists()
+        if not cwd_pair_ok and kb_doc.exists() and kb_doc.with_suffix(".tests.yaml").exists():
+            args.doc = kb_doc
 
     if not args.doc.exists():
         print(f"ERROR: doc not found: {args.doc}", file=sys.stderr)
