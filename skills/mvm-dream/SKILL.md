@@ -5,7 +5,7 @@ description: "MVM offline integration. Reads mvm stats + recall-log; resolves ev
 
 # /mvm-dream
 
-Selection rule for quality + staleness: **oldest mtime first**, never random. v0.1 will refine to `priority = age × log(retrievals + 1) × domain_velocity`.
+Selection rule for quality + staleness: **least-recently-VERIFIED first** via `dream-verify-pick` (shipped 2026-06-06 dream-cycle), NOT raw oldest-mtime. WHY the change: a PASS never touches a file's mtime, so "oldest mtime first" re-probed the SAME ~8 oldest canonicals every full pass forever while ~29 of 37 test-bearing docs were NEVER quality-verified (coverage blind spot). `dream-verify-pick pick <N> [exclude...]` reads ledger `~/mvm/state/quality-verified.jsonl` and returns the N least-recently-verified canonicals (never-verified rank epoch-0, tiebreak oldest-mtime — so it degrades to the old behavior on a cold ledger). After each probe, stamp it: `dream-verify-pick record <doc> <PASS|FAIL> <quality|staleness>` (this is what rotates the next cycle to fresh docs). v0.1 will refine to `priority = age × log(retrievals + 1) × domain_velocity`.
 
 **FEP rule: every detected anomaly resolves in this cycle.** No anomaly leaves dream as a flat log entry — it either *dissolves* (cross-check disconfirms) or *drives a substrate change* (cross-check confirms → ingest/supersede). Per-cycle cap: 3 substrate-changing ingestions.
 
@@ -26,14 +26,14 @@ Selection rule for quality + staleness: **oldest mtime first**, never random. v0
 
    **RECALL-LOG APPEND (mandatory, steps 3+4) — the `mvm-(kb|web)-clone` spawns below trip the fail-closed Stop hook `stop-recall-log-enforce.sh`, which BLOCKS at session end if the ledger got zero appends (it can't tell dream-QA clones from recall-skill probes; ingest is exempted by using naked-only clones, dream cannot — it needs kb/web).** Each verification probe IS a genuine kb/web retrieval with a decided answer, so log one line PER probe as you grade it: `echo '{"question":"<test q>","topic_hint":"dream-quality-verify|dream-staleness-verify","decided_source":"kb","decided_answer":"<answer> — <doc> PASS/FAIL"}' | recall-log add`. Use **`decided_source":"kb"`** even for staleness web-corroboration (the KB canonical is the trust-hierarchy winner when it holds) so these don't register as false `web`/`none` fallbacks that spuriously trigger next cycle's coverage ingest. ts/session_id auto-fill.
 
-3. **Quality — re-verify + repair** (oldest 5 canonicals):
-   For each, pick a random test. Spawn injected-mode cold-clone (haiku, ANSWER/RATIONALE format). Grade. **Log the probe to recall-log (see RECALL-LOG APPEND above).**
+3. **Quality — re-verify + repair** (5 least-recently-verified canonicals: `dream-verify-pick pick 5`):
+   For each, pick a random test. Spawn injected-mode cold-clone (haiku, ANSWER/RATIONALE format). Grade. **Log the probe to recall-log (see RECALL-LOG APPEND above) AND stamp the rotation ledger: `dream-verify-pick record <doc> <PASS|FAIL> quality`.**
    - **PASS** → done.
    - **FAIL** → spawn second cold-clone immediately for cross-check.
      - **Both fail** → spawn `/mvm-ingest` on the doc's original `source:` URL (overwriting re-ingest).
      - **Second passes** → record as transient in dream-log; no action.
 
-4. **Staleness — spot-check + supersede** (oldest 3 not in step 3):
+4. **Staleness — spot-check + supersede** (3 least-recently-verified not in step 3: `dream-verify-pick pick 3 <the 5 step-3 docs...>`; stamp each after via `dream-verify-pick record <doc> PASS staleness`):
    **Typed-edge skip-guard (mechanical, runs FIRST per candidate):** Bash `mvm relations <doc> --rel superseded_by --json`. If it returns a non-empty `out`-direction edge, the doc is ALREADY superseded → SKIP it (don't burn web probes re-validating a known-dead canonical; pick the next-oldest instead). This is the typed-edge CONSUMER replacing a prose re-read.
    For each surviving candidate, take the first test's `q`, run KB-clone (Read doc) + web-clone (WebSearch) in parallel. **Log the probe to recall-log (see RECALL-LOG APPEND above).**
    - **Agree** → done.
@@ -78,7 +78,8 @@ Selection rule for quality + staleness: **oldest mtime first**, never random. v0
    - Self-check before append (now also asserts the canonical actions key set so a rename can't escape): `python3 -c "import json,sys; e=json.loads(sys.argv[1]); p=e['phase_2_meta_review']; a=p['mistakes_2plus_30d_assessment']; CANON={'coverage_ingests','coverage_edits','quality_repairs','quality_verifies','staleness_supersedes','contested_resolved','gaps_surfaced','transients','substrate_fixes'}; bad=set(e.get('actions',{}))-CANON; assert not bad, f'non-canonical actions key(s): {bad} — substrate-fix field is substrate_fixes'; assert isinstance(p,dict), 'phase_2_meta_review must be dict'; assert isinstance(a,str) and not any(s in a.lower() for s in ['see escalations','see journal','see above','see the ']), 'mistakes_2plus_30d_assessment must be inline, not a pointer'" "$LINE"` — if this assertion fails, the entry is non-compliant; fix the key / inline the assessment and re-validate BEFORE the append.
 
    **JSON-validate before append** (added 2026-05-14 per auditor #134 D134-V6-1 — `"count_7d":~11` human-prose tilde leaked into a numeric field, breaking `json.loads()` on the appended line). Two-line discipline:
-   1. **Compose the entry as a Python dict and `json.dumps(d, separators=(',', ':'))`** so prose can't slip past — numbers stay numbers, NaN/Infinity get caught at dump time. Equivalent: hand-author the line then `python3 -c 'import json,sys; json.loads(sys.argv[1])' "$LINE"` BEFORE the `>> dream-log.jsonl` append.
+   1. **Compose the entry as a Python dict and `json.dumps(d, separators=(',', ':'))`** so prose can't slip past — numbers stay numbers, NaN/Infinity get caught at dump time. Equivalent: hand-author the line then `python3 -c 'import json,sys; json.loads(sys.argv[1])' "$LINE"` BEFORE the append.
+   1b. **APPEND VIA `dream-log-append "$LINE"`, NEVER bare `>> dream-log.jsonl`** (shipped 2026-06-07 dream cycle). WHY: a bare `>>` fuses the new entry onto a prior line that lacked a trailing newline — observed 2026-06-07 when the 10:47 reduced entry was written unterminated, so the next append produced one 14KB concatenated line that `json.loads()` rejected, masking the ENTIRE entry from every consumer (auditor, dream-pass-coverage). `dream-log-append` (a) raw_decode-validates the line is exactly one JSON object (rejects concatenation/trailing junk, non-zero exit), and (b) ensures the file ends in `\n` before appending. This is the durable fix for the recurring concatenation class (prior occurrence: entry-4 split-fix).
    2. **Never write `~N`, `approx N`, `est N`, `~$N`, etc. inside a JSON numeric field.** Approximations belong in string fields with explicit prefix (`"count_7d_approx":"~11"`) or as a separate `notes` field. A tilde inside a number-typed slot is always a bug.
 
    If validation fails: fix the entry in-context, re-validate, then append. Do NOT append a broken line "and fix it later" — programmatic consumers (auditor, dream-pass-coverage) skip the entire malformed entry and silently report "no recent dream pass," masking the work that was done.
