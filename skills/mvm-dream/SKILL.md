@@ -49,13 +49,16 @@ probes, `web` for web-grounded ones.)
    `/mvm-ingest <URL>` in background.
 
 3. **Quality — re-verify + repair** (`dream-verify-pick pick 5`): per doc,
-   pick a random locked test, spawn injected-mode cold-clone (haiku,
-   ANSWER/RATIONALE). Grade; log probe; stamp
-   `dream-verify-pick record <doc> <PASS|FAIL> quality`.
-   - PASS → done.
-   - FAIL → second cold-clone immediately. Both fail → `/mvm-ingest` the doc's
-     `source:` URL (overwriting re-ingest). Second passes → transient, no
-     action.
+   **first probe via the engine** — `mvm verify <doc> --test-id <random id>
+   --json` (cold-clone + auto-grade; zero doc bytes through your context).
+   Log probe; stamp `dream-verify-pick record <doc> <PASS|FAIL> quality`.
+   - Engine PASS → done.
+   - Engine FAIL → cross-check with ONE orchestrator-graded cold-clone
+     (inject doc, grade per doctrine: lenient on phrasing/enumeration
+     completeness, strict on facts — the engine grader is measurably
+     stricter, exp6 2026-06-09). Both fail → `/mvm-ingest` the doc's
+     `source:` URL (overwriting re-ingest). Cross-check passes → transient,
+     no action.
 
 4. **Staleness — spot-check + supersede** (`dream-verify-pick pick 3
    <step-3 docs...>`; stamp each `PASS staleness` after):
