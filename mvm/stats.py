@@ -43,7 +43,21 @@ def parse_window(s: str) -> timedelta:
     raise ValueError(f"unknown window format: {s}")
 
 
-def load_entries(path: Path, since: datetime | None) -> list[dict]:
+def entry_kind(obj: dict) -> str:
+    """Explicit kind wins; legacy entries (pre 2026-06-09) are inferred from
+    the dream-probe topic_hint convention. WHY: 75% of the ledger was dream's
+    own QA probes, drowning real-recall signal in every stats window."""
+    k = obj.get("kind")
+    if k in ("recall", "dream-probe"):
+        return k
+    h = str(obj.get("topic_hint") or "")
+    if "dream-quality-verify" in h or "dream-staleness-verify" in h:
+        return "dream-probe"
+    return "recall"
+
+
+def load_entries(path: Path, since: datetime | None,
+                 kind: str = "recall") -> list[dict]:
     if not path.exists():
         return []
     entries = []
@@ -63,6 +77,8 @@ def load_entries(path: Path, since: datetime | None) -> list[dict]:
                     continue
             except ValueError:
                 pass
+        if kind != "all" and entry_kind(obj) != kind:
+            continue
         entries.append(obj)
     return entries
 
@@ -160,6 +176,10 @@ def main(argv = None) -> int:
     parser.add_argument("--since", help="Absolute start (ISO date), overrides --window.")
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG, help="Recall-log path.")
     parser.add_argument("--json", action="store_true", help="Emit JSON.")
+    parser.add_argument("--kind", default="recall",
+                        choices=["recall", "dream-probe", "all"],
+                        help="Ledger slice (default: recall — real recalls only; "
+                             "dream QA probes are a separate measurement channel).")
     args = parser.parse_args(argv)
 
     if args.since:
@@ -169,11 +189,12 @@ def main(argv = None) -> int:
         since = datetime.now(timezone.utc) - parse_window(args.window)
         window_label = args.window
 
-    entries = load_entries(args.log, since)
+    entries = load_entries(args.log, since, kind=args.kind)
     stats = aggregate(entries)
 
     if args.json:
-        print(json.dumps({"window": window_label, "stats": stats}, indent=2))
+        print(json.dumps({"window": window_label, "kind": args.kind,
+                          "stats": stats}, indent=2))
     else:
         print(render_text(stats, window_label))
 
