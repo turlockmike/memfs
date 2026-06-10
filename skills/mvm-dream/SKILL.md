@@ -74,6 +74,11 @@ probes, `web` for web-grounded ones.)
    - `decided_source:"contested"` since last dream → 5 paraphrased web probes;
      convergence → ingest consensus; still split → escalate.
    - `decided_source:"none"` (hard misses) → propose as curriculum items.
+   - **Hot-doc test coverage:** `mvm heat --untested --top 10` — author locked
+     tests for the SINGLE hottest untested doc (3–8 cases, /mvm-ingest step 2
+     style, injected-verify before commit). One per cycle; verification budget
+     follows retrieval heat, not age. Longitudinal metric: `mvm heat` coverage
+     % (baseline 35% @ 2026-06-09; target ≥90%).
    - **(a) Consume known tensions:** per doc touched in steps 3–4,
      `mvm relations <doc> --rel in_tension_with --json`; re-probe any pair
      (one cold-clone each). Now agree → remove `in_tension_with:` from both +
