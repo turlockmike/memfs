@@ -192,3 +192,57 @@ def test_dream_escape_hatch(tmp_path):
     r = subprocess.run([DREAM_APPEND_CLI, json.dumps(e)],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0
+
+
+# ----------------------------------------------------------- cache-lookup
+
+def _seed(log_path, entries):
+    for e in entries:
+        r = run_recall_add(e, log_path)
+        assert r.returncode == 0, r.stderr
+
+
+def run_cache(q, log_path, *args):
+    env = dict(os.environ, RECALL_LOG=str(log_path))
+    return subprocess.run([RECALL_LOG_CLI, "cache-lookup", q, *args],
+                          capture_output=True, text=True, env=env)
+
+
+def test_cache_exact_repeat_hits(tmp_path):
+    log = tmp_path / "rl.jsonl"
+    _seed(log, [{"question": "PoE2 0.5 Omen of Greater Exaltation mechanics?",
+                 "decided_answer": "adds 2 mods", "decided_source": "kb"}])
+    r = run_cache("PoE2 0.5 Omen of Greater Exaltation mechanics?", log)
+    assert r.returncode == 0
+    hit = json.loads(r.stdout.strip().splitlines()[0])
+    assert hit["decided_answer"] == "adds 2 mods"
+    assert hit["sim"] >= 0.99
+
+
+def test_cache_paraphrase_hits(tmp_path):
+    log = tmp_path / "rl.jsonl"
+    _seed(log, [{"question": "PoE2 0.5: does Orb of Annulment remove a RANDOM mod?",
+                 "decided_answer": "yes, random", "decided_source": "kb"}])
+    r = run_cache("In PoE2 0.5 can I choose which mod Orb of Annulment removes?", log)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_cache_excludes_hard_misses_and_probes(tmp_path):
+    log = tmp_path / "rl.jsonl"
+    _seed(log, [
+        {"question": "mystery question alpha beta gamma", "decided_answer": "n/a",
+         "decided_source": "none"},
+        {"question": "probe question delta epsilon zeta", "decided_answer": "x",
+         "decided_source": "kb", "topic_hint": "dream-quality-verify"},
+    ])
+    assert run_cache("mystery question alpha beta gamma", log).returncode == 1
+    assert run_cache("probe question delta epsilon zeta", log).returncode == 1
+
+
+def test_cache_no_false_positive_on_novel(tmp_path):
+    log = tmp_path / "rl.jsonl"
+    _seed(log, [{"question": "PoE2 catalyst quality mechanics on rings",
+                 "decided_answer": "a", "decided_source": "kb"}])
+    r = run_cache("What is the capital of France?", log)
+    assert r.returncode == 1
+    assert not r.stdout.strip()
