@@ -186,12 +186,34 @@ def test_dream_newline_repair(tmp_path):
 
 
 def test_dream_escape_hatch(tmp_path):
+    # LOCKED-TEST AMENDMENT 2026-06-12: fixture ts "t" -> valid ISO ts. The
+    # original fixture (authored 9adf598, 06-09) predates dream-log-append v3
+    # (2026-06-11, journal 07:31 CDT session): ts integrity now binds EVEN in
+    # skip-schema mode, because a recency-keyed log with a garbage stamp
+    # poisons every consumer (dream-recent-clean keys on ts). The test's
+    # INTENT — skip mode bypasses SCHEMA (non-canonical actions keys pass) —
+    # is unchanged; the superseded part was only the garbage-ts fixture.
+    # Companion lock below pins the new ts bound.
+    env = dict(os.environ, DREAM_LOG=str(tmp_path / "dl.jsonl"),
+               DREAM_LOG_SKIP_SCHEMA="1")
+    e = {"ts": "2026-06-09T20:00:00-05:00",
+         "actions": {"structural_fixes": ["x"]}}
+    r = subprocess.run([DREAM_APPEND_CLI, json.dumps(e)],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+
+
+def test_dream_escape_hatch_does_not_bypass_ts_integrity(tmp_path):
+    # v3 contract (2026-06-11): skip-schema is a SCHEMA bypass, not an
+    # integrity bypass — unparseable ts is refused rc 2 in BOTH modes.
     env = dict(os.environ, DREAM_LOG=str(tmp_path / "dl.jsonl"),
                DREAM_LOG_SKIP_SCHEMA="1")
     e = {"ts": "t", "actions": {"structural_fixes": ["x"]}}
     r = subprocess.run([DREAM_APPEND_CLI, json.dumps(e)],
                        capture_output=True, text=True, env=env)
-    assert r.returncode == 0
+    assert r.returncode == 2
+    assert "unparseable ts" in r.stderr
+    assert not (tmp_path / "dl.jsonl").exists()
 
 
 # ----------------------------------------------------------- timings (F3a)
