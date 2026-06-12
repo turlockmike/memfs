@@ -194,6 +194,49 @@ def test_dream_escape_hatch(tmp_path):
     assert r.returncode == 0
 
 
+# ----------------------------------------------------------- timings (F3a)
+# 2026-06-12: per-step latency instrumentation. Rows must be able to carry a
+# timings profile (else the 713s-mean recall latency stays unprofileable),
+# rows WITHOUT timings must stay valid (480+ historical rows predate the
+# field), and malformed values must be rejected at write time (a string ms
+# or negative delta would silently poison the eventual profile aggregation).
+
+def test_recall_accepts_timings_object(tmp_path):
+    log = tmp_path / "rl.jsonl"
+    e = {**GOOD_RECALL, "duration_ms": 713000,
+         "timings": {"cache_ms": 1200, "kb_search_ms": 95000,
+                     "probe_ms": 41000, "web_ms": 180000,
+                     "reconcile_ms": 30500.5}}
+    r = run_recall_add(e, log)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(log.read_text().strip())
+    assert got["timings"]["kb_search_ms"] == 95000  # persisted verbatim
+
+
+def test_recall_accepts_null_timing_for_skipped_step(tmp_path):
+    e = {**GOOD_RECALL,
+         "timings": {"cache_ms": 800, "web_ms": None}}  # web skipped
+    assert run_recall_add(e, tmp_path / "rl.jsonl").returncode == 0
+
+
+def test_recall_without_timings_still_valid(tmp_path):
+    # backward-compat: the entire pre-F3a ledger has no timings field
+    assert run_recall_add(GOOD_RECALL, tmp_path / "rl.jsonl").returncode == 0
+
+
+@pytest.mark.parametrize("bad", [
+    "fast",                              # prose where an object belongs
+    {"kb_search_ms": "95s"},             # string ms
+    {"kb_search_ms": -40},               # negative delta = botched stamps
+    {"kb_search_ms": True},              # bool is not a measurement
+])
+def test_recall_rejects_malformed_timings(tmp_path, bad):
+    r = run_recall_add({**GOOD_RECALL, "timings": bad}, tmp_path / "rl.jsonl")
+    assert r.returncode == 2
+    assert "timings" in r.stderr
+    assert not (tmp_path / "rl.jsonl").exists()
+
+
 # ----------------------------------------------------------- cache-lookup
 
 def _seed(log_path, entries):
