@@ -47,12 +47,24 @@ probes, `web` for web-grounded ones.)
 2. **Coverage — proactive ingest** (max 3/cycle): for each top-fallback topic,
    find the most-frequent web URL among `kind=recall` ledger entries; spawn
    `/mvm-ingest <URL>` in background.
+   **Query-predictability gate** (empirical — sleep-time compute,
+   arXiv:2504.13171: offline-consolidation gains scale with how predictable
+   future queries are from the substrate; ~2.5x amortization needs ~10 related
+   queries): consolidate fallback topics with stable, recurring question shapes
+   (curated domains, repeat-hit topics); a one-off novel-investigation topic in
+   the fallback list is answer-live territory → SKIP the ingest, because the
+   ingest cost never amortizes. Canonical:
+   `~/mvm/knowledge/topics-alfred-state/memory-architectures/letta-sleep-time-compute.md`.
 
 3. **Quality — re-verify + repair** (`dream-verify-pick pick 5`): per doc,
    **first probe via the engine** — `mvm verify <doc> --test-id <random id>
    --json` (cold-clone + auto-grade; zero doc bytes through your context).
    Log probe; stamp `dream-verify-pick record <doc> <PASS|FAIL> quality`.
    - Engine PASS → done.
+   - Engine FAIL with an `error` field / retry-exhausted EMPTY stdout →
+     classify as `transients` (probe-noise: the retriever/CLI failed, the doc
+     was never judged), NEVER a content defect or quality repair (auditor
+     sign-off dream-20260610-0100, point 4).
    - Engine FAIL → cross-check with ONE orchestrator-graded cold-clone
      (inject doc, grade per doctrine: lenient on phrasing/enumeration
      completeness, strict on facts — the engine grader is measurably
@@ -93,7 +105,24 @@ probes, `web` for web-grounded ones.)
      (root-relative), `mvm index`, surface to user.
 
 6. **Log cycle — compose the entry as a Python dict, `json.dumps`, then
-   append via `dream-log-append "$LINE"`.** The CLI **enforces the schema**
+   append via `dream-log-append "$LINE"`.** **RECEIPTS-FIRST (added 2026-06-11):
+   if long verifies are still running when every other step is done, append
+   the entry NOW with those items marked `"<doc>:PENDING"` in `actions`, then
+   amend after **via `dream-log-amend <session_id> '<patch-json>'`** (flock'd,
+   value-only, audited; added 2026-06-11 because hand-rolled rewrites of the
+   canonical log missed a residual marker) — never hold the whole cycle's
+   receipts hostage to the slowest probe. The amend done-test greps the
+   amended ENTRY for `PROVISIONAL|:PENDING`, not just the tests.yaml. Cron/staged sessions can be cut at any moment; results that exist
+   only in-context are lost (the 18:07 6/11 audit lost its entire log+report
+   this way and REFLECT had to forensically recover it from the transcript).**
+   **STAGED-WAKE REFLECT BINDING (2026-06-11, 2nd occurrence same day): any
+   stage that recovers or finishes a cut dream/audit cycle owns this append.
+   The cycle is INCOMPLETE until the dream-log line exists — an audit report,
+   journal entry, or trace does NOT substitute (dream-recent-clean keys ONLY
+   on dream-log.jsonl recency, so a report-without-append forces a redundant
+   cycle next wake). Recovery checklist order: dream-log append (with
+   `:PENDING` markers) FIRST, then report/journal/trace.**
+   The CLI **enforces the schema**
    (canonical `actions` keys, dict-typed `phase_2_meta_review`, inline —
    never pointer — `mistakes_2plus_30d_assessment`, single-object JSON,
    newline repair) and **rejects non-compliant entries**: on exit≠0, fix the

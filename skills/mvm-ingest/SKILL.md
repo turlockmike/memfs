@@ -27,6 +27,12 @@ reference → `resources/<topic>.md`. Mirror existing structure.
    ```
    Tests are immutable post-authoring. Every test has a real expected answer
    (no DONT-KNOW expecteds). Hallucination = high confidence + wrong answer.
+   **Question-scope gate (auditor-mandated, dream-20260610):** the expected
+   `a` must answer the question and NOTHING MORE — facts beyond the
+   question's scope (extra times, adjacent events, provenance asides) belong
+   in the canonical doc, not the expected, because out-of-scope EXPECTED
+   facts produce grader false-FAILs (8/11 in the 06-10 cycle were this
+   artifact, class: grader-question-blindness).
 
 3. **Naked baseline** — ONE Agent call, `subagent_type: mvm-naked-clone`
    (tools: [] structural), `model: haiku`, ALL tests in one prompt:
@@ -96,10 +102,11 @@ reference → `resources/<topic>.md`. Mirror existing structure.
 7. **Any injected FAIL → rewrite the doc** (never the test). ≤3 retries, then
    commit or refuse.
 
-8. **On all-pass — two-phase index** (never concurrent — SQLite lock deadlock):
+8. **On all-pass — single incremental index** (since 2026-06-10 `mvm index`
+   is incremental by default: only the new/changed doc is parsed + embedded,
+   seconds total — the old two-phase --no-embed/--embed-only dance is obsolete):
    ```bash
-   mvm index --no-embed --quiet      # seconds; doc immediately searchable
-   mvm index --embed-only --quiet    # run with run_in_background: true
+   mvm index --quiet      # delta-only: FTS + embedding for the new doc, ~5s
    ```
    Report: `Naked pass: N/total · Injected pass: N/total · KB lift: +N`.
 

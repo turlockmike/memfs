@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from mvm import verify
 
 
@@ -167,3 +169,160 @@ def test_grader_flow_passes_incidental_enumeration_omission(tmp_path):
     with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
         rc = verify.main([str(doc)])
     assert rc == 0
+
+
+# Question-scope grader locks (dream-20260610, auditor APPROVE-WITH-CHANGES;
+# successor to e223738). The grader was question-blind: candidates that fully
+# answered the asked question FAILed against EXPECTEDs carrying out-of-scope
+# facts (8/11 engine FAILs in the 2026-06-10T01:17 cycle were this artifact:
+# ff4, cpi1, cpi6, fomc5, mtm1, mtm4, mtm5, mtm8). Fix: QUESTION is passed to
+# the grader, plus a bounded question-scope clause subordinated to the
+# distinct-fact-omission FAIL rule. These are ANTI-DELETION locks in the same
+# style as the e223738 block above.
+
+def test_grader_prompt_carries_question(tmp_path):
+    """(i) The QUESTION must be passed into the constructed grader prompt —
+    both the system rubric and the grader user-turn."""
+    assert "QUESTION" in verify.GRADER_SYSTEM
+
+    doc = tmp_path / "doc.md"
+    doc.write_text("The May 2026 CPI is released June 10, 2026 at 08:30 AM ET.")
+    (tmp_path / "doc.tests.yaml").write_text(
+        "- id: 1\n"
+        "  q: 'On what date is the May 2026 reference-month CPI data released by the BLS?'\n"
+        "  a: 'June 10, 2026 (at 08:30 AM ET).'\n"
+    )
+    calls = []
+
+    def fake_subproc(system, user, model="haiku", timeout=120):
+        calls.append((system, user))
+        return "June 10, 2026" if len(calls) == 1 else "PASS"
+
+    with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
+        rc = verify.main([str(doc)])
+    assert rc == 0
+    grader_system, grader_user = calls[1]
+    assert grader_system == verify.GRADER_SYSTEM
+    assert "QUESTION: On what date is the May 2026 reference-month CPI data" in grader_user
+    # QUESTION precedes CANDIDATE/EXPECTED — it is rubric context, not an answer.
+    assert grader_user.index("QUESTION:") < grader_user.index("CANDIDATE:")
+
+
+def test_grader_system_question_scope_clause_locked():
+    """Anti-deletion lock on the auditor-mandated bounding clause — BOTH
+    sentences, verbatim. Sentence 2 is the positive-fire bound: dropping it
+    would let the scope carve-out swallow genuine in-scope omissions."""
+    p = verify.GRADER_SYSTEM
+    assert ("EXPECTED facts outside the QUESTION's scope do not count as "
+            "distinct required facts.") in p
+    assert ("Facts WITHIN the question's scope are still governed by the "
+            "distinct-fact-omission FAIL rule — a candidate that omits or "
+            "contradicts an in-scope fact still FAILs.") in p
+
+
+def test_grader_system_in_scope_omission_still_fails():
+    """(ii) positive-fire: the rubric mandates FAIL when the question asks for
+    two facts and the candidate gives only one in-scope fact. The two-part
+    set-date/has-it-changed example must survive with its FAIL verdict."""
+    p = verify.GRADER_SYSTEM
+    assert "When was the current target range set, and has it changed in 2026?" in p
+    assert 'the question asked two things; "has it changed in 2026" is in-scope and unanswered' in p
+    # The FAIL branch itself stays intact (e223738 lock reasserted here: the
+    # scope clause is subordinated to it, never a replacement for it).
+    assert "omits a DISTINCT fact" in p
+    assert "materially-different-learner" in p
+
+
+def test_grader_user_turn_bounds_scope_clause():
+    """The grader user-turn must carry the scope clause WITH its in-scope
+    bound, aligned with the system rubric (same both-directions pattern as
+    the 'every DISTINCT fact' alignment lock above)."""
+    import inspect
+    src = inspect.getsource(verify.verify_test)
+    assert 'f"QUESTION: {question}' in src
+    assert "outside the QUESTION's scope do not" in src
+    assert "in-scope omissions and contradictions" in src
+
+
+# Regression fixtures — real transients from the 2026-06-10T01:17 dream cycle,
+# q/expected verbatim from the locked test files under knowledge/. Each
+# candidate fully answers the asked question; EXPECTED's surplus is outside the
+# question's scope, so under the new clause these are locked PASS cases.
+QUESTION_SCOPE_TRANSIENTS = [
+    pytest.param(
+        # areas/kalshi/cpi-release-schedule-2026.tests.yaml id=1 ("cpi1",
+        # time-of-day surplus)
+        "On what date is the May 2026 reference-month CPI data released by the BLS?",
+        "June 10, 2026 (at 08:30 AM ET).",
+        "June 10, 2026",
+        id="cpi1",
+    ),
+    pytest.param(
+        # areas/kalshi/fed-funds-rate-2026.tests.yaml id=4 ("ff4", set-date
+        # surplus)
+        "What was the target range right before the December 2025 cut to 3.50-3.75%?",
+        "3.75-4.00% (set Oct 29, 2025).",
+        "3.75-4.00%",
+        id="ff4",
+    ),
+    pytest.param(
+        # areas/kalshi/fomc-schedule-2026.tests.yaml id=5 ("fomc5", press-conf
+        # surplus)
+        "When is the FOMC rate decision / statement released relative to the two-day meeting, and what time?",
+        "On the second (final) day of the meeting, at 2:00 PM ET, followed by the Chair's press conference at 2:30 PM ET.",
+        "On the second (final) day of the meeting, at 2:00 PM ET.",
+        id="fomc5",
+    ),
+]
+
+
+@pytest.mark.parametrize("question,expected,candidate", QUESTION_SCOPE_TRANSIENTS)
+def test_grader_flow_passes_out_of_scope_expected_surplus(
+    tmp_path, question, expected, candidate
+):
+    """(iii) Mocked end-to-end on the exact motivating artifacts: candidate
+    answers the asked question fully; EXPECTED's out-of-scope surplus must not
+    block PASS. Also asserts the grader call received the QUESTION."""
+    import yaml as _yaml
+
+    doc = tmp_path / "doc.md"
+    doc.write_text(f"Q context: {question}\nA: {expected}\n")
+    (tmp_path / "doc.tests.yaml").write_text(
+        _yaml.safe_dump([{"id": 1, "q": question, "a": expected}])
+    )
+    calls = []
+
+    def fake_subproc(system, user, model="haiku", timeout=120):
+        calls.append((system, user))
+        return candidate if len(calls) == 1 else "PASS"
+
+    with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
+        rc = verify.main([str(doc)])
+    assert rc == 0
+    grader_user = calls[1][1]
+    assert f"QUESTION: {question}" in grader_user
+    assert f"CANDIDATE: {candidate}" in grader_user
+    assert f"EXPECTED: {expected}" in grader_user
+
+
+def test_grader_flow_fails_in_scope_omission(tmp_path):
+    """Negative control at the flow level: a grader FAIL on an in-scope
+    omission still propagates to rc=1 — the scope clause changed the rubric,
+    not the FAIL plumbing. (Live-haiku negative control is the manual
+    integration run; see file header.)"""
+    doc = tmp_path / "doc.md"
+    doc.write_text("Set 2025-12-10; held with no change at every 2026 meeting.")
+    (tmp_path / "doc.tests.yaml").write_text(
+        "- id: 1\n"
+        "  q: 'When was the current target range set, and has it changed in 2026?'\n"
+        "  a: 'Set 2025-12-10; HELD with no change at every 2026 meeting so far.'\n"
+    )
+
+    def fake_subproc(system, user, model="haiku", timeout=120):
+        # Retriever returns one-of-two in-scope facts; grader (per rubric's
+        # in-scope bound) returns FAIL on every attempt.
+        return "Set 2025-12-10" if user.startswith("DOCUMENT:") else "FAIL"
+
+    with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
+        rc = verify.main([str(doc)])
+    assert rc == 1
