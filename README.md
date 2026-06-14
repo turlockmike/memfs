@@ -90,6 +90,8 @@ mvm search "calguran" --kind canonical               # frontmatter filter
 
 The filesystem is treated as a graph database — folder hierarchy carries semantic information (`logs/` vs `wiki/` vs `canonical/`), markdown links are explicit edges, and external URLs are first-class destinations.
 
+> **Caveat — `mvm search` is RANKED retrieval, not a literal-string finder.** BM25 + graph + hierarchy always returns nearest-neighbours (scores cluster ~0.6) whether or not the exact string exists in the corpus. For **literal contamination/residue hunts** ("does the byte-string `+6 amulet` / `Ulaman stacks` still appear anywhere?") use `grep` over BOTH recall surfaces (`~/mvm/knowledge/resources/poe2/` + `~/resources/poe2/`), not `mvm search` — a semantic hit is not evidence the string is present, and a semantic miss is not evidence it is absent. (G6 contamination sweep, 2026-06-14.)
+
 ## File conventions
 
 Each KB entry is a pair:
