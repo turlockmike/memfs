@@ -164,10 +164,22 @@ probes, `web` for web-grounded ones.)
    `dream-log-amend` path; partial is for work that will NOT be finished by
    this session at all.
 
+   **TS DISCIPLINE (2026-06-22): do NOT hand-supply `ts` — OMIT it from the
+   composed dict and let `dream-log-append` stamp from its own canonical-Chicago
+   clock (the 6/20 hardening).** A hand-stamped `ts` is the TZ-confusion failure
+   surface: the tool clamps a FUTURE ts and discards a NAIVE ts, but a
+   tz-aware-yet-wrong PAST ts (e.g. the PDT wall-clock hour pinned with the
+   Central `-05:00` offset → 2h stale) passes ALL guards untouched and makes
+   `dream-recent-clean` read the fresh cycle as stale → false re-fire (confirmed
+   2026-06-22: wrote `01:18-05:00` for a `03:18` Chicago cycle). Past ts cannot be
+   auto-clamped (recovery/backfill is legitimate), so the prevention is omission.
+   If you must set it (recovery for an earlier cut), derive it from `jnow --iso`,
+   never a hand-typed hour.
+
    Entry shape (canonical `actions` keys are exactly these; empty arrays may
-   be dropped):
+   be dropped; OMIT `ts` per the discipline above):
    ```json
-   {"ts":"...","session_id":"...","stats_snapshot":{...},
+   {"session_id":"...","stats_snapshot":{...},
     "meta_audit":{"chronic_failures":[],"stuck_topics":[],
                   "noisy_threshold":false,"permanently_contested":[]},
     "actions":{"coverage_ingests":[],"coverage_edits":[],"quality_repairs":[],
