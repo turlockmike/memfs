@@ -47,6 +47,15 @@ probes, `web` for web-grounded ones.)
 2. **Coverage — proactive ingest** (max 3/cycle): for each top-fallback topic,
    find the most-frequent web URL among `kind=recall` ledger entries; spawn
    `/mvm-ingest <URL>` in background.
+   **Stale-ledger pre-check (run FIRST, before the predictability gate):** the
+   recall ledger is append-only, so a count-1 fallback often PREDATES a doc that
+   has since shipped — the topic is already covered and the fallback is a ledger
+   artifact, not a gap. Before treating any fallback as a gap, `mvm search` the
+   topic (or check the obvious recall-surface path, e.g.
+   `resources/poe2/0.5/crafting/`): if a doc exists AND answers the query →
+   SKIP, no ingest (double-ingest is a regression). This catches what the
+   predictability gate misses — curated-domain topics (PoE2/finance/Kalshi)
+   pass the "stable shape → consolidate" test yet are already-shipped.
    **Query-predictability gate** (empirical — sleep-time compute,
    arXiv:2504.13171: offline-consolidation gains scale with how predictable
    future queries are from the substrate; ~2.5x amortization needs ~10 related
@@ -59,6 +68,11 @@ probes, `web` for web-grounded ones.)
 3. **Quality — re-verify + repair** (`dream-verify-pick pick 5`): per doc,
    **first probe via the engine** — `mvm verify <doc> --test-id <random id>
    --json` (cold-clone + auto-grade; zero doc bytes through your context).
+   **ALWAYS pass `--test-id` (ONE test); never run bare `mvm verify <doc>`
+   (full suite) — full-suite reliably TIMES OUT @200s on large docs
+   (poe2-crafting-codex, 0.5.0-patch-notes burned ~10min for 0 verdicts,
+   dream-20260614-0431), and a timeout judges nothing → counts only as a
+   `transients` probe-noise entry, not signal. One id = one cheap verdict.
    Log probe; stamp `dream-verify-pick record <doc> <PASS|FAIL> quality`.
    - Engine PASS → done.
    - Engine FAIL with an `error` field / retry-exhausted EMPTY stdout →
@@ -112,7 +126,15 @@ probes, `web` for web-grounded ones.)
    value-only, audited; added 2026-06-11 because hand-rolled rewrites of the
    canonical log missed a residual marker) — never hold the whole cycle's
    receipts hostage to the slowest probe. The amend done-test greps the
-   amended ENTRY for `PROVISIONAL|:PENDING`, not just the tests.yaml. Cron/staged sessions can be cut at any moment; results that exist
+   amended ENTRY for `PROVISIONAL|:PENDING`, not just the tests.yaml.
+   **AMEND SWEEPS ALL FIELDS (2026-06-14): a `:PENDING`/PROVISIONAL marker
+   you wrote into prose fields (`step_results`, `step_3_quality`) lingers even
+   after you clear the canonical `quality_verifies` marker — `dream-amend`
+   replaces one top-level key, so a single patch misses the others.
+   `dream-recent-clean` keys ONLY on the canonical marker (so it correctly
+   goes green), but a naive `grep PENDING` on the entry still hits the stale
+   prose. When amending, patch EVERY field that carried the marker, then
+   grep-verify the whole entry clean.** Cron/staged sessions can be cut at any moment; results that exist
    only in-context are lost (the 18:07 6/11 audit lost its entire log+report
    this way and REFLECT had to forensically recover it from the transcript).**
    **STAGED-WAKE REFLECT BINDING (2026-06-11, 2nd occurrence same day): any
@@ -127,6 +149,20 @@ probes, `web` for web-grounded ones.)
    never pointer — `mistakes_2plus_30d_assessment`, single-object JSON,
    newline repair) and **rejects non-compliant entries**: on exit≠0, fix the
    reported field and retry — never bypass, never bare `>>`.
+
+   **PARTIAL / interrupted cycle (2026-06-22, auditor Rec 2 part-b):** if this
+   cycle is CUT before all phases complete — a dark-recovery catch-up that a
+   Mike interject or staged-wake boundary truncated, phase_2 not run, a verify
+   left genuinely undone (not just `:PENDING`-then-amended) — set
+   `"partial": true` (real JSON boolean) + a `"partial_reason"` string in the
+   entry. **Why it's load-bearing, not cosmetic:** `dream-recent-clean` treats
+   a `partial` entry exactly like a dirty (high/critical) one — it does NOT let
+   the entry's fresh ts suppress the next owed cycle, so the deferred phases
+   re-fire instead of the lane reading clean-when-owed. A complete cycle omits
+   the field (absent = false = redundant-cluster-suppressible as before). Do
+   NOT mark partial just because a verify is slow — that's the `:PENDING` +
+   `dream-log-amend` path; partial is for work that will NOT be finished by
+   this session at all.
 
    Entry shape (canonical `actions` keys are exactly these; empty arrays may
    be dropped):
