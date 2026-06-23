@@ -1,9 +1,9 @@
 ---
-name: mvm-recall
-description: "MVM unified question-answering. Step 0 memo-cache, then KB + web retrieval INLINE (orchestrator searches itself) plus ONE naked-baseline haiku probe for prior-contamination signal; reconciles via trust hierarchy KB>web>weights, auto-spawns /mvm-ingest on web hits, logs every recall via `recall-log add`. Triggers: '/mvm-recall', 'recall <question>', any factual question routed to mvm."
+name: recall
+description: "Recall what I already know BEFORE answering. Searches my own knowledge base first, then the web, reconciles them (my KB beats web beats raw memory), and logs the result. USE THIS FIRST for any factual question — and it is MANDATORY, not a judgment call, for curated domains: PoE2 (builds/items/crafting/mechanics/currency), finance/budget/Monarch, Kalshi, home-device state. Whenever I'm about to answer a fact from memory alone, OR reach for the web/a tool to 'discover' something I might already know — recall first instead. The cheapest, highest-trust source is my own memory. Triggers: '/recall', 'recall <question>', any factual lookup (esp. curated-domain)."
 ---
 
-# /mvm-recall
+# /recall
 
 Architecture: KB and web retrieval run **inline** (you search); only the naked
 probe is a subagent (weight-prior needs an uncontaminated context). History &

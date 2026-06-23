@@ -1,9 +1,9 @@
 ---
-name: mvm-dream
-description: "MVM offline integration. Reads mvm stats + recall-log; resolves every detected anomaly within the same cycle (no sinks). Coverage → proactive ingest. Quality failure → cross-check → re-ingest if confirmed. Staleness → cross-check → supersede if confirmed. Contested/gap → user escalation. Triggers: '/mvm-dream', 'mvm dream', 'mvm consolidate', 'mvm maintenance'."
+name: dream
+description: "Maintain and consolidate my memory — the offline integration pass. Reads memory stats + the recall log, finds gaps / staleness / quality problems, and resolves each within the cycle: proactively ingesting missing knowledge, cross-checking and superseding stale facts, escalating contested ones. This is how my memory keeps itself honest and current across sessions. Triggers: '/dream', 'consolidate memory', 'memory maintenance', 'audit my knowledge' (also runs on a cron)."
 ---
 
-# /mvm-dream
+# /dream
 
 **FEP rule: every detected anomaly resolves in this cycle** — it dissolves
 (cross-check disconfirms) or drives a substrate change (ingest/supersede).
