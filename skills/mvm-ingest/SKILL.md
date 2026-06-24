@@ -19,13 +19,15 @@ reference → `resources/<topic>.md`. Mirror existing structure.
 (learned 2026-06-14, costs 2× when violated).** `~/mvm/knowledge/` is this skill's
 native surface; the `mvm-mirror` cron (`*/5`) carries the canonical `.md` BACK to
 `~/resources/`. Authoring on the `~/resources` side breaks the loop two ways:
-(1) **`mvm-mirror` syncs only `*.md`, never `*.tests.yaml`** → the locked tests never
-reach the mvm side, so injected-verify/cascade run against a missing file (you'd have
-to `cp -p` the tests by hand); (2) the mirror **preserves original mtime** via `cp -p`,
+(1) historically `mvm-mirror` synced only `*.md` (tests never reached the other side);
+**since 2026-06-14 the mirror carries BOTH `*.md` and `*.tests.yaml` bidirectionally**
+(`mvm-mirror` source `for pattern in ("*.md","*.tests.yaml")`), so that specific hazard
+is closed — but authoring mvm-side is still correct for reason (2) + directness;
+(2) the mirror **preserves original mtime** via `cp -p`,
 which can make a CHANGED doc's mtime collide with the recorded value → the incremental
 index's `mtime != recorded` change-detector compares EQUAL and **silently SKIPS the
-update** (the doc indexes stale; defeated by `touch`-before-index, see step 8). Author
-both `.md` and `.tests.yaml` under `~/mvm/knowledge/...`, then index (step 8) — the
+update** (the doc indexes stale; defeated by `touch`-before-index, see step 9). Author
+both `.md` and `.tests.yaml` under `~/mvm/knowledge/...`, then index (step 9) — the
 mirror handles `~/resources/`.
 
 ## Steps
@@ -180,7 +182,20 @@ mirror handles `~/resources/`.
 7. **Any injected FAIL → rewrite the doc** (never the test). ≤3 retries, then
    commit or refuse.
 
-8. **On all-pass — single incremental index** (since 2026-06-10 `mvm index`
+8. **Tests-shape lint — HARD GATE before indexing** (added 2026-06-24 after the
+   n_tests=0 / PARTIAL-INDEX saga: a dict-wrapped `tests:`/`expect:` shape does
+   NOT parse as the flat top-level `{id,q,a}` list the engine consumes → n_tests
+   stays 0 no matter how many reindexes, and 3 cycles were burned chasing a
+   phantom "index race"). Lint the tests file FIRST so the shape bug is caught at
+   ingest, never via reindex thrash:
+   ```bash
+   kb-retrievable --lint-tests "<doc>.tests.yaml"   # exit 0 valid / 1 malformed (with cause) / 2 unreadable
+   ```
+   Exit 0 → proceed to index. Exit 1 → FIX the shape to a flat list of `{id,q,a}`
+   (never dict-wrapped), re-lint, then proceed. Never `mvm index` a malformed
+   tests file.
+
+9. **On all-pass — single incremental index** (since 2026-06-10 `mvm index`
    is incremental by default: only the new/changed doc is parsed + embedded,
    seconds total — the old two-phase --no-embed/--embed-only dance is obsolete).
    **`touch` the doc + its tests FIRST, then index** — this is the happy path, not
@@ -206,7 +221,26 @@ mirror handles `~/resources/`.
    find it.
    Report: `Naked pass: N/total · Injected pass: N/total · KB lift: +N`.
 
-9. **Cascade check:** `mvm backlinks <topic-relpath>` → for each linker, run
+10. **Cascade check:** `mvm backlinks <topic-relpath>` → for each linker, run
    one random test from `<linker>.tests.yaml` in injected mode (haiku
    cold-clone). FAIL → surface to user: "ingest of <topic> broke <linker> test
    <id> — review or rewrite <linker>." No automatic rewrite; user decides.
+
+11. **COMMIT in-stage — HARD GATE, the ingest is NOT done until committed**
+   (added 2026-06-24 after the auditor/gould flagged the recurring
+   `uncommitted_ingest_gap`: ACT authored real ingests but committed nothing for
+   4 cycles, leaning on the later reflect-net to reconstruct-from-disk + commit —
+   a defect that was also INVISIBLE to mistakes-root-cluster because never
+   captured). Do NOT rely on the reflect-net or the hourly auto-snapshot; commit
+   where you stand. Topology: docs+tests author under `~/mvm/knowledge`; the
+   canonical recall surface + git tracking live under `~/resources` (part of the
+   `/home/mike` repo). Force the mirror NOW (don't wait for the `*/5` cron), then
+   commit both artifacts:
+   ```bash
+   mvm-mirror                                    # carries .md + .tests.yaml -> ~/resources NOW
+   git -C ~ add "resources/<relpath>.md" "resources/<relpath>.tests.yaml"
+   git -C ~ commit -m "ingest: <topic> (<source-id>) — corpus N→M"
+   ```
+   Confirm `git -C ~ status --short resources/<relpath>*` is clean before exit.
+   This is the proven mechanism (the reflect-net used exactly this); wiring it
+   into ACT closes the gap structurally.
