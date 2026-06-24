@@ -171,10 +171,18 @@ probes, `web` for web-grounded ones.)
    tz-aware-yet-wrong PAST ts (e.g. the PDT wall-clock hour pinned with the
    Central `-05:00` offset → 2h stale) passes ALL guards untouched and makes
    `dream-recent-clean` read the fresh cycle as stale → false re-fire (confirmed
-   2026-06-22: wrote `01:18-05:00` for a `03:18` Chicago cycle). Past ts cannot be
-   auto-clamped (recovery/backfill is legitimate), so the prevention is omission.
-   If you must set it (recovery for an earlier cut), derive it from `jnow --iso`,
-   never a hand-typed hour.
+   2026-06-22: wrote `01:18-05:00` for a `03:18` Chicago cycle).
+   **STRUCTURALLY ENFORCED (2026-06-24, dream-log-append layer 6): a caller-supplied
+   `ts` is now IGNORED by default — the tool drops it (preserving it in
+   `ts_caller_supplied_ignored`) and self-stamps its own canonical-Chicago clock.**
+   This converts the prose discipline above into a gate: the entire
+   journal_timezone_confusion-via-dream-log class (incl. the layer-5 compose-early
+   residual) can no longer land a wrong ts. The "OMIT ts" rule still holds as the
+   clean habit, but a slip is now caught structurally rather than relied on.
+   If you genuinely need a backfill ts (recovery for an earlier-cut cycle), set
+   `DREAM_LOG_TS_RECOVERY=1` to opt the caller ts back in (it then flows through
+   the layer-3/4/5 normalization guards); derive it from `jnow --iso`, never a
+   hand-typed hour.
 
    Entry shape (canonical `actions` keys are exactly these; empty arrays may
    be dropped; OMIT `ts` per the discipline above):
