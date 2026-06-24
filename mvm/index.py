@@ -409,6 +409,7 @@ def main(argv = None) -> int:
     existing = dict(idx.execute("SELECT path, mtime FROM files").fetchall())
     full = args.full or not existing
     n_deleted = 0
+    unembedded = []  # docs present but missing a vec row (incremental self-heal)
 
     if full:
         idx.execute("DELETE FROM files")
@@ -428,7 +429,20 @@ def main(argv = None) -> int:
         changed = [r for r, p in disk.items()
                    if r in existing and _doc_mtime(p) != existing[r]]
         deleted = [r for r in existing if r not in disk]
-        if not added and not changed and not deleted:
+        # Self-heal embedding ghosts: a doc whose embed batch silently failed
+        # once lands in files/FTS with current mtime but NO files_vec row. The
+        # mtime diff above never flags it again, so plain `mvm index` would
+        # report "up to date" while the doc stays unsearchable until a manual
+        # --embed-only/--full. Treat missing-embedding as dirty-for-embed (same
+        # criterion as _embed_only_main) — but embed-only, no FTS/graph rework.
+        if not args.no_embed:
+            dirty = set(added) | set(changed)
+            unembedded = [r for (r,) in idx.execute(
+                "SELECT f.path FROM files f "
+                "LEFT JOIN files_vec v ON v.path = f.path "
+                "WHERE v.path IS NULL").fetchall()
+                if r in disk and r not in dirty]
+        if not added and not changed and not deleted and not unembedded:
             idx.close()
             g.close()
             if not args.quiet:
@@ -461,6 +475,16 @@ def main(argv = None) -> int:
         n_edges += ne
         parsed.append((rel, body))
         n_files += 1
+
+    # Ghost backfill: embed docs present-but-unembedded WITHOUT re-touching
+    # their FTS/graph rows (Phase 1 left them intact). Phase 2's
+    # delete-just-before-insert upserts the vec row (the prior DELETE is a
+    # no-op since these have no vec row — that's why they're here).
+    for rel in unembedded:
+        md = args.root / rel
+        if md.exists():
+            _, body = parse_markdown(md)
+            parsed.append((rel, body))
 
     # Phase 2: batch-embed (skipped if --no-embed). ~10× faster than per-doc.
     if not args.no_embed and parsed:
