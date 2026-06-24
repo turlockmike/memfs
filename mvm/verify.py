@@ -391,7 +391,7 @@ def main(argv = None) -> int:
         description="Cold-clone verify a markdown doc against locked Q/A tests."
     )
     parser.add_argument("doc", type=Path, help="Path to the markdown doc.")
-    parser.add_argument("--test-id", type=int, help="Run only the test with this id.")
+    parser.add_argument("--test-id", type=str, help="Run only the test with this id (matches int or string ids).")
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
@@ -445,7 +445,10 @@ def main(argv = None) -> int:
         return 2
 
     if args.test_id is not None:
-        tests_data = [t for t in tests_data if t.get("id") == args.test_id]
+        # Match by string so docs with string ids (e.g. "q1-base-selection")
+        # and docs with integer yaml ids (e.g. 1) both resolve from the
+        # str-typed CLI arg. Backward-compatible: str(1) == "1".
+        tests_data = [t for t in tests_data if str(t.get("id")) == args.test_id]
         if not tests_data:
             print(f"ERROR: no test with id={args.test_id} in {tests_path}", file=sys.stderr)
             return 2

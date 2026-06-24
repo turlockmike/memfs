@@ -47,6 +47,57 @@ def test_verify_with_mocked_subprocess(tmp_path):
     assert rc == 0  # all pass
 
 
+def test_verify_test_id_matches_string_id(tmp_path):
+    """--test-id resolves a string yaml id (e.g. 'q1-base-selection').
+
+    Regression: --test-id was type=int, so docs whose tests use string ids
+    could never be probed single-test (argparse rejected the string; an int
+    never equalled a string id). dream-20260624 fix: parse as str, match by
+    str(id) — backward-compatible with integer yaml ids.
+    """
+    doc = tmp_path / "doc.md"
+    doc.write_text("The capital of France is Paris.")
+    (tmp_path / "doc.tests.yaml").write_text(
+        "- id: q1-base\n  q: 'capital of France?'\n  a: 'Paris'\n"
+        "- id: q2-other\n  q: 'unused?'\n  a: 'x'\n"
+    )
+    responses = ["Paris", "PASS"]
+
+    def fake_subproc(system, user, model="haiku", timeout=120):
+        return responses.pop(0)
+
+    with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
+        rc = verify.main([str(doc), "--test-id", "q1-base"])
+    assert rc == 0  # the single string-id test resolved and passed
+
+
+def test_verify_test_id_matches_int_id(tmp_path):
+    """--test-id still resolves an integer yaml id from a str-typed CLI arg."""
+    doc = tmp_path / "doc.md"
+    doc.write_text("The capital of France is Paris.")
+    (tmp_path / "doc.tests.yaml").write_text(
+        "- id: 1\n  q: 'capital of France?'\n  a: 'Paris'\n"
+    )
+    responses = ["Paris", "PASS"]
+
+    def fake_subproc(system, user, model="haiku", timeout=120):
+        return responses.pop(0)
+
+    with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
+        rc = verify.main([str(doc), "--test-id", "1"])
+    assert rc == 0
+
+
+def test_verify_test_id_unknown_errors(tmp_path, capsys):
+    """An unmatched --test-id still errors cleanly (rc 2)."""
+    doc = tmp_path / "doc.md"
+    doc.write_text("body")
+    (tmp_path / "doc.tests.yaml").write_text("- id: q1\n  q: 'q?'\n  a: 'a'\n")
+    rc = verify.main([str(doc), "--test-id", "nope"])
+    assert rc == 2
+    assert "no test with id" in capsys.readouterr().err.lower()
+
+
 def test_verify_records_error_on_subprocess_failure(tmp_path):
     doc = tmp_path / "doc.md"
     doc.write_text("body")
