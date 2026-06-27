@@ -219,6 +219,19 @@ mirror handles `~/resources/`.
    mtime entirely). An ingest is NOT done until search returns the doc — injected
    tests inject the doc inline, so they pass even when the live recall surface can't
    find it.
+   **Then GATE on corpus integrity (HARD GATE, added 2026-06-27):** the step-9
+   index just ran a full incremental embed, which self-heals embedding ghosts
+   corpus-wide — so this is the correct post-embed point to assert (NEVER right
+   after a `--no-embed` pass, which by design leaves ghosts → false alarm):
+   ```bash
+   mvm index --verify   # exit 0 CLEAN / exit 1 names embedding-ghost|FTS-missing|n_tests-drift offenders
+   ```
+   Exit 0 → proceed. Exit 1 → the new doc (or a sibling) is structurally
+   inconsistent (e.g. n_tests drift from a same-second mtime collision, or an
+   FTS-missing body): re-`touch` the named doc + `mvm index --full`, re-verify.
+   Do NOT report the ingest done while verify is red. (A periodic
+   `mvm-verify-guard` cron heal-then-verifies between ingests; this gate catches
+   it at authoring time.)
    Report: `Naked pass: N/total · Injected pass: N/total · KB lift: +N`.
 
 10. **Cascade check:** `mvm backlinks <topic-relpath>` → for each linker, run
