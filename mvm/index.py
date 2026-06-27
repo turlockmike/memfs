@@ -11,6 +11,7 @@ column via sqlite-vec. The schema reserves space for embeddings.
 Usage:
   mvm-index                          # INCREMENTAL: only added/changed/deleted docs (default)
   mvm-index --full                   # full rebuild: wipe + reindex + re-embed everything
+  mvm-index --verify                 # read-only integrity check (embed/FTS/n_tests); exit 1 on drift
   mvm-index --root /path/to/kb       # custom root
   mvm-index --root . --state ./state
 
@@ -46,16 +47,54 @@ def _embed_model():
     return _EMBED_MODEL
 
 
+# bge-small-en-v1.5 silently truncates input at 512 tokens (~400 words). A single
+# whole-doc embedding therefore represents ONLY the head of any long doc — the tail
+# is invisible to semantic search (proven 2026-06-24: cos(embed(full), embed(head400))
+# == 1.0 for a 2400-word doc; finances.md's Compassion/Zelle/Monarch content lived past
+# the window and returned from NO query). Fix: split each doc into <=512-token chunks,
+# embed every chunk, mean-pool into one renormalized 384-dim vector. Schema unchanged
+# (still one vector per path). Short docs (<=350 words) are a single chunk → identical
+# vector as before, so no regression; long docs now carry their tail signal.
+_CHUNK_WORDS = 350
+
+
+def _chunk_text(text: str, size: int = _CHUNK_WORDS) -> list[str]:
+    """Split text into word-chunks of <=size words (fits the 512-token model window)."""
+    w = text.split()
+    if len(w) <= size:
+        return [text]
+    return [" ".join(w[i:i + size]) for i in range(0, len(w), size)]
+
+
+def _meanpool(embs) -> bytes:
+    """Mean-pool a list of chunk embeddings into one renormalized 384-dim blob."""
+    import numpy as np
+    v = np.mean(np.asarray(embs, dtype="float32"), axis=0)
+    n = float(np.linalg.norm(v))
+    if n > 0:
+        v = v / n
+    return struct.pack(f"{len(v)}f", *v.tolist())
+
+
 def _embed_to_blob(text: str) -> bytes:
-    """Embed a single text. Prefer _embed_batch when many docs."""
-    emb = next(iter(_embed_model().embed([text])))
-    return struct.pack(f"{len(emb)}f", *emb)
+    """Embed a single doc (chunk + mean-pool). Prefer _embed_batch when many docs."""
+    chunks = _chunk_text(text)
+    embs = list(_embed_model().embed(chunks))
+    return _meanpool(embs)
 
 
 def _embed_batch(texts: list[str]) -> list[bytes]:
-    """Batch-embed many texts. ~10× faster than one-at-a-time."""
-    embs = list(_embed_model().embed(texts))
-    return [struct.pack(f"{len(e)}f", *e) for e in embs]
+    """Batch-embed many docs (chunk + mean-pool each). One flattened embed call keeps
+    the batch speedup; chunks are regrouped per-doc and mean-pooled. ~10× faster than
+    one-at-a-time."""
+    flat: list[str] = []
+    spans: list[tuple[int, int]] = []  # (start, end) into flat, per input doc
+    for t in texts:
+        chunks = _chunk_text(t)
+        spans.append((len(flat), len(flat) + len(chunks)))
+        flat.extend(chunks)
+    all_embs = list(_embed_model().embed(flat))
+    return [_meanpool(all_embs[s:e]) for s, e in spans]
 
 DEFAULT_ROOT = Path(os.environ.get("MVM_KNOWLEDGE", str(Path.home() / "mvm" / "knowledge")))
 DEFAULT_STATE = Path(os.environ.get("MVM_STATE", str(Path.home() / "mvm" / "state")))
@@ -243,6 +282,90 @@ def count_tests(md_path: Path) -> int:
         return 0
 
 
+def _verify_main(args) -> int:
+    """Read-only structural integrity check of index.db. Every doc in `files`
+    must be FULLY indexed: (a) a vector embedding row in files_vec, (b) an
+    FTS-matchable non-empty body in files_fts, (c) n_tests equal to the count
+    in its .tests.yaml sidecar (when one exists on disk). A partial-index
+    (e.g. the mvm-mirror `--no-embed` pass landing a doc into files/FTS before
+    the debounced embed runs, or an embed batch that silently failed) leaves a
+    doc that plain searches cannot surface — the silent class that bit twice on
+    2026-06-23. The ghost self-heal fixes embeddings on the NEXT index run; this
+    ASSERTS the state so /ingest + a cron can detect drift the moment it appears.
+    Returns 0 if clean, 1 if any inconsistency."""
+    import json
+    state = args.state
+    db = state / "index.db"
+    if not db.exists():
+        print(f"ERROR: index.db not found at {db}", file=sys.stderr)
+        return 2
+    idx = sqlite3.connect(db, timeout=30.0)
+    idx.enable_load_extension(True)
+    import sqlite_vec
+    sqlite_vec.load(idx)
+    idx.enable_load_extension(False)
+
+    files = idx.execute("SELECT path, n_tests FROM files").fetchall()
+    embedded = {r[0] for r in idx.execute("SELECT path FROM files_vec")}
+    fts_ok = {r[0] for r in idx.execute(
+        "SELECT path FROM files_fts WHERE body IS NOT NULL AND body != ''")}
+    idx.close()
+
+    ghosts = []        # in files, no embedding
+    fts_missing = []   # in files, not FTS-matchable
+    test_drift = []    # n_tests != sidecar count
+    for path, n_tests in files:
+        if path not in embedded:
+            ghosts.append(path)
+        if path not in fts_ok:
+            fts_missing.append(path)
+        disk_n = count_tests(args.root / path)
+        if (args.root / path).with_suffix(".tests.yaml").exists() and disk_n != n_tests:
+            test_drift.append({"path": path, "db_n_tests": n_tests, "sidecar": disk_n})
+
+    total_bad = len(ghosts) + len(fts_missing) + len(test_drift)
+    report = {
+        "files": len(files),
+        "embedding_ghosts": ghosts,
+        "fts_missing": fts_missing,
+        "n_tests_drift": test_drift,
+        "clean": total_bad == 0,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        if total_bad == 0:
+            print(f"mvm index --verify: CLEAN — {len(files)} files, all embedded + "
+                  f"FTS-matchable + n_tests in sync.")
+        else:
+            print(f"mvm index --verify: {total_bad} INCONSISTENCIES across {len(files)} files",
+                  file=sys.stderr)
+            if ghosts:
+                print(f"  embedding ghosts ({len(ghosts)}) — in files, NO vector "
+                      f"(semantically unsearchable; run `mvm index` to self-heal):",
+                      file=sys.stderr)
+                for p in ghosts[:20]:
+                    print(f"    {p}", file=sys.stderr)
+                if len(ghosts) > 20:
+                    print(f"    … +{len(ghosts) - 20} more", file=sys.stderr)
+            if fts_missing:
+                print(f"  FTS-missing ({len(fts_missing)}) — in files, no matchable body "
+                      f"(run `mvm index --full`):", file=sys.stderr)
+                for p in fts_missing[:20]:
+                    print(f"    {p}", file=sys.stderr)
+                if len(fts_missing) > 20:
+                    print(f"    … +{len(fts_missing) - 20} more", file=sys.stderr)
+            if test_drift:
+                print(f"  n_tests drift ({len(test_drift)}) — db count != .tests.yaml "
+                      f"(re-touch the doc or run `mvm index --full`):", file=sys.stderr)
+                for d in test_drift[:20]:
+                    print(f"    {d['path']}: db={d['db_n_tests']} sidecar={d['sidecar']}",
+                          file=sys.stderr)
+                if len(test_drift) > 20:
+                    print(f"    … +{len(test_drift) - 20} more", file=sys.stderr)
+    return 0 if total_bad == 0 else 1
+
+
 def _embed_only_main(args) -> int:
     """Backfill embeddings on existing index.db files. Idempotent — only embeds docs
     not already in files_vec. Doesn't touch FTS or graph."""
@@ -367,12 +490,24 @@ def main(argv = None) -> int:
                         help="Skip vector embeddings (FTS+graph only). Useful for bulk migration; backfill later.")
     parser.add_argument("--embed-only", action="store_true",
                         help="Backfill embeddings on existing files without rebuilding FTS/graph. Idempotent.")
+    parser.add_argument("--verify", action="store_true",
+                        help="Read-only structural integrity check of index.db: every file in `files` "
+                             "must have a vector embedding, an FTS-matchable body, and n_tests matching "
+                             "its .tests.yaml sidecar. Exit 1 if any inconsistency (the silent-corruption "
+                             "class that bit twice on 2026-06-23 before the ghost self-heal landed). "
+                             "Cheap enough for /ingest to gate on without a full --embed rebuild.")
+    parser.add_argument("--json", action="store_true",
+                        help="With --verify: emit the integrity report as JSON.")
     parser.add_argument("--full", action="store_true",
                         help="Force a full rebuild (wipe + reindex + re-embed the entire corpus, "
                              "~minutes + ~2.5GB RAM). Default is incremental: only added/changed/"
                              "deleted docs are touched (seconds; embedding model not even loaded "
                              "on a zero-delta run).")
     args = parser.parse_args(argv)
+
+    # Read-only structural integrity check (no writes, no embed model load).
+    if args.verify:
+        return _verify_main(args)
 
     # Backfill-only path: read existing files table, embed docs that don't have embeddings yet.
     if args.embed_only:
