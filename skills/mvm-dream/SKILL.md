@@ -88,6 +88,17 @@ probes, `web` for web-grounded ones.)
 
 4. **Staleness — spot-check + supersede** (`dream-verify-pick pick 3
    <step-3 docs...>`; stamp each `PASS staleness` after):
+   - **Distribution sanity-check (run ONCE per cycle, before the per-doc picks):**
+     `lib-staleness-audit --json` — emits the curated-lib freshness histogram +
+     oldest-N re-verification worklist + a deterministic header-zombie
+     (SUPERSEDED/DEPRECATED/RETIRED) contradiction-RISK proxy. This measures
+     least-recently-**DATED** (content freshness by in-doc date→git→mtime), a
+     complementary axis to `dream-verify-pick`'s least-recently-**VERIFIED**.
+     Use it two ways: (a) if `stale_frac` > 0.05 the lib is drifting — prefer the
+     audit's oldest-N worklist docs over the verify-pick rotation this cycle;
+     (b) any header-zombie that is NOT an intentional tombstone (e.g. `kalshi.md`
+     RETIRED is a deliberate keep-live block) → resolve as a real contradiction.
+     Baseline 2026-06-27: 232 docs, stale_frac 0.004, 1 benign zombie — healthy.
    - **Skip-guard first:** `mvm relations <doc> --rel superseded_by --json` —
      non-empty `out` edge = already superseded → skip, take next-oldest.
    - Else: first test's `q` → KB-clone (Read doc) + web-clone (WebSearch) in
