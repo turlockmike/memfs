@@ -3,6 +3,7 @@
 We don't exercise the live `claude` subprocess (slow + nondeterministic).
 Subprocess-mocked tests live here; live integration is a separate manual run.
 """
+import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -96,6 +97,24 @@ def test_verify_test_id_unknown_errors(tmp_path, capsys):
     rc = verify.main([str(doc), "--test-id", "nope"])
     assert rc == 2
     assert "no test with id" in capsys.readouterr().err.lower()
+
+
+def test_verify_test_id_unknown_json_emits_stdout_error(tmp_path, capsys):
+    """In --json mode a bad/absent test-id emits a structured error on STDOUT
+    (not just stderr), so a stdout-only JSON consumer (the dream cycle) can tell
+    a caller error apart from empty-stdout probe-noise. Regression for the
+    silent-empty ambiguity that nearly mislogged PASSing docs as transients
+    (dream-20260629-0100)."""
+    doc = tmp_path / "doc.md"
+    doc.write_text("body")
+    (tmp_path / "doc.tests.yaml").write_text("- id: q1\n  q: 'q?'\n  a: 'a'\n")
+    rc = verify.main([str(doc), "--test-id", "nope", "--json"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert out.strip(), "stdout must not be empty in --json mode on missing id"
+    payload = json.loads(out)
+    assert payload["error"] == "no test with id=nope"
+    assert payload["available_ids"] == ["q1"]
 
 
 def test_verify_records_error_on_subprocess_failure(tmp_path):

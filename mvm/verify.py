@@ -450,7 +450,22 @@ def main(argv = None) -> int:
         # str-typed CLI arg. Backward-compatible: str(1) == "1".
         tests_data = [t for t in tests_data if str(t.get("id")) == args.test_id]
         if not tests_data:
+            # Always emit the human line on stderr (backward-compat).
             print(f"ERROR: no test with id={args.test_id} in {tests_path}", file=sys.stderr)
+            # In --json mode ALSO emit a structured error on stdout, so a
+            # stdout-only JSON consumer (e.g. the dream cycle) can distinguish
+            # a bad/absent test-id (caller error -> fix the id) from genuine
+            # probe-noise / an infra timeout (which yields empty stdout). The
+            # silent-empty ambiguity nearly caused two PASSing docs to be
+            # mislogged as transients (dream-20260629-0100).
+            if args.json:
+                available = [str(t.get("id")) for t in (yaml.safe_load(tests_path.read_text()) or [])]
+                print(json.dumps({
+                    "doc": str(args.doc),
+                    "tests": str(tests_path),
+                    "error": f"no test with id={args.test_id}",
+                    "available_ids": available,
+                }))
             return 2
 
     if args.lift:
