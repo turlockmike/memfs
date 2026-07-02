@@ -178,6 +178,65 @@ def fts_search(index_db: Path, query: str, kind: str | None, in_prefix: str | No
     return [(p, s / max_s) for p, s in raw]
 
 
+RRF_K = int(os.environ.get("MVM_RRF_K", "60"))
+# FTS votes at half a vector vote: vector is the primary whole-doc semantic
+# signal; BM25 is a keyword corroborator with a known keyword-bag pathology.
+# Satisfiable interval from the frozen probes: (~0.2, ~0.75); 0.5 = midpoint.
+RRF_W_FTS = float(os.environ.get("MVM_RRF_W_FTS", "0.5"))
+
+
+def rrf_fuse(vec_results: list[tuple[str, float]], fts_results: list[tuple[str, float]],
+             k: int = RRF_K, w_fts: float = RRF_W_FTS) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion of the two retrievers.
+
+    Rank-based, so BM25 and cosine scores never need to share a scale — the
+    fix for the cross-domain saturation defect (2026-07-01): max-normalized
+    cosine sims put PoE2 noise at sem~1.000 on Kalshi queries while an
+    exact-keyword doc sat FTS-rank-1 unseen (FTS only ran as a fallback).
+    Output is max-normalized for display continuity only; ordering is pure RRF.
+    """
+    scores: dict[str, float] = {}
+    for rank, (p, _) in enumerate(vec_results):
+        scores[p] = scores.get(p, 0.0) + 1.0 / (k + rank + 1)
+    for rank, (p, _) in enumerate(fts_results):
+        scores[p] = scores.get(p, 0.0) + w_fts / (k + rank + 1)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if not ranked:
+        return []
+    max_s = ranked[0][1] or 1.0
+    return [(p, s / max_s) for p, s in ranked]
+
+
+def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | None,
+              limit: int = 50) -> tuple[list[tuple[str, float]], str]:
+    """Text-signal ranking. Returns (results, retriever_label).
+
+    Default (MVM_HYBRID=1) → RRF fusion of vector + FTS ("hybrid").
+    MVM_HYBRID=0           → legacy path: vector first, FTS only as
+                             empty-fallback. Kill switch for the 2026-07-01
+                             cutover (frozen eval: test/eval_crossdomain.py).
+    """
+    hybrid = os.environ.get("MVM_HYBRID", "1") == "1"
+    if hybrid:
+        vec = vec_search(index_db, query, kind, in_prefix, limit=limit)
+        fts = fts_search(index_db, query, kind, in_prefix, limit=limit)
+        # Navigation files (index.md / auto-generated INDEX.md) are keyword
+        # bags — BM25 ranks them above the content they merely list, whenever
+        # they match at all (eval 2026-07-01: PC1/PC2 regression). Drop them
+        # from the FTS vote only; they stay reachable via the vector signal,
+        # which is exactly how the legacy path ranked them.
+        fts = [(p, s) for p, s in fts if Path(p).name not in ("index.md", "INDEX.md")]
+        if vec and fts:
+            return rrf_fuse(vec, fts), "hybrid"
+        if vec:
+            return vec, "sem"
+        return fts, "fts"
+    results = vec_search(index_db, query, kind, in_prefix, limit=limit)
+    if results:
+        return results, "sem"
+    return fts_search(index_db, query, kind, in_prefix, limit=limit), "fts"
+
+
 def fetch_metadata(index_db: Path, paths: list[str]) -> dict[str, dict]:
     if not paths or not index_db.exists():
         return {}
@@ -215,12 +274,8 @@ def main(argv = None) -> int:
     index_db = args.state / "index.db"
     graph_db = args.state / "graph.db"
 
-    # Vector search first (semantic); FTS fallback if vector returns nothing
-    text_results = vec_search(index_db, args.query, args.kind, args.in_prefix, limit=50)
-    retriever = "sem"  # which retriever produced text_results (sem=vector, fts=keyword fallback)
-    if not text_results:
-        text_results = fts_search(index_db, args.query, args.kind, args.in_prefix, limit=50)
-        retriever = "fts"
+    # Text signal: hybrid RRF fusion when MVM_HYBRID=1, else legacy vec-then-fts.
+    text_results, retriever = text_rank(index_db, args.query, args.kind, args.in_prefix, limit=50)
     if not text_results:
         if args.json:
             print(json.dumps({"query": args.query, "results": []}))
