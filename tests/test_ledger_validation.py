@@ -120,10 +120,35 @@ GOOD_DREAM = {
 
 
 def test_dream_accepts_compliant_entry(tmp_path):
+    # LOCKED-TEST AMENDMENT 2026-07-01: ts assertion updated for
+    # dream-log-append layer 6 (b018d29, 2026-06-24 — caller-supplied ts is
+    # IGNORED by default and self-stamped, raw preserved in
+    # ts_caller_supplied_ignored, because NO legitimate caller supplies ts;
+    # a supplied one is always the hand-composed wall-clock error class that
+    # fired ~8x/30d). The test's INTENT — a compliant entry is accepted rc 0
+    # and persisted — is unchanged; the superseded part was only the
+    # "ts persisted verbatim" pin (that contract now lives in RECOVERY mode,
+    # locked by the companion test below). Tool-side locks: selftest 10/10b/10c.
+    import datetime
     log = tmp_path / "dl.jsonl"
     r = run_dream_append(json.dumps(GOOD_DREAM), log)
     assert r.returncode == 0, r.stderr
-    assert json.loads(log.read_text().strip())["ts"] == GOOD_DREAM["ts"]
+    got = json.loads(log.read_text().strip())
+    assert got["ts_caller_supplied_ignored"] == GOOD_DREAM["ts"]  # raw kept
+    stamped = datetime.datetime.fromisoformat(got["ts"])
+    assert stamped.tzinfo is not None  # self-stamp is aware (Chicago)
+
+
+def test_dream_recovery_mode_honors_backfill_ts(tmp_path):
+    # Companion lock (2026-07-01): the pre-layer-6 "ts persisted verbatim"
+    # contract still holds under the explicit backfill opt-in.
+    env = dict(os.environ, DREAM_LOG=str(tmp_path / "dl.jsonl"),
+               DREAM_LOG_TS_RECOVERY="1")
+    r = subprocess.run([DREAM_APPEND_CLI, json.dumps(GOOD_DREAM)],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    got = json.loads((tmp_path / "dl.jsonl").read_text().strip())
+    assert got["ts"] == GOOD_DREAM["ts"]  # already Chicago-offset -> identity
 
 
 @pytest.mark.parametrize("badkey", ["structural_fixes",        # #173 cycle 5/29
@@ -206,14 +231,36 @@ def test_dream_escape_hatch(tmp_path):
 def test_dream_escape_hatch_does_not_bypass_ts_integrity(tmp_path):
     # v3 contract (2026-06-11): skip-schema is a SCHEMA bypass, not an
     # integrity bypass — unparseable ts is refused rc 2 in BOTH modes.
+    # LOCKED-TEST AMENDMENT 2026-07-01: layer 6 (b018d29, 2026-06-24) IGNORES
+    # caller ts by default, so a garbage ts never reaches the integrity check
+    # in default mode (it is dropped + self-stamped; companion lock below).
+    # The refuse-garbage contract now binds where ts is actually HONORED:
+    # recovery mode. INTENT unchanged — skip-schema still cannot smuggle a
+    # garbage stamp into the log. Tool-side lock: selftest "garbage ts
+    # refused in skip mode" (runs in the recovery-flag body).
     env = dict(os.environ, DREAM_LOG=str(tmp_path / "dl.jsonl"),
-               DREAM_LOG_SKIP_SCHEMA="1")
+               DREAM_LOG_SKIP_SCHEMA="1", DREAM_LOG_TS_RECOVERY="1")
     e = {"ts": "t", "actions": {"structural_fixes": ["x"]}}
     r = subprocess.run([DREAM_APPEND_CLI, json.dumps(e)],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 2
     assert "unparseable ts" in r.stderr
     assert not (tmp_path / "dl.jsonl").exists()
+
+
+def test_dream_default_mode_ignores_garbage_caller_ts(tmp_path):
+    # Layer-6 default contract (mirrors tool selftest 10b): a garbage caller
+    # ts is IGNORED, not refused — the entry lands rc 0 with a valid
+    # self-stamp and the raw value preserved for audit. No garbage stamp can
+    # reach the log either way.
+    import datetime
+    log = tmp_path / "dl.jsonl"
+    e = {**json.loads(json.dumps(GOOD_DREAM)), "ts": "t"}
+    r = run_dream_append(json.dumps(e), log)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(log.read_text().strip())
+    assert got["ts_caller_supplied_ignored"] == "t"
+    datetime.datetime.fromisoformat(got["ts"])  # stamped ts is valid ISO
 
 
 # ----------------------------------------------------------- timings (F3a)
