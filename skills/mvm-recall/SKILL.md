@@ -72,6 +72,9 @@ rationale for every rule here: `~/resources/mvm-incident-history.md`.
    + URL. Skip ONLY when KB returned a grounded hit in a declared curated
    domain AND you have no staleness concern — web is how supersession is
    detected. Discount SEO/gold-seller domains (aoeah, u4gm, mmoexp, …).
+   For PoE2, **fextralife is BANNED** (Mike-direct 2026-06-29) — a wiki whose
+   data is plausible-but-wrong; treat a fextralife-only fact as UNKNOWN. Full
+   list: `~/resources/poe2/source-trust-hierarchy.md`.
    Timing: WebSearch/WebFetch are not Bash, so bare-stamp before the first
    and after the last web call → `web_ms`; skipped web → `"web_ms": null`.
 
