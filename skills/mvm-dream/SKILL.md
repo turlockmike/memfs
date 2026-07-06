@@ -29,7 +29,10 @@ probes, `web` for web-grounded ones.)
 
 ## Steps
 
-0. **Meta-audit** — read last 10 entries of `~/mvm/state/dream-log.jsonl`:
+0. **Meta-audit** — FIRST run `dream-cycle-begin` (stamps the cycle-start epoch
+   so the final `dream-log-append` self-stamps a real `duration_ms`, reviving the
+   monotonic-rising branch below — auditor #48). Then read last 10 entries of
+   `~/mvm/state/dream-log.jsonl`:
    - Same canonical in `quality_repairs` ≥3 cycles → mark frontmatter
      `status: chronic_failure`; surface to user with history.
    - Same topic in `coverage_ingests` ≥3 cycles, fallback rate flat →
@@ -213,10 +216,25 @@ probes, `web` for web-grounded ones.)
        "session_capsule_check":{"exists":true,"action":"skip"}},
     "escalations":[],"duration_ms":0}
    ```
+   (`duration_ms:0` is a PLACEHOLDER — `dream-log-append` overwrites it with the
+   real wall-clock ms diffed from the Step-0 `dream-cycle-begin` marker, then
+   consumes the marker; auditor #48. Keep emitting `0`, don't hand-compute it.)
    S4 path pin: the s4-initiatives ledger is
    `~/.local/state/alfred/areas/s4-initiatives/` (NOT `~/areas/` — stubs only).
    Approximations go in string fields (`"count_7d_approx":"~11"`), never a
    tilde in a numeric slot.
+
+   **Queue-reconciliation gate (2026-07-02):** any ship this cycle
+   (`substrate_fixes`, hook flip, ingest) that satisfies — fully or partially —
+   a standing `~/areas/research-queue.md` item or a journal-head
+   LARGE-TASK/Next-action premise → reconcile that row IN THIS CYCLE: mark
+   `[x] CLOSED` (or annotate partial progress) with a one-line pointer to this
+   dream session_id. Why load-bearing: the 6/27 enforce-flip of the
+   curated-web-recall gate shipped out-of-band and left research-queue L12 +
+   three downstream ORIENTs planning against a dead observe-mode premise
+   (discovered 7/2 wake #8, a full LARGE-TASK slot spent re-deriving it). An
+   out-of-band ship without queue reconciliation converts every downstream
+   ORIENT into stale-premise planning.
 
    **Hook-ship preserve gate:** if this cycle shipped a NEW hook, then BEFORE
    the log append: declare it in `~/.local/state/alfred/hooks-preserve.json`
