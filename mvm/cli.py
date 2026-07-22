@@ -11,6 +11,7 @@ SUBCOMMANDS = {
     "search": "mvm.search",
     "stats": "mvm.stats",
     "heat": "mvm.heat",
+    "sweep": "mvm.sweep",
     "watch": "mvm.watch",
     "backlinks": "mvm.backlinks",
     "relations": "mvm.relations",
@@ -30,6 +31,7 @@ Subcommands:
   search  Tri-mode retrieval (vector + graph + hierarchy + kind filter)
   stats   Decoherence dashboard from recall-log.jsonl
   heat    Retrieval-heat ranking + hot-doc test coverage
+  sweep   Zero-token deterministic curation sweep → worklist for the dream pass
   watch     Daemon: passively embed new/changed docs after a debounce window
   backlinks List files that link TO a given path (used by /mvm-ingest cascade)
   relations Show a doc's typed semantic relation neighborhood (superseded_by, ...)

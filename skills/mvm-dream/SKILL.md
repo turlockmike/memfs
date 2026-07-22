@@ -158,6 +158,18 @@ probes, `web` for web-grounded ones.)
    on dream-log.jsonl recency, so a report-without-append forces a redundant
    cycle next wake). Recovery checklist order: dream-log append (with
    `:PENDING` markers) FIRST, then report/journal/trace.**
+   **PENDING CARRY CONTRACT (2026-07-17, auditor #88 F1): every `:PENDING`
+   from the PREVIOUS pass must be CLOSED or EXPLICITLY CARRIED by this pass —
+   step 0 of every cycle greps the latest prior entry (`dream-log` tail) for
+   `PENDING`, and each hit ends this cycle in exactly one of two states:
+   (a) CLOSED — verdict recorded via `dream-log-amend` on the ORIGINAL entry,
+   or (b) CARRIED — named in THIS cycle's entry with an explicit reason why
+   the verify is still outstanding. Silent outcomes are the failure class this
+   rule kills: a promised amend that never lands, or a doc silently
+   SUBSTITUTED without a verdict/drop-reason on the original (the 7/16 12:39
+   breach-tablet swap — 4 of 5 PENDINGs closed, the 5th replaced with no
+   disposition). PENDINGs rot invisibly because nothing re-surfaces them; this
+   contract makes pass N+1 the re-surfacer.**
    The CLI **enforces the schema**
    (canonical `actions` keys, dict-typed `phase_2_meta_review`, inline —
    never pointer — `mistakes_2plus_30d_assessment`, single-object JSON,

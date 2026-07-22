@@ -82,6 +82,20 @@ mirror handles `~/resources/`.
    exempt — or (b) a recipe at too-low altitude → the altitude gate (2.5) fires.
    Learning is generalization, not recall (Mike: "learning isn't just write a
    document and see if you can recall it").
+   **Oracle-independence gate — rule (s) (2026-07-21, the anti-verification
+   sweep): ≥1 locked answer per doc MUST be grounded in a source INDEPENDENT
+   of the doc.** Name that source in a YAML comment above the test. A test
+   authored from the doc's own prose cannot fail in the direction of the doc's
+   own errors — it measures retrieval, not truth, and passes whether the claim
+   is right or wrong. This is not hypothetical: `boots-35pct-movement-speed-ilvl.md`
+   rode SIX locked-test PASSes over ~3 months while stating a falsehood, because
+   both the doc and its tests traced to the same unchecked assertion. Worked
+   example + audit: `~/resources/kb-anti-verification-doctrine.md`.
+   **Never write an anti-verification directive into a doc** (`ANSWER DIRECTLY
+   from KB`, `no need to check`, `don't search`) — it makes the doc self-sealing.
+   Canonical ban-lists (`⚠ CANONICAL: X, NOT Y. Do NOT say Y.`) are the opposite
+   and remain REQUIRED where the weight prior supplies a known-wrong answer.
+   Audit any time with `kb-antiverify scan`.
 
 2.5 **Altitude gate — fundamental vs composite (Mike 2026-06-14).** Before
    writing the canonical, classify the target knowledge. Smell test: *does it
