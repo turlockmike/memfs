@@ -57,6 +57,27 @@ def _embed_model():
 # vector as before, so no regression; long docs now carry their tail signal.
 _CHUNK_WORDS = 350
 
+# 🔴 THE OOM BOUND — measured 2026-07-22, do not remove.
+# Transformer attention is O(batch × heads × seq²) in the number of SEQUENCES handed
+# to ONE inference call — it is NOT proportional to the number of documents. This is
+# the whole bug: `_embed_batch` flattened every chunk of a 64-doc batch into a single
+# `embed()` call, so the real inference batch was unbounded (a 64-doc batch of long
+# docs is thousands of 512-token sequences). fastembed's own default batch_size=256
+# then applies to *chunks*, which is far too large at this sequence length.
+#
+# Result: `mvm index --embed-only` climbed to ~7 GB RSS on a 7,815 MB box and was
+# OOM-killed every 15 minutes by the cron guard, collateral-killing live sessions
+# (two dmesg events literally headed `claude invoked oom-killer`).
+#
+# Measured on 20 real ghost docs (44,210 words → 136 chunks):
+#     unbounded (old): peak RSS 2,901 MB, 132.0 s
+#     batch_size=16  : peak RSS   763 MB, 113.2 s   ← 3.8× less memory AND faster
+#
+# ⚠️ Capping the *file* list instead would NOT have fixed this: a single large enough
+# document produces enough chunks to OOM the process by itself. The bound has to be
+# on chunks-per-inference-call, which is what this constant is.
+_EMBED_CHUNK_BATCH = int(os.environ.get("MVM_EMBED_CHUNK_BATCH", "16"))
+
 
 def _chunk_text(text: str, size: int = _CHUNK_WORDS) -> list[str]:
     """Split text into word-chunks of <=size words (fits the 512-token model window)."""
@@ -79,7 +100,7 @@ def _meanpool(embs) -> bytes:
 def _embed_to_blob(text: str) -> bytes:
     """Embed a single doc (chunk + mean-pool). Prefer _embed_batch when many docs."""
     chunks = _chunk_text(text)
-    embs = list(_embed_model().embed(chunks))
+    embs = list(_embed_model().embed(chunks, batch_size=_EMBED_CHUNK_BATCH))
     return _meanpool(embs)
 
 
@@ -93,7 +114,10 @@ def _embed_batch(texts: list[str]) -> list[bytes]:
         chunks = _chunk_text(t)
         spans.append((len(flat), len(flat) + len(chunks)))
         flat.extend(chunks)
-    all_embs = list(_embed_model().embed(flat))
+    # batch_size bounds the ONNX inference batch (see _EMBED_CHUNK_BATCH). The
+    # returned vectors are tiny (384 floats each), so materializing them all is
+    # cheap — it is the *inference* batch, never the result list, that OOMs.
+    all_embs = list(_embed_model().embed(flat, batch_size=_EMBED_CHUNK_BATCH))
     return [_meanpool(all_embs[s:e]) for s, e in spans]
 
 DEFAULT_ROOT = Path(os.environ.get("MVM_KNOWLEDGE", str(Path.home() / "mvm" / "knowledge")))
