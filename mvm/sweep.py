@@ -64,6 +64,9 @@ CHECKS = ("review_due", "cold_decayed", "untested_hot", "broken_links", "index_d
 
 _FM_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
 _ISO_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+# `none`/`n/a`/`never` as a WHOLE word, optionally followed by the reason that
+# makes the declaration honest. `nonsense` must not match.
+_NONE_RE = re.compile(r"(?i)^(?:none|n/a|never)\b(?P<reason>.*)$", re.S)
 _LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+?)(?:\s+\"[^\"]*\")?\)")
 _INDEX_LINK_RE = re.compile(r"\]\(([^)\s]+\.md)\)")
 
@@ -96,15 +99,39 @@ def frontmatter(text: str) -> dict:
 
 
 def parse_review_at(raw: str):
-    """('due'|'future'|'unparseable', date-or-None).
+    """('due'|'future'|'none'|'unparseable', date-or-None).
 
     A value must START with an ISO date to count as a date — `2026-08-15 (~8
     settles by then)` is a date with a note, `see § Verdict` is not a date at
     all, and pretending otherwise would silently drop a review that is owed.
+
+    THE `none` SENTINEL (added 2026-07-22, dream cycle): some docs genuinely
+    have no review date — a KILLED trading lane does not decay, and its
+    re-entry bars are event-triggered rather than calendar-triggered. Before
+    this, such a doc was reported `unparseable` on EVERY sweep, forever, at
+    zero information value. That is the cry-wolf failure this module's own
+    honesty rules exist to prevent: a permanent false positive trains its
+    reader to ignore the check, which is how a real unparseable row would slip
+    past unseen.
+
+    But `none` is only honest WITH A REASON. A bare `none` is
+    indistinguishable from someone who could not be bothered to pick a date,
+    so it stays `unparseable`. Declaring that no review is owed is a claim,
+    and a claim carries its justification — the same rule the rest of the
+    substrate runs on. Accepted form: `none — <why>` (any dash/punctuation or
+    whitespace separator, ≥3 chars of actual reason).
+
+    `nonsense` does not match: the sentinel must be a whole word.
     """
     raw = (raw or "").strip().strip("*").strip()
     if not raw:
         return "unparseable", None
+    m_none = _NONE_RE.match(raw)
+    if m_none:
+        reason = m_none.group("reason") or ""
+        # Strip leading separator punctuation before measuring the reason.
+        reason = reason.lstrip("-—–:;,. \t").strip()
+        return ("none" if len(reason) >= 3 else "unparseable"), None
     m = _ISO_RE.match(raw)
     if not m:
         return "unparseable", None
@@ -167,7 +194,7 @@ def heat_by_window(log: Path, root: Path, now: datetime):
 
 # ------------------------------------------------------------------- checks --
 def check_review_due(root: Path, docs, now: datetime):
-    due, unparseable = [], []
+    due, unparseable, declared_none = [], [], []
     for p, text in docs:
         fm = frontmatter(text)
         if "review_at" not in fm:
@@ -176,10 +203,20 @@ def check_review_due(root: Path, docs, now: datetime):
         rel = str(p.relative_to(root))
         if state == "due":
             due.append({"path": rel, "review_at": date})
+        elif state == "none":
+            declared_none.append({"path": rel, "reason": fm["review_at"][:120]})
         elif state == "unparseable":
             unparseable.append({"path": rel, "review_at_raw": fm["review_at"][:80]})
     due.sort(key=lambda r: r["review_at"])
-    return {"rows": due, "unparseable": unparseable}
+    declared_none.sort(key=lambda r: r["path"])
+    return {
+        "rows": due,
+        "unparseable": unparseable,
+        # Surfaced as a COUNT+list, never as worklist rows: these are decided,
+        # not owed. Kept visible so "no review owed" stays auditable rather
+        # than becoming an invisible way to opt out of the check.
+        "declared_no_review": declared_none,
+    }
 
 
 def check_cold_decayed(root: Path, docs, ever, recent):
@@ -370,8 +407,10 @@ def render(result: dict, out=sys.stdout) -> None:
     print("worklist rows: %d\n" % result["total_worklist_rows"], file=out)
     if "review_due" in c:
         r = c["review_due"]
-        print("  review_due      %4d due  (+%d review_at unparseable — owed, not skipped)"
-              % (len(r["rows"]), len(r["unparseable"])), file=out)
+        print("  review_due      %4d due  (+%d review_at unparseable — owed, not skipped"
+              "; %d declared no-review-with-reason)"
+              % (len(r["rows"]), len(r["unparseable"]),
+                 len(r.get("declared_no_review", []))), file=out)
         for row in r["rows"][:10]:
             print("      %s  (review_at %s)" % (row["path"], row["review_at"]), file=out)
         for row in r["unparseable"][:5]:
@@ -418,6 +457,15 @@ def _fixture(tmp: Path):
     doc("resources/future.md", "title: f\nreview_at: 2099-01-01")            # NOT due
     doc("resources/vague.md", "title: v\nreview_at: see § Verdict")          # unparseable
     doc("resources/dated-with-note.md", "title: d\nreview_at: 2020-02-02 (~8 settles)")
+    # `none` sentinel fixtures (2026-07-22)
+    doc("resources/killed-lane.md",
+        "title: k\nreview_at: none — lane closed; re-entry bars are event-triggered")
+    doc("resources/bare-none.md", "title: b\nreview_at: none")       # no reason -> unparseable
+    # Whole-word guard. MUST be a word that genuinely STARTS with the sentinel
+    # — `nonsense` is n-o-n-S, so `none` never prefixed it and the case was
+    # vacuous (caught by mutation test 2026-07-22). `nonetheless` is n-o-n-e-T.
+    doc("resources/nonsense-review.md", "title: n\nreview_at: nonetheless, see § Verdict")
+    doc("resources/na-review.md", "title: a\nreview_at: n/a — kills do not decay")
     doc("resources/no-review.md", "title: n")                               # NOT flagged
     doc("resources/hot-tested.md", "title: ht")                             # NOT flagged
     (root / "resources" / "hot-tested.tests.yaml").write_text("cases: []\n")
@@ -494,6 +542,28 @@ def selftest() -> int:
         check("unparseable review_at is REPORTED, not silently dropped",
               "resources/vague.md" in up)
         check("unparseable is not counted as due", "resources/vague.md" not in rd)
+
+        # --- `none` sentinel (2026-07-22): a declared no-review is decided,
+        # not owed — but only when it carries a reason.
+        nn = {r["path"] for r in c["review_due"]["declared_no_review"]}
+        check("`none — <reason>` is DECLARED no-review, not unparseable",
+              "resources/killed-lane.md" in nn
+              and "resources/killed-lane.md" not in up)
+        check("a declared no-review is never counted as due",
+              "resources/killed-lane.md" not in rd)
+        check("the declared reason is retained for audit",
+              any("lane closed" in r["reason"]
+                  for r in c["review_due"]["declared_no_review"]
+                  if r["path"] == "resources/killed-lane.md"))
+        check("BARE `none` (no reason) stays unparseable — a claim needs its why",
+              "resources/bare-none.md" in up and "resources/bare-none.md" not in nn)
+        check("`nonetheless` does NOT match the none sentinel (whole word only)",
+              "resources/nonsense-review.md" in up
+              and "resources/nonsense-review.md" not in nn)
+        check("`n/a` with a reason is accepted as declared no-review",
+              "resources/na-review.md" in nn)
+        check("a real ISO date is unaffected by the none sentinel",
+              "resources/past-due.md" in rd and "resources/past-due.md" not in nn)
 
         cd = {r["path"] for r in c["cold_decayed"]["rows"]}
         check("cold_decayed finds a doc whose heat is all older than the window",

@@ -16,6 +16,7 @@ SUBCOMMANDS = {
     "backlinks": "mvm.backlinks",
     "relations": "mvm.relations",
     "log": "mvm.log",
+    "linkfix": "mvm.linkfix",
 }
 
 
@@ -36,6 +37,7 @@ Subcommands:
   backlinks List files that link TO a given path (used by /mvm-ingest cascade)
   relations Show a doc's typed semantic relation neighborhood (superseded_by, ...)
   log       Show recall-log or dream-log entries
+  linkfix   Repair relative .md links whose target exists elsewhere in the tree
 
 Run `mvm <subcommand> --help` for subcommand usage.
 """
