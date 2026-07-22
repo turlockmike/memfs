@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,11 @@ from pathlib import Path
 import yaml
 
 CLAUDE = os.environ.get("MVM_CLAUDE_BIN", "claude")
+
+# Max bytes to pass as a single argv entry before falling back to stdin.
+# Linux MAX_ARG_STRLEN is 131072 (32 pages) per argument; this sits safely under it
+# so the system-prompt + flags in the same argv never push the exec over the edge.
+ARGV_PROMPT_MAX_BYTES = 100_000
 DEFAULT_MODEL = os.environ.get("MVM_VERIFY_MODEL", "haiku")
 DEFAULT_TIMEOUT = int(os.environ.get("MVM_VERIFY_TIMEOUT", "120"))
 
@@ -232,14 +238,29 @@ def claude_subprocess(
         "--system-prompt", system_prompt,
     ]
 
+    # Oversized prompts go via STDIN, not argv. Linux caps a SINGLE argv entry at
+    # MAX_ARG_STRLEN = 32 pages = 131072 bytes; exceeding it makes execve fail with
+    # E2BIG ("[Errno 7] Argument list too long") BEFORE claude ever starts. An
+    # injected-verify prompt embeds the entire doc, so every doc above ~128KB was
+    # structurally unverifiable — and the failure surfaced as a normal test FAIL with
+    # candidate=None, i.e. it read as a CONTENT defect in the doc rather than as an
+    # engine defect. Found 2026-07-22 (dream-20260722-0655) authoring locked tests for
+    # areas/earning-lane-inventory.md (140,822 B): all 5 tests "failed" 3/3 attempts
+    # with an empty candidate. `claude --print` reads the prompt from stdin when no
+    # positional prompt is given, which has no size limit.
+    use_stdin = len(user_prompt.encode("utf-8")) > ARGV_PROMPT_MAX_BYTES
+    stdin_payload = user_prompt if use_stdin else None
+    positional = [] if use_stdin else [user_prompt]
+
     if _bare_path_engaged():
         # Legacy fast path. Trust --bare to handle isolation.
         # --bare placed right after --print to match `claude --print --bare ...` docs.
         cmd = [CLAUDE, "--print", "--bare", "--no-session-persistence",
                "--tools", "", "--model", model,
-               "--system-prompt", system_prompt, user_prompt]
+               "--system-prompt", system_prompt] + positional
         result = subprocess.run(
             cmd,
+            input=stdin_payload,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -250,11 +271,11 @@ def claude_subprocess(
             "--setting-sources", "project,local",
             "--strict-mcp-config",
             "--disable-slash-commands",
-            user_prompt,
-        ]
+        ] + positional
         with isolated_home() as (cwd, env):
             result = subprocess.run(
                 cmd,
+                input=stdin_payload,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -444,7 +465,23 @@ def main(argv = None) -> int:
         print(f"ERROR: tests file must be a YAML list: {tests_path}", file=sys.stderr)
         return 2
 
-    if args.test_id is not None:
+    selected_id = None
+    if args.test_id is not None and args.test_id in ("random", "any"):
+        # Sentinel: the dream cycle wants ONE cheap verdict from an arbitrary
+        # test, but id CONVENTIONS differ per doc ("1".."8", "id2",
+        # "q3-cheap-reroll-tech"). A hand-guessed id costs a full round trip of
+        # exit-2 errors before any doc is judged (dream-20260721-1242 burned a
+        # 5-doc parallel launch that way; the same ambiguity nearly mislogged
+        # two PASSing docs as transients in dream-20260629-0100). Resolving the
+        # id from the tests file makes "pick a random test" structurally
+        # always-valid instead of caller-guessed.
+        if not tests_data:
+            print(f"ERROR: tests file is empty: {tests_path}", file=sys.stderr)
+            return 2
+        chosen = random.choice(tests_data)
+        selected_id = str(chosen.get("id"))
+        tests_data = [chosen]
+    elif args.test_id is not None:
         # Match by string so docs with string ids (e.g. "q1-base-selection")
         # and docs with integer yaml ids (e.g. 1) both resolve from the
         # str-typed CLI arg. Backward-compatible: str(1) == "1".
@@ -523,6 +560,7 @@ def main(argv = None) -> int:
             "tests": str(tests_path),
             "model": args.model,
             "mode": args.mode,
+            "test_id_selected": selected_id,
             "pass": n_pass,
             "total": n_total,
             "results": results,

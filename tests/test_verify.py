@@ -396,3 +396,102 @@ def test_grader_flow_fails_in_scope_omission(tmp_path):
     with mock.patch.object(verify, "claude_subprocess", side_effect=fake_subproc):
         rc = verify.main([str(doc)])
     assert rc == 1
+
+
+def test_verify_test_id_random_selects_a_real_id(tmp_path, capsys, monkeypatch):
+    """`--test-id random` resolves ONE real id from the tests file, whatever the
+    doc's id convention is ("1".."8" / "id2" / "q3-slug"). Regression for the
+    caller-guessed-id round trip: dream-20260721-1242 launched 5 parallel
+    verifies with a guessed `id2` and got 5x exit-2 and zero verdicts, because
+    id conventions are per-doc. Judged tests must be exactly 1 (cheap verdict),
+    and the chosen id must be reported so the dream log can cite WHICH test."""
+    doc = tmp_path / "doc.md"
+    doc.write_text("body")
+    (tmp_path / "doc.tests.yaml").write_text(
+        "- id: q1-alpha\n  q: 'a?'\n  a: 'a'\n"
+        "- id: 2\n  q: 'b?'\n  a: 'b'\n"
+        "- id: id3\n  q: 'c?'\n  a: 'c'\n"
+    )
+    seen = []
+
+    def fake_retry(doc_path, test, model, mode="injected", retries=1):
+        seen.append(str(test.get("id")))
+        return {"id": test.get("id"), "question": test.get("q"), "passed": True,
+                "candidate": "", "expected": test.get("a"), "attempts": 1}
+
+    monkeypatch.setattr(verify, "verify_test_retry", fake_retry)
+    rc = verify.main([str(doc), "--test-id", "random", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 1, "random must judge exactly ONE test, not the full suite"
+    assert len(seen) == 1
+    assert seen[0] in {"q1-alpha", "2", "id3"}
+    assert payload["test_id_selected"] == seen[0], "the judged id must be reported"
+
+
+def test_verify_test_id_random_on_empty_tests_file_errors(tmp_path, capsys):
+    """An empty tests file under `random` is a caller-visible exit 2, never a
+    silent 0/0 'pass' — a vacuous pass would log as a clean verify."""
+    doc = tmp_path / "doc.md"
+    doc.write_text("body")
+    (tmp_path / "doc.tests.yaml").write_text("[]\n")
+    rc = verify.main([str(doc), "--test-id", "random", "--json"])
+    assert rc == 2
+
+
+# --- oversized-prompt stdin fallback (dream-20260722-0655) -------------------
+# Regression lock for a REAL failure: injected-verify embeds the whole doc in the
+# prompt, and Linux caps a single argv entry at MAX_ARG_STRLEN=131072 bytes, so
+# every doc >~128KB died with "[Errno 7] Argument list too long" BEFORE claude
+# started — surfacing as a content FAIL (candidate=None), not an engine error.
+# These lock the routing decision in BOTH directions without spawning a subprocess.
+
+def _capture_run(monkeypatch):
+    """Patch subprocess.run inside verify; return the recorded call kwargs."""
+    seen = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["input"] = kwargs.get("input")
+        return _Result()
+
+    monkeypatch.setattr(verify.subprocess, "run", fake_run)
+    return seen
+
+
+def test_small_prompt_goes_via_argv(monkeypatch):
+    seen = _capture_run(monkeypatch)
+    prompt = "tiny prompt"
+    out = verify.claude_subprocess("sys", prompt)
+    assert out == "ok"
+    # positional prompt present, stdin unused
+    assert seen["cmd"][-1] == prompt
+    assert seen["input"] is None
+
+
+def test_oversized_prompt_goes_via_stdin(monkeypatch):
+    seen = _capture_run(monkeypatch)
+    prompt = "x" * (verify.ARGV_PROMPT_MAX_BYTES + 1)
+    out = verify.claude_subprocess("sys", prompt)
+    assert out == "ok"
+    # prompt must NOT appear in argv (that is what raised E2BIG)...
+    assert prompt not in seen["cmd"]
+    # ...and must be delivered on stdin instead
+    assert seen["input"] == prompt
+
+
+def test_threshold_stays_under_linux_max_arg_strlen():
+    # MAX_ARG_STRLEN = 32 pages = 131072 bytes. The threshold must leave headroom
+    # for the system prompt and flags sharing the same exec.
+    assert verify.ARGV_PROMPT_MAX_BYTES < 131072
+
+
+def test_real_world_doc_size_would_route_to_stdin():
+    # The doc that exposed the bug was 140,822 bytes; anything that size must
+    # route to stdin or the regression is back.
+    assert 140_822 > verify.ARGV_PROMPT_MAX_BYTES
