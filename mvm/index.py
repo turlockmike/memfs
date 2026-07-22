@@ -419,6 +419,12 @@ def _embed_only_main(args) -> int:
 
     BATCH = 64
     done = 0
+    # failed counts embeddings this run was ASKED to produce and did not. It must
+    # reach the exit code: `mvm-verify-guard` reads ONLY rc to decide whether to
+    # log EMBED_HEAL_FAIL/EMBED_HEAL_OOM, so a run whose every batch died used to
+    # surface as a serene `CLEAN files=N` while the search index decayed.
+    # (2026-07-22; locked by tests/test_embed_only_exit_code.py.)
+    failed = 0
     for i in range(0, total, BATCH):
         chunk_paths = pending[i:i + BATCH]
         bodies = []
@@ -435,12 +441,14 @@ def _embed_only_main(args) -> int:
         try:
             blobs = _embed_batch(bodies)
         except Exception as e:
+            failed += len(valid)
             print(f"  warn: batch embed failed at offset {i}: {e}", file=sys.stderr)
             continue
         for rel, blob in zip(valid, blobs):
             try:
                 idx.execute("INSERT INTO files_vec (path, embedding) VALUES (?, ?)", (rel, blob))
             except Exception as e:
+                failed += 1
                 print(f"  warn: insert embed failed for {rel}: {e}", file=sys.stderr)
         idx.commit()
         done = min(i + BATCH, total)
@@ -448,6 +456,12 @@ def _embed_only_main(args) -> int:
             print(f"  {done}/{total}", flush=True)
 
     idx.close()
+    if failed:
+        # Always stderr, even under --quiet: the guard's log line is built from
+        # this, and a silent partial heal is the failure mode being fixed.
+        print(f"embed backfill incomplete: {failed}/{total} file(s) not embedded",
+              file=sys.stderr)
+        return 1
     if not args.quiet:
         print(f"Backfill complete: {done}/{total}.")
     return 0
