@@ -44,6 +44,45 @@ probes, `web` for web-grounded ones.)
      stop re-attempting.
    Every pattern drives a meta-action or escalation; nothing flat-logs.
 
+0.5 **Load the sweep worklist — DISCOVERY IS ALREADY DONE, DO NOT REDO IT**
+   (hermes-parity build #4, 2026-07-22; `~/projects/hermes-parity/PLAN.md:45-51`).
+
+   ```
+   mvm sweep --check-fresh || mvm sweep      # regenerate only if stale (~4s, 0 tokens)
+   mvm sweep --json                          # or read ~/.local/state/alfred/mvm-sweep/worklist.json
+   ```
+
+   **The split this enforces, and why it is the whole point of the build:** finding
+   *which* docs are stale, dead, broken-linked, or past `review_at` is a
+   **deterministic file-scan** — ~4,100 docs in ~4 s at **zero model tokens**. Judging
+   what to DO about a flagged doc is the part that needs a model. Before this step
+   existed, the dream pass spent Claude tokens rediscovering the first half every
+   cycle. **Spend tokens on the judgment calls, never on the enumeration.**
+
+   The `mvm-sweep-producer` cron (`20 */6`) runs 10 minutes ahead of this pass, so
+   the worklist is normally ≤10 min old and the `--check-fresh` line is a no-op guard,
+   not a regeneration. It regenerates only when the producer genuinely missed.
+
+   **Route the rows — each check has ONE owning step, so nothing is worked twice:**
+   | worklist check | feeds | what the model actually decides |
+   |---|---|---|
+   | `review_due` (+ `unparseable`) | step 4 | is the canonical still true? supersede / re-date / retire. **`unparseable` rows are a `review_at` field that is prose, not a date — fix the field, and do not count it as reviewed.** |
+   | `cold_decayed` | step 4 | zero retrieves in 30 d with ≥2 lifetime: genuinely dead weight, or seasonal (a lane that will wake)? **Decay ≠ delete** — prefer archive/merge; a doc that grounded real recalls once has earned a reason before removal. |
+   | `untested_hot` | step 3 | any doc crossing the ≥2-recall threshold must acquire locked tests **before its next dream pass** — this is the live maintenance oracle in `PLAN.md:51`. Currently **0**; keeping it at 0 IS the success condition. |
+   | `broken_links` | step 3 | repair the target, or delete the link if the referent is genuinely gone. |
+   | `index_drift` | step 5 | `INDEX.md`/`index.md` collisions — structural, usually mechanical. |
+
+   ⛔ **`never_retrieved` is a bounded COUNT, not a worklist** — ~3,879 docs have never
+   grounded a single recall. Do **NOT** author tests, verify, or repair against that
+   set: it is cost with no retrieval on the other side. The build's original "3.6%
+   coverage gap" clause was **RETIRED on exactly this reasoning** (`PLAN.md:49,51`) —
+   do not resurrect it from an older cached reading of the plan.
+
+   ⚠ **If `--check-fresh` fails twice in a row, that is a PRODUCER outage, not a
+   worklist problem** — say so in the cycle entry rather than quietly regenerating
+   forever; the regeneration masks a dead cron, which is the exact class audit #110
+   was about.
+
 1. **Dashboard** — `mvm stats --window 7d --json` (defaults to real recalls).
    Capture top fallback topics, source mix.
 

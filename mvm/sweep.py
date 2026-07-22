@@ -574,8 +574,85 @@ def selftest() -> int:
               {"cold_days", "hot_min_recalls", "heat_horizon"})
         check("selftest touched no real knowledge tree", str(DEFAULT_ROOT) not in str(root))
 
+        # --- check_fresh: the DRIFT arm. A gate that cannot go red is not a gate,
+        # so every case below is paired with its opposite; passing only the
+        # happy path would prove nothing about staleness detection.
+        t0 = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+        check("check_fresh: fresh worklist passes",
+              check_fresh(wl, 7.0, now=datetime.fromisoformat(
+                  json.loads(wl.read_text())["generated"]) + timedelta(hours=1))[0] == 0)
+        check("check_fresh: STALE worklist fails (the gate can go red)",
+              check_fresh(wl, 7.0, now=datetime.fromisoformat(
+                  json.loads(wl.read_text())["generated"]) + timedelta(hours=8))[0] == 1)
+        check("check_fresh: boundary is exclusive — exactly at the cap is still fresh",
+              check_fresh(wl, 7.0, now=datetime.fromisoformat(
+                  json.loads(wl.read_text())["generated"]) + timedelta(hours=7))[0] == 0)
+        check("check_fresh: ABSENT worklist fails as stale, never as 'nothing to do'",
+              check_fresh(tmp / "does-not-exist.json", 7.0, now=t0)[0] == 1)
+        malformed = tmp / "malformed.json"
+        malformed.write_text('{"total_worklist_rows": 3}')   # no `generated`
+        check("check_fresh: worklist with no `generated` is rc=2, distinct from stale",
+              check_fresh(malformed, 7.0, now=t0)[0] == 2)
+        notjson = tmp / "notjson.json"
+        notjson.write_text("this is not json")
+        check("check_fresh: unparseable worklist is rc=2, not a crash",
+              check_fresh(notjson, 7.0, now=t0)[0] == 2)
+        # mtime is a LIE on this substrate (mvm-mirror copies files); freshness must
+        # come from the sweep's own stamp.
+        #
+        # ⚠ THIS CASE WAS VACUOUS ON FIRST WRITE (caught 2026-07-22 by the mutation
+        # pass, not by review). v1 touched mtime to *now* and asserted STALE — but a
+        # stamp-reader and an mtime-reader BOTH returned stale there, so the mutation
+        # "use mtime instead of generated" survived a green selftest. The two
+        # readings must DISAGREE for the assertion to carry information: mtime is
+        # driven far into the past while `generated` stays recent, so stamp-reading
+        # says FRESH and mtime-reading says STALE. Now the mutation dies.
+        gen_dt = datetime.fromisoformat(json.loads(wl.read_text())["generated"])
+        old = (gen_dt - timedelta(hours=100)).timestamp()
+        os.utime(wl, (old, old))
+        check("check_fresh: reads `generated`, NOT file mtime (mirror-cron safe)",
+              check_fresh(wl, 7.0, now=gen_dt + timedelta(hours=1))[0] == 0)
+
     print("\n%d passed, %d failed" % (ok, fail))
     return 1 if fail else 0
+
+
+def check_fresh(worklist_path: Path, max_age_hours: float, now=None) -> tuple:
+    """The DRIFT arm of this build's closed loop (architecture invariant #17).
+
+    Returns (rc, message). rc 0 = fresh, 1 = stale or absent, 2 = unreadable.
+
+    ⛔ WHY THIS EXISTS, and why it is not decoration: a worklist that stops being
+    regenerated does not fail loudly — it just gets old, and the dream pass keeps
+    consuming it as if it were current. That is strictly WORSE than having no
+    worklist at all, because a stale worklist launders "I checked" over "nobody
+    has looked in six days." The consumer trusts this file; something has to
+    check that the file deserves it.
+
+    Freshness is measured from the sweep's OWN `generated` stamp, not the file
+    mtime — mtime lies whenever the file is copied, restored, or touched by a
+    sync job, and this substrate has a mirror cron that does exactly that.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if not worklist_path.exists():
+        return 1, "mvm sweep: worklist ABSENT at %s — producer has never run" % worklist_path
+    try:
+        data = json.loads(worklist_path.read_text())
+        stamp = data["generated"]
+        gen = datetime.fromisoformat(stamp)
+    except (ValueError, KeyError, OSError) as exc:
+        return 2, "mvm sweep: worklist unreadable//malformed (%s): %s" % (worklist_path, exc)
+    if gen.tzinfo is None:
+        gen = gen.replace(tzinfo=timezone.utc)
+    age_h = (now - gen).total_seconds() / 3600.0
+    if age_h > max_age_hours:
+        return 1, ("mvm sweep: worklist STALE — generated %s (%.1f h ago, cap %.1f h). "
+                   "The dream pass is consuming a worklist nobody refreshed; "
+                   "check the `mvm-sweep-producer` cron job."
+                   % (stamp, age_h, max_age_hours))
+    return 0, ("mvm sweep: worklist fresh — generated %s (%.1f h ago, cap %.1f h), %d row(s)"
+               % (stamp, age_h, max_age_hours, data.get("total_worklist_rows", -1)))
 
 
 def main(argv=None) -> int:
@@ -591,10 +668,22 @@ def main(argv=None) -> int:
     ap.add_argument("--no-write", action="store_true",
                     help="Do not write the worklist file.")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--check-fresh", action="store_true",
+                    help="Do not sweep: assert the EXISTING worklist is fresh. "
+                         "exit 0 = fresh, 1 = stale/absent, 2 = malformed. "
+                         "This is the auditor's drift gate.")
+    ap.add_argument("--max-age-hours", type=float, default=7.0,
+                    help="Staleness cap for --check-fresh (default 7 — the "
+                         "producer runs every 6 h, so 7 tolerates one late run "
+                         "but never two missed ones).")
     args = ap.parse_args(argv)
 
     if args.selftest:
         return selftest()
+    if args.check_fresh:
+        rc, msg = check_fresh(args.worklist, args.max_age_hours)
+        print(msg, file=sys.stderr if rc else sys.stdout)
+        return rc
     if not args.root.is_dir():
         print("mvm sweep: knowledge root not found: %s" % args.root, file=sys.stderr)
         return 3
