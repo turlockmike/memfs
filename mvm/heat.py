@@ -97,6 +97,39 @@ def has_tests(relpath: str, root: Path) -> bool:
     return (root / relpath.replace(".md", ".tests.yaml")).is_file()
 
 
+# Retired-status set, kept identical to sweep.py's _RETIRED_STATUS so the two
+# tools cannot disagree about the same doc (2026-07-25, dream-20260725-0647).
+# WHY: `mvm heat --untested` is the worklist the /dream step-5 protocol reads to
+# pick "the SINGLE hottest untested doc" to author locked tests for. Without this
+# filter it happily nominates a doc whose own frontmatter says `status: superseded`
+# — i.e. it directs verification budget at content already declared dead. Found
+# live: resources/poe2/facts/_unverified/crafting-omens/
+# sinestral-crystallization-prefix-remove.md, heat 2, UNTESTED, status superseded,
+# sat at the TOP of --untested while `mvm sweep`'s untested_hot correctly reported
+# 0 rows. The two tools looked like they contradicted each other; they didn't —
+# sweep applied this filter and heat did not.
+# Scope is deliberately narrow: retired docs stay in the plain heat RANKING,
+# because a superseded doc still being retrieved is itself a real signal (the
+# supersede didn't reach retrieval). Only the test-authoring worklist is filtered.
+_RETIRED_STATUS = {"superseded", "archived", "retired", "deprecated"}
+
+
+def is_retired(relpath: str, root: Path) -> bool:
+    try:
+        text = (root / relpath).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not text.startswith("---"):
+        return False
+    end = text.find("\n---", 3)
+    fm = text[3:end] if end > 0 else text[3:]
+    for line in fm.splitlines():
+        if line.lower().startswith("status:"):
+            return line.split(":", 1)[1].strip().strip("\"'").lower() \
+                in _RETIRED_STATUS
+    return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Retrieval-heat ranking + hot-doc test coverage.")
@@ -111,8 +144,14 @@ def main(argv=None) -> int:
     counts = heat_counts(args.log, args.root)
     rows = [{"path": p, "recalls": c, "tested": has_tests(p, args.root)}
             for p, c in counts.most_common()]
+    retired_skipped = []
     if args.untested:
         rows = [r for r in rows if not r["tested"]]
+        # Never nominate already-dead content for test authoring; report what was
+        # withheld so a shrunken worklist can't quietly read as "nothing to do".
+        retired_skipped = [r["path"] for r in rows
+                           if is_retired(r["path"], args.root)]
+        rows = [r for r in rows if r["path"] not in set(retired_skipped)]
     rows = rows[:args.top]
 
     hot_all = [{"path": p, "tested": has_tests(p, args.root)}
@@ -125,12 +164,22 @@ def main(argv=None) -> int:
             round(100 * covered / len(hot_all), 1) if hot_all else 0.0,
     }
 
+    if args.untested:
+        summary["retired_excluded"] = len(retired_skipped)
+        summary["retired_excluded_paths"] = retired_skipped
+
     if args.json:
         print(json.dumps({"summary": summary, "rows": rows}, indent=1))
     else:
         print(f"Docs with retrieval heat: {summary['docs_with_heat']}")
         print(f"Hot top-{args.top} test coverage: {covered}/{len(hot_all)} "
               f"({summary[f'hot_top{args.top}_coverage_pct']}%)")
+        if args.untested and retired_skipped:
+            print(f"Excluded {len(retired_skipped)} retired/superseded doc(s) "
+                  f"from the test-authoring worklist "
+                  f"(matches mvm sweep untested_hot):")
+            for p in retired_skipped:
+                print(f"    - {p}")
         print()
         for r in rows:
             flag = "✓ tests" if r["tested"] else "✗ UNTESTED"
