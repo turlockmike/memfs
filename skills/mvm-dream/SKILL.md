@@ -37,8 +37,19 @@ probes, `web` for web-grounded ones.)
      `status: chronic_failure`; surface to user with history.
    - Same topic in `coverage_ingests` ≥3 cycles, fallback rate flat →
      escalate (suggest manual ingest of an authoritative source).
-   - `transients` outpacing `quality_repairs` over the window → cross-check
-     disconfirming too often; surface (clone noisy or threshold wrong).
+   - **`probe-noise` transients** outpacing `quality_repairs` over the window →
+     the retriever/CLI is failing too often; surface (infrastructure degrading).
+     ⚠ **Count the CAUSE TAG, never the raw `transients` bucket** (2026-07-25):
+     `transients` holds three causes with OPPOSITE meanings, and only
+     `probe-noise:` is infrastructure signal. `grader-strict:` entries are the
+     designed strict-engine→lenient-cross-check filter WORKING, and on a healthy
+     corpus they NATURALLY exceed `quality_repairs` (few real defects, some
+     strict-tier false positives); `staleness-disconfirm:` is healthy skepticism.
+     Counting the bucket raw makes this rule fire on corpus HEALTH — it did on
+     2026-07-25 (5 transients vs 3 repairs → discriminated: 4 grader-strict + 1
+     timeout ⇒ healthy, no escalation). Tags are now **enforced at the write gate**
+     (`dream-log-append` rc=2 on an untagged transient), so this count is
+     deterministic: grep the tag, don't re-read prose.
    - `duration_ms` monotonically rising → schedule consolidation; surface.
    - Same question `still_split` ≥2 cycles → permanently contested; escalate,
      stop re-attempting.
@@ -110,6 +121,17 @@ probes, `web` for web-grounded ones.)
 3. **Quality — re-verify + repair** (`dream-verify-pick pick 5`): per doc,
    **first probe via the engine** — `mvm verify <doc> --test-id <random id>
    --json` (cold-clone + auto-grade; zero doc bytes through your context).
+   - **Canonical cross-check FIRST (cycle-level, deterministic, zero tokens):**
+     `contamination-scan` — greps every curated PoE2 doc + its `.tests.yaml`
+     answers against the canonical PoE1-only ban-lists. This catches the class
+     `mvm verify` **structurally cannot**: a doc self-consistent with its OWN
+     tests but contradicting a canonical allowlist (the test was authored from
+     the same contaminated source, so it passes forever). Real case that
+     motivated it (2026-07-24): `0.4/crafting/catalyst-mechanics.tests.yaml`
+     test#4 hard-codes "Fertile catalyst (life tag)" — Fertile is PoE1-only;
+     29 hits across ~10 docs. Each hit = fix the tested doc + its test, then
+     re-run the injected-verify gate. Extend the ban-list by adding rows to
+     `canonical/catalysts.md` § "Confirmed PoE1-only" (the tool parses it live).
    **ALWAYS pass `--test-id` (ONE test); never run bare `mvm verify <doc>`
    (full suite) — full-suite reliably TIMES OUT @200s on large docs
    (poe2-crafting-codex, 0.5.0-patch-notes burned ~10min for 0 verdicts,
@@ -118,15 +140,23 @@ probes, `web` for web-grounded ones.)
    Log probe; stamp `dream-verify-pick record <doc> <PASS|FAIL> quality`.
    - Engine PASS → done.
    - Engine FAIL with an `error` field / retry-exhausted EMPTY stdout →
-     classify as `transients` (probe-noise: the retriever/CLI failed, the doc
-     was never judged), NEVER a content defect or quality repair (auditor
-     sign-off dream-20260610-0100, point 4).
+     classify as `transients` tagged **`probe-noise:`** (the retriever/CLI
+     failed, the doc was never judged), NEVER a content defect or quality repair
+     (auditor sign-off dream-20260610-0100, point 4).
    - Engine FAIL → cross-check with ONE orchestrator-graded cold-clone
      (inject doc, grade per doctrine: lenient on phrasing/enumeration
      completeness, strict on facts — the engine grader is measurably
      stricter, exp6 2026-06-09). Both fail → `/mvm-ingest` the doc's
-     `source:` URL (overwriting re-ingest). Cross-check passes → transient,
-     no action.
+     `source:` URL (overwriting re-ingest). Cross-check passes → transient
+     tagged **`grader-strict:`**, no action.
+   **TRANSIENT CAUSE TAG IS MANDATORY (2026-07-25, enforced — `dream-log-append`
+   returns rc=2 on an untagged entry).** Every `transients` string starts with
+   exactly one of `probe-noise:` · `grader-strict:` · `staleness-disconfirm:`
+   (or be a dict with a canonical `cause` key). Why it's load-bearing: these three
+   mean OPPOSITE things — probe-noise is infrastructure failing, grader-strict is
+   the two-tier filter working as designed, staleness-disconfirm is healthy
+   skepticism — so an untagged bucket makes the step-0 meta-audit rule fire on
+   corpus health. Tag at mint time; the next cycle counts tags, not prose.
 
 4. **Staleness — spot-check + supersede** (`dream-verify-pick pick 3
    <step-3 docs...>`; stamp each `PASS staleness` after):
@@ -150,7 +180,8 @@ probes, `web` for web-grounded ones.)
      canonical `status: superseded` + `superseded_by: resources/...`
      (root-relative); `mvm index`; **verify the edge resolves**
      (`mvm relations <old-doc> --rel superseded_by` must list the new doc —
-     empty = dangling pointer, fix before moving on). Disconfirmed → transient.
+     empty = dangling pointer, fix before moving on). Disconfirmed → transient
+     tagged **`staleness-disconfirm:`** (mandatory tag — see step 3).
 
 5. **Contested + gaps + cross-contradiction sweep:**
    - `decided_source:"contested"` since last dream → 5 paraphrased web probes;
