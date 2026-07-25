@@ -235,6 +235,24 @@ def check_cold_decayed(root: Path, docs, ever, recent):
                      "the log as much as the docs." % (len(never), len(known)))}
 
 
+# A doc carrying one of these frontmatter `status:` values is RETIRED from the
+# active retrieval surface (points at a canonical replacement or a tombstone).
+# Demanding locked tests for it is exactly the "cost with no retrieval on the
+# other side" anti-pattern this module warns about for `never_retrieved` —
+# verification budget follows LIVE heat, and a superseded duplicate has none.
+# (dream-20260725-0031: a corrected+superseded omen duplicate re-flagged hot
+# forever because supersede alone never cleared it.)
+_RETIRED_STATUS = {"superseded", "archived", "retired", "deprecated"}
+
+
+def _is_retired(root: Path, relpath: str) -> bool:
+    try:
+        text = (root / relpath).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return frontmatter(text).get("status", "").lower() in _RETIRED_STATUS
+
+
 def check_untested_hot(root: Path, ever):
     rows = []
     for path, n in ever.most_common():
@@ -244,13 +262,16 @@ def check_untested_hot(root: Path, ever):
             continue
         if (root / path.replace(".md", ".tests.yaml")).is_file():
             continue
+        if _is_retired(root, path):
+            continue
         rows.append({"path": path, "recalls_ever": n})
     # State what the threshold HIDES. A "0 untested hot docs" headline is only
     # honest next to the count just below the bar — otherwise the threshold is
     # doing the reassuring, not the tree.
     below = sum(1 for p, n in ever.items()
                 if n < HOT_MIN_RECALLS and (root / p).is_file()
-                and not (root / p.replace(".md", ".tests.yaml")).is_file())
+                and not (root / p.replace(".md", ".tests.yaml")).is_file()
+                and not _is_retired(root, p))
     return {"rows": rows,
             "hot_threshold_recalls": HOT_MIN_RECALLS,
             "untested_below_threshold": below,
@@ -470,6 +491,10 @@ def _fixture(tmp: Path):
     doc("resources/hot-tested.md", "title: ht")                             # NOT flagged
     (root / "resources" / "hot-tested.tests.yaml").write_text("cases: []\n")
     doc("resources/hot-untested.md", "title: hu")                           # untested_hot
+    # hot + no tests BUT retired via status -> must NOT be flagged untested_hot
+    doc("resources/hot-superseded.md",
+        "title: hs\nstatus: superseded\n"
+        "superseded_by: resources/hot-tested.md")
     doc("resources/cold-decayed.md", "title: cd")                           # cold_decayed
     doc("resources/never.md", "title: nv")                                  # never-retrieved
     doc("areas/links.md", body="see [ok](../resources/never.md) and "
@@ -499,6 +524,9 @@ def _fixture(tmp: Path):
     for _ in range(2):
         lines.append(json.dumps({"kind": "recall", "ts": fresh,
                                  "evidence_paths": ["resources/hot-tested.md"]}))
+    for _ in range(2):
+        lines.append(json.dumps({"kind": "recall", "ts": fresh,
+                                 "evidence_paths": ["resources/hot-superseded.md"]}))
     lines.append(json.dumps({"kind": "dream-probe", "ts": fresh,
                              "evidence_paths": ["resources/never.md"]}))
     log.write_text("\n".join(lines) + "\n")
@@ -584,6 +612,8 @@ def selftest() -> int:
               "resources/hot-tested.md" not in uh)
         check("untested_hot does NOT flag a cold untested doc",
               "resources/never.md" not in uh)
+        check("untested_hot does NOT flag a hot doc RETIRED via status: superseded",
+              "resources/hot-superseded.md" not in uh)
 
         bl = {(r["path"], r["link"]) for r in c["broken_links"]["rows"]}
         check("broken_links finds the dead relative link",
