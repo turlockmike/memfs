@@ -409,10 +409,19 @@ def verify_test_retry(
 
 def main(argv = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Cold-clone verify a markdown doc against locked Q/A tests."
+        description="Cold-clone verify a markdown doc against locked Q/A tests.",
+        epilog=(
+            "INCREMENTAL EDIT? verify the DELTA, not the whole suite. A whole-doc "
+            "run executes every locked probe SEQUENTIALLY (~20-30s/probe on haiku), "
+            "so a ~12-probe doc exceeds a `timeout 300` wrapper and SIGTERMs mid-run "
+            "(exit 143) leaving results 'pending'. For an appended/changed probe on "
+            "an immutable-prefix .tests.yaml: run `--test-id <new>` per changed id, "
+            "and a git PURE-APPEND diff proves the untouched immutable ids cannot "
+            "regress. Re-run the whole doc only after a structural body change."
+        ),
     )
     parser.add_argument("doc", type=Path, help="Path to the markdown doc.")
-    parser.add_argument("--test-id", type=str, help="Run only the test with this id (matches int or string ids).")
+    parser.add_argument("--test-id", type=str, help="Run only the test with this id (matches int or string ids). Use for incremental-edit verification — see epilog.")
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
