@@ -20,6 +20,16 @@ files.mtime manifest (max of .md and its .tests.yaml), touches only the
 delta. A zero-delta run never loads the embedding model — sub-second,
 ~30MB RSS, vs ~10min/2.5GB for a full re-embed (the OOM-storm suspect
 that motivated this).
+
+MIRROR-LAG FOOTGUN (2026-07-24): the indexer walks ~/mvm/knowledge/, but
+docs are authored in ~/resources/ and propagated by the mvm-mirror cron
+(*/5). If you edit a ~/resources/ doc and immediately `mvm index`, the
+knowledge copy is still stale, so incremental CORRECTLY reports "up to
+date" and your edit stays unsearchable — the mtime detection is not
+broken, the mirror just hasn't run. `--full` appears to "fix" it only
+because minutes have passed and the mirror caught up. Correct reflex after
+editing a ~/resources/ doc: run `mvm-mirror` first (or wait for the cron),
+THEN `mvm index` — no --full needed.
 """
 from __future__ import annotations
 
@@ -518,7 +528,18 @@ def regenerate_folder_indexes(root: Path) -> int:
 
 
 def main(argv = None) -> int:
-    parser = argparse.ArgumentParser(description="Build the mvm graph + FTS index.")
+    parser = argparse.ArgumentParser(
+        description="Build the mvm graph + FTS index.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "MIRROR-LAG REFLEX (2026-07-24): the indexer walks ~/mvm/knowledge/, "
+            "not ~/resources/. If you just edited a ~/resources/ doc and index reports "
+            "'up to date', the edit hasn't mirrored yet (mvm-mirror runs */5) — "
+            "incremental is CORRECT, not broken. Run `mvm-mirror` first, THEN `mvm index`. "
+            "Do NOT reach for --full to force it (that only 'works' because time passed "
+            "and the mirror caught up; it also triggers a ~10min/2.5GB full re-embed)."
+        ),
+    )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                         help=f"Knowledge root (default: {DEFAULT_ROOT}).")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE,
