@@ -230,8 +230,9 @@ probes, `web` for web-grounded ones.)
    `:PENDING` markers) FIRST, then report/journal/trace.**
    **PENDING CARRY CONTRACT (2026-07-17, auditor #88 F1): every `:PENDING`
    from the PREVIOUS pass must be CLOSED or EXPLICITLY CARRIED by this pass —
-   step 0 of every cycle greps the latest prior entry (`dream-log` tail) for
-   `PENDING`, and each hit ends this cycle in exactly one of two states:
+   step 0 of every cycle runs **`dream-pending-carry`** (rc=0 nothing owed ·
+   rc=1 REAL/AMBIGUOUS markers owe a disposition · rc=2 instrument failure),
+   and each REAL hit ends this cycle in exactly one of two states:
    (a) CLOSED — verdict recorded via `dream-log-amend` on the ORIGINAL entry,
    or (b) CARRIED — named in THIS cycle's entry with an explicit reason why
    the verify is still outstanding. Silent outcomes are the failure class this
@@ -240,6 +241,17 @@ probes, `web` for web-grounded ones.)
    breach-tablet swap — 4 of 5 PENDINGs closed, the 5th replaced with no
    disposition). PENDINGs rot invisibly because nothing re-surfaces them; this
    contract makes pass N+1 the re-surfacer.**
+   ⚠ **Do NOT hand-grep for `PENDING` — the prose remedy is SELF-WORSENING and
+   that is exactly why the tool exists (2026-07-25).** The moment a cycle writes
+   its verdict ("PENDING-carry: 0 real action-level markers") into `meta_audit`,
+   that sentence BECOMES the next cycle's grep hit. Measured: all 6 prior entries
+   carry 2–4 raw hits and the last 3 cycles each burned model tokens re-deriving
+   the identical negative. `dream-pending-carry` classifies REAL (item-attached
+   marker, or any attached marker in `actions.*`) vs META (carry-contract
+   discourse) vs AMBIGUOUS (fail-closed → rc=1, surfaced for judgment), so the
+   enumeration is deterministic and only genuine dispositions cost tokens.
+   Selftest 9/9 incl. verbatim repros of the 0300 + 0647 entries. Enumeration is
+   the tool's job; judgment is yours.
    The CLI **enforces the schema**
    (canonical `actions` keys, dict-typed `phase_2_meta_review`, inline —
    never pointer — `mistakes_2plus_30d_assessment`, single-object JSON,
