@@ -176,38 +176,95 @@ def vec_search(index_db: Path, query: str, kind: str | None, in_prefix: str | No
     return [(p, s / max_s) for p, s in sims]
 
 
+def fts_tokens(query: str) -> list[str]:
+    """Split a natural-language query into FTS5-safe bare tokens.
+
+    FTS5's MATCH grammar treats `,` `.` `(` `)` `:` `-` `*` `"` as OPERATORS, so
+    ANY sentence-shaped query raises `fts5: syntax error near ","` -- which the
+    old handler swallowed into an empty result, indistinguishable from "the
+    keyword signal legitimately found nothing". Measured 2026-07-26 over the
+    1,959 real questions in `state/recall-log.jsonl`: **90.1% raised a syntax
+    error**, so `text_rank` fell through to the vector-only `sem` branch and the
+    advertised hybrid retriever was keyword-blind for nine of every ten real
+    queries, silently, since the 2026-07-01 cutover.
+
+    Keeping only alphanumerics is deliberate over escaping: it cannot construct
+    a token FTS5 reads as punctuation-syntax, so that failure mode is closed by
+    construction rather than by a blacklist the next punctuation mark escapes.
+
+    Stripping alone is NOT sufficient, and this test caught it: a surviving bare
+    word can still BE an operator -- `AND` `OR` `NOT` `NEAR` are FTS5 keywords
+    (uppercase only), so the legitimate question "Kalshi AND WTI ladder" still
+    raised a syntax error after sanitization. Callers therefore quote every
+    token as an FTS5 string literal; with all non-alphanumerics already gone
+    there is no embedded quote to escape, so quoting is total.
+    """
+    toks = []
+    for raw in query.split():
+        t = "".join(ch for ch in raw if ch.isalnum())
+        if t:
+            toks.append(t)
+    return toks
+
+
+def fts_expr(toks: list[str], op: str) -> str:
+    """Join sanitized tokens into an FTS5 expression, each quoted as a literal."""
+    return f" {op} ".join(f'"{t}"' for t in toks)
+
+
 def fts_search(index_db: Path, query: str, kind: str | None, in_prefix: str | None,
                limit: int = 50) -> list[tuple[str, float]]:
     """FTS5 BM25 fallback. Returns [(path, normalized_score)] descending."""
     if not index_db.exists():
         return []
+    toks = fts_tokens(query)
+    if not toks:
+        return []
     conn = sqlite3.connect(index_db)
     cur = conn.cursor()
-    fts_query = " ".join(query.split())
-    # Strip apostrophes / quotes which break FTS5 syntax
-    fts_query = fts_query.replace("'", "").replace('"', "")
     sql = (
         "SELECT files_fts.path, bm25(files_fts) AS score "
         "FROM files_fts JOIN files ON files.path = files_fts.path "
         "WHERE files_fts MATCH ?"
     )
-    params: list = [fts_query]
+    tail = ""
+    extra: list = []
     if kind:
-        sql += " AND files.kind = ?"
-        params.append(kind)
+        tail += " AND files.kind = ?"
+        extra.append(kind)
     if in_prefix:
-        sql += " AND files.path LIKE ?"
-        params.append(f"{in_prefix.rstrip('/')}%")
-    sql += " ORDER BY score LIMIT ?"
-    params.append(limit)
-    try:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-    except sqlite3.OperationalError as e:
-        conn.close()
-        if "no such" in str(e).lower() or "syntax" in str(e).lower():
-            return []
-        raise
+        tail += " AND files.path LIKE ?"
+        extra.append(f"{in_prefix.rstrip('/')}%")
+    tail += " ORDER BY score LIMIT ?"
+
+    # AND-of-all-terms first (precise), OR as a fallback ONLY when AND is empty.
+    # Strictly additive: every query the conjunction already answered keeps its
+    # exact prior ranking, and the disjunction runs solely where the keyword
+    # signal was otherwise contributing nothing. Measured on the same 1,959
+    # questions: of the 193 that were syntactically legal, 48 (24.9%) still
+    # returned zero rows because one rare term vetoed the whole conjunction.
+    rows = []
+    for expr in (fts_expr(toks, "AND"), fts_expr(toks, "OR")):
+        try:
+            cur.execute(sql + tail, [expr] + extra + [limit])
+            rows = cur.fetchall()
+        except sqlite3.OperationalError as e:
+            # Sanitization above makes this unreachable for syntax; if it fires
+            # anyway the keyword half is DEAD and must say so out loud rather
+            # than pose as an empty result set.
+            if "syntax" in str(e).lower():
+                print(f"mvm-search: FTS5 rejected sanitized query {expr!r}: {e}",
+                      file=sys.stderr)
+                rows = []
+            elif "no such" in str(e).lower():
+                rows = []
+            else:
+                conn.close()
+                raise
+        if rows:
+            break
+        if len(toks) == 1:
+            break
     conn.close()
     if not rows:
         return []
@@ -246,7 +303,7 @@ def rrf_fuse(vec_results: list[tuple[str, float]], fts_results: list[tuple[str, 
 
 
 def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | None,
-              limit: int = 50) -> tuple[list[tuple[str, float]], str]:
+              limit: int = 50, root: Path | None = None) -> tuple[list[tuple[str, float]], str]:
     """Text-signal ranking. Returns (results, retriever_label).
 
     Default (MVM_HYBRID=1) → RRF fusion of vector + FTS ("hybrid").
@@ -254,16 +311,25 @@ def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | Non
                              empty-fallback. Kill switch for the 2026-07-01
                              cutover (frozen eval: test/eval_crossdomain.py).
     """
+    root = root or DEFAULT_ROOT
     hybrid = os.environ.get("MVM_HYBRID", "1") == "1"
     if hybrid:
         vec = vec_search(index_db, query, kind, in_prefix, limit=limit)
         fts = fts_search(index_db, query, kind, in_prefix, limit=limit)
-        # Navigation files (index.md / auto-generated INDEX.md) are keyword
+        # Navigation files (auto-generated INDEX.md / index.md) are keyword
         # bags — BM25 ranks them above the content they merely list, whenever
         # they match at all (eval 2026-07-01: PC1/PC2 regression). Drop them
         # from the FTS vote only; they stay reachable via the vector signal,
         # which is exactly how the legacy path ranked them.
-        fts = [(p, s) for p, s in fts if Path(p).name not in ("index.md", "INDEX.md")]
+        #
+        # Uses the SAME anchored predicate as the scoring-stage demote, which
+        # this line used to disagree with: a filename-only test also dropped
+        # HAND-AUTHORED navigation docs that carry real routing knowledge.
+        # Measured 2026-07-26: 9 such docs, including `resources/index.md` (the
+        # root routing table) and `areas/index.md`, were being denied a keyword
+        # vote while `is_autogen_index` correctly spared them. Two definitions
+        # of "index node" in one file is the drift; one predicate is the fix.
+        fts = [(p, s) for p, s in fts if not is_autogen_index(root, p)]
         if vec and fts:
             return rrf_fuse(vec, fts), "hybrid"
         if vec:
@@ -313,7 +379,8 @@ def main(argv = None) -> int:
     graph_db = args.state / "graph.db"
 
     # Text signal: hybrid RRF fusion when MVM_HYBRID=1, else legacy vec-then-fts.
-    text_results, retriever = text_rank(index_db, args.query, args.kind, args.in_prefix, limit=50)
+    text_results, retriever = text_rank(index_db, args.query, args.kind, args.in_prefix,
+                                        limit=50, root=args.root)
     if not text_results:
         if args.json:
             print(json.dumps({"query": args.query, "results": []}))
