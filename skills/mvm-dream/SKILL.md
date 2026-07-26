@@ -202,6 +202,24 @@ probes, `web` for web-grounded ones.)
      tagged **`staleness-disconfirm:`** (mandatory tag — see step 3).
 
 5. **Contested + gaps + cross-contradiction sweep:**
+   ⚠ **EVERY cold clone spawned in THIS step gets a `recall-log add` append, same
+   as steps 3 and 4 — this step used to be silent about it and that gap bites
+   (2026-07-26).** Steps 3/4 each say "log probe"; step 5 spawned clones and said
+   nothing, so a cycle that reached 5(b) without touching 3/4's clone paths ended
+   with **zero** appends and tripped the fail-closed RECALL-LOG ENFORCER at Stop.
+   The consequence is not cosmetic: `pretool-curated-write-gate` uses that ledger
+   as its **only** evidence source, so an unlogged probe **blocks the next
+   legitimate curated write**. Use an explicit `"kind":"dream-probe"` — the CLI's
+   `infer_kind()` only maps the literal hints `dream-quality-verify` /
+   `dream-staleness-verify` to `dream-probe`, so a step-5 hint like
+   `dream-tension-discovery/...` would otherwise be counted as a **real recall**
+   and inflate `mvm stats` (explicit `kind` wins over inference):
+   ```bash
+   echo '{"kind":"dream-probe","question":"<the probing question>",
+    "topic_hint":"dream-tension-discovery/<topic>","decided_source":"kb",
+    "decided_answer":"<answer> — <doc>, contradiction|dissolved",
+    "evidence_paths":["<doc>"]}' | recall-log add
+   ```
    - `decided_source:"contested"` since last dream → 5 paraphrased web probes;
      convergence → ingest consensus; still split → escalate.
    - `decided_source:"none"` (hard misses) → propose as curriculum items.
@@ -219,6 +237,19 @@ probes, `web` for web-grounded ones.)
      ask both docs the same probing question via 2 cold-clones; contradiction →
      flag both `status: cross-contested` + reciprocal `in_tension_with:` edges
      (root-relative), `mvm index`, surface to user.
+     ⚠ **VERSION-SPANNING PAIRS ARE THE DOMINANT FIRE CLASS AND ARE NOT TENSIONS**
+     (measured on the gate's first live rotation, 2026-07-26). The very first fire
+     paired `poe2/0.5/crafting/jewellery-quality-system.md` with
+     `poe2/0.4/mechanics/quality.md`; the clones returned **different numbers**
+     (0.4: max amulet quality 30% · 0.5: 20% base + 20 Essence + 10 Vaal Infuser
+     = 50%) and it **dissolved**, because both docs are version-scoped in their
+     path AND self-declare their patch in the answer. **Discriminator before
+     flagging anything: do the two docs cover DIFFERENT VERSIONS and each say so?
+     Then it is correct versioning — no `cross-contested`, no edge.** Only a
+     disagreement *within the same declared version* is a real tension. The live
+     hazard from such a pair is retrieval-side, not doc-side (a version-less query
+     can land on the older doc), so it belongs in `gaps_surfaced`, never in
+     `contested_resolved`.
      ⚠ **Do NOT gate on `score` (2026-07-26 — the previous rule was UNREACHABLE).**
      The old trigger read "top-2 similarity > 0.7" against `score`, but `score` =
      `0.6*text + 0.25*graph + 0.15*hier` where `text` is **min-max normalized so
