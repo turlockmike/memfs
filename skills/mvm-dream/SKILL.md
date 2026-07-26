@@ -100,7 +100,25 @@ probes, `web` for web-grounded ones.)
 2. **Coverage — proactive ingest** (max 3/cycle): for each top-fallback topic,
    find the most-frequent web URL among `kind=recall` ledger entries; spawn
    `/mvm-ingest <URL>` in background.
-   **Stale-ledger pre-check (run FIRST, before the predictability gate):** the
+   **RUN `dream-coverage-triage` FIRST — it decides which topics even reach the
+   two gates below** (shipped 2026-07-25; selftest 15/15). rc=0 = every fallback
+   topic was already adjudicated on THIS SAME evidence ⇒ **step 2 is done, spend
+   zero judgment**; rc=1 = at least one topic NEEDS-JUDGMENT ⇒ apply the gates
+   below to those topics only; rc=2 = instrument failure (never read as
+   all-clear). After ruling on a NEW topic, persist it:
+   `dream-coverage-triage record <topic> <skip|ingest> --reason R --doc <covering-doc>`.
+   **Why it exists (measured):** `kalshi/earning-lane/data-availability` is ONE
+   recall row (2026-07-21T16:22) that cost a full model judgment in SIX separate
+   cycles (dream-20260721-1850 → dream-20260725-1241), each re-deriving the same
+   SKIP, with ~18 more owed before it aged out of the 7d window. Enumeration is
+   deterministic; judgment is not — same split as `mvm sweep` (step 0.5) and
+   `dream-pending-carry` (step 6). It is **fail-open toward judgment**: a topic
+   re-surfaces as NEW whenever the evidence changes (new fallback rows —
+   recurrence is exactly when predictability flips toward ingest), the
+   adjudication expires (>30d), or the covering doc goes missing/superseded. An
+   adjudication can only ever suppress the identical question on identical
+   evidence, so it can never hide a growing gap.
+   **Stale-ledger pre-check (the judgment applied to NEW topics):** the
    recall ledger is append-only, so a count-1 fallback often PREDATES a doc that
    has since shipped — the topic is already covered and the fallback is a ledger
    artifact, not a gap. Before treating any fallback as a gap, `mvm search` the
@@ -197,10 +215,26 @@ probes, `web` for web-grounded ones.)
      (one cold-clone each). Now agree → remove `in_tension_with:` from both +
      re-index. Still contradict → leave the durable edge.
    - **(b) Discover new tensions:** `mvm search "<random recent-canonical
-     keyword>" --top-k 3`; if top-2 similarity > 0.7, ask both docs the same
-     probing question via 2 cold-clones; contradiction → flag both
-     `status: cross-contested` + reciprocal `in_tension_with:` edges
+     keyword>" --top-k 3 --json`; if the **#2 result's `components.text` ≥ 0.98**,
+     ask both docs the same probing question via 2 cold-clones; contradiction →
+     flag both `status: cross-contested` + reciprocal `in_tension_with:` edges
      (root-relative), `mvm index`, surface to user.
+     ⚠ **Do NOT gate on `score` (2026-07-26 — the previous rule was UNREACHABLE).**
+     The old trigger read "top-2 similarity > 0.7" against `score`, but `score` =
+     `0.6*text + 0.25*graph + 0.15*hier` where `text` is **min-max normalized so
+     rank-1 is ALWAYS exactly 1.0**, and graph/hier are **always 0 unless `--near`
+     is passed** (step 5b never passes it). So the ceiling for ANY query here is
+     **0.600** — measured identical across 6 unrelated queries spanning poe2 /
+     kalshi / french / finances. `>0.7` could never fire, so tension-DISCOVERY was
+     structurally inert for its entire life and every "no new tensions" it reported
+     was a **vacuous negative**, not evidence of a clean corpus. Gate on the
+     normalized `text` component of rank-2 instead: it measures what the rule
+     actually wants (is #2 nearly as good a match as #1 ⇒ near-duplicate pair worth
+     probing for contradiction) and is reachable — observed rank-2 `text` spread on
+     that same 6-query sample was 0.947–0.995, so 0.98 selects the genuinely tight
+     pairs. **Lesson (gate #20 class): a threshold is only a test if some real input
+     can cross it — check reachability against the metric's actual range before
+     trusting a negative.**
 
 6. **Log cycle — compose the entry as a Python dict, `json.dumps`, then
    append via `dream-log-append "$LINE"`.** **RECEIPTS-FIRST (added 2026-06-11):
