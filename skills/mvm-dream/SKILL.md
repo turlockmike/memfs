@@ -233,10 +233,29 @@ probes, `web` for web-grounded ones.)
      (one cold-clone each). Now agree → remove `in_tension_with:` from both +
      re-index. Still contradict → leave the durable edge.
    - **(b) Discover new tensions:** `mvm search "<random recent-canonical
-     keyword>" --top-k 3 --json`; if the **#2 result's `components.text` ≥ 0.98**,
-     ask both docs the same probing question via 2 cold-clones; contradiction →
-     flag both `status: cross-contested` + reciprocal `in_tension_with:` edges
-     (root-relative), `mvm index`, surface to user.
+     keyword>" --top-k 3 --json`, then apply the **STRUCTURAL pair test** below to
+     results #1 and #2. If it passes, ask both docs the same probing question via
+     2 cold-clones; contradiction → flag both `status: cross-contested` +
+     reciprocal `in_tension_with:` edges (root-relative), `mvm index`, surface.
+     **The pair test — ALL FOUR must hold (no similarity number anywhere):**
+     1. **Same `kind`** (`metadata.kind` in the JSON) — a `recipe` and a `decision`
+        cannot contradict; they answer different questions.
+     2. **Same declared version, or both version-less.** A `0.4` doc and a `0.5`
+        doc disagreeing is correct versioning, not tension — this was the dominant
+        historical fire class (see below), so it is now a PRECONDITION, not an
+        after-the-fact discriminator.
+     3. **≥2 shared significant title terms** (ignore stop-words + `index`/`notes`).
+        Cheap proxy for "these make claims about the same subject."
+     4. **Neither doc is an AGGREGATOR** — ⛔ skip any path under `areas/` matching
+        `backlog|research-queue|dashboard`, or any file >40 KB. Grab-bag files pair
+        with everything (measured: `research-queue-cold.md` ↔ `backlog.md` = **0.9805**
+        cosine, *higher* than a real near-dup pair) and they are the single largest
+        source of false fires.
+     **Done-test for this rung (grade it on the next live rotation, do not assume):**
+     the pair `areas/research-queue-cold.md` + `areas/backlog.md` must be REJECTED
+     (rule 4), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
+     `poe2/0.4/mechanics/quality.md` must ALSO be rejected (rule 2 — different
+     declared versions). If a rotation reports a fire, record which rule admitted it.
      ⚠ **VERSION-SPANNING PAIRS ARE THE DOMINANT FIRE CLASS AND ARE NOT TENSIONS**
      (measured on the gate's first live rotation, 2026-07-26). The very first fire
      paired `poe2/0.5/crafting/jewellery-quality-system.md` with
@@ -266,6 +285,22 @@ probes, `web` for web-grounded ones.)
      pairs. **Lesson (gate #20 class): a threshold is only a test if some real input
      can cross it — check reachability against the metric's actual range before
      trusting a negative.**
+     ⚠ **ALL THREE SIMILARITY PROXIES ARE NOW DEAD — do NOT propose a fourth number
+     (2026-07-26 reflect, measured).** (1) `score > 0.7` was **unreachable** (ceiling
+     0.600). (2) rank-2 `components.text ≥ 0.98` is **content-blind**: RRF is
+     rank-based then max-normalized, so the value is a ratio of rank-reciprocals —
+     measured over 11 queries, the value **0.9841 occurs on three of them**
+     (`catalyst quality amulet`, `budget monarch categories`, `french lesson
+     subjunctive`), reported as IDENTICAL while their absolute cosines spread
+     0.7820 / 0.6425 / 0.6855. (3) **doc↔doc absolute cosine** (`mvm doc-sim`, built
+     and graded this cycle) is **INVERTED on the falsifier**: the FALSE pair scores
+     **0.9805** against the TRUE near-dup pair's **0.9367**, versus a random-pair
+     null of p50 0.642 / max 0.810 (n=210) — so no threshold separates them.
+     **Root cause shared by all three: TENSION IS A RELATION BETWEEN CLAIMS, and no
+     aggregate over a whole document carries claim structure.** A whole-doc embedding
+     of a grab-bag file encodes genre and voice, not subject — *a document about one
+     thing embeds its subject; a document about forty things embeds its author.*
+     That is why the structural test above uses zero similarity scores.
 
 6. **Log cycle — compose the entry as a Python dict, `json.dumps`, then
    append via `dream-log-append "$LINE"`.** **RECEIPTS-FIRST (added 2026-06-11):
