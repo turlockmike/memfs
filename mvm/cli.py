@@ -15,6 +15,7 @@ SUBCOMMANDS = {
     "watch": "mvm.watch",
     "backlinks": "mvm.backlinks",
     "relations": "mvm.relations",
+    "doc-sim": "mvm.docsim",
     "log": "mvm.log",
     "linkfix": "mvm.linkfix",
 }
@@ -36,6 +37,7 @@ Subcommands:
   watch     Daemon: passively embed new/changed docs after a debounce window
   backlinks List files that link TO a given path (used by /mvm-ingest cascade)
   relations Show a doc's typed semantic relation neighborhood (superseded_by, ...)
+  doc-sim   Absolute cosine between two indexed docs (doc↔doc; --calibrate first)
   log       Show recall-log or dream-log entries
   linkfix   Repair relative .md links whose target exists elsewhere in the tree
 

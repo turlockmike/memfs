@@ -126,8 +126,16 @@ def graph_distances(graph_db: Path, seed: str, max_depth: int = 4) -> dict[str, 
 
 
 def vec_search(index_db: Path, query: str, kind: str | None, in_prefix: str | None,
-               limit: int = 50) -> list[tuple[str, float]]:
+               limit: int = 50, cos_out: dict[str, float] | None = None) -> list[tuple[str, float]]:
     """Vector cosine search via sqlite-vec. Returns [(path, normalized_score)] desc.
+
+    `cos_out`, when given, is filled with {path: ABSOLUTE cosine} — the one
+    signal in this file that survives no normalization. It is an OUT-param and
+    never affects ordering; the return value is byte-identical with or without
+    it. It exists because every score this module publishes is max-normalized,
+    so `mvm search --json` could report NO absolute match quality anywhere, and
+    a consumer that needs "is this pair actually similar?" (see /dream's
+    tension gate) was forced to threshold a ratio of rank-reciprocals instead.
 
     ⚠ `limit` is CLAMPED to VEC_K_MAX (4096). sqlite-vec rejects a knn `k` above
     that with `OperationalError: k value in knn query too large`, and the
@@ -196,8 +204,23 @@ def vec_search(index_db: Path, query: str, kind: str | None, in_prefix: str | No
     conn.close()
     if not rows:
         return []
-    # vec0 distance is L2 on normalized vectors; convert to similarity ~ 1 - d/2
+    # vec0 `distance` is PLAIN L2 (not squared) over UNIT vectors — verified
+    # 2026-07-26 against a numpy oracle on live rows: stored norms are exactly
+    # 1.000000, and 1 - d*d/2 reproduced numpy's cosine to 6 decimals while the
+    # legacy 1 - d/2 did not (d=0.4646 → true cos 0.8921, legacy 0.7677).
+    #
+    # ⚠ THE LEGACY TRANSFORM BELOW IS DELIBERATELY LEFT UNCHANGED. It is
+    # monotone decreasing in d, so ordering — and therefore every ranking this
+    # module has ever produced — is identical either way; it is a DISPLAY scale
+    # that has been mis-labelled "cosine", not a ranking bug. Correcting it in
+    # place would silently move published `components.text` values on the
+    # non-hybrid path for zero ranking gain, so the honest fix is to stop the
+    # NAME from over-claiming and to carry the real quantity on its own channel.
     sims = [(p, max(0.0, 1.0 - d / 2.0)) for p, d in rows]
+    if cos_out is not None:
+        # True cosine, absolute and un-normalized: cos = 1 - L2^2/2 for unit vectors.
+        for p, d in rows:
+            cos_out[p] = max(-1.0, min(1.0, 1.0 - (d * d) / 2.0))
     max_s = max(s for _, s in sims) or 1.0
     return [(p, s / max_s) for p, s in sims]
 
@@ -419,8 +442,15 @@ def rrf_fuse(vec_results: list[tuple[str, float]], fts_results: list[tuple[str, 
 
 
 def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | None,
-              limit: int = 50, root: Path | None = None) -> tuple[list[tuple[str, float]], str]:
+              limit: int = 50, root: Path | None = None,
+              cos_out: dict[str, float] | None = None) -> tuple[list[tuple[str, float]], str]:
     """Text-signal ranking. Returns (results, retriever_label).
+
+    `cos_out` is a pass-through OUT-param (see vec_search): absolute cosine per
+    path, ordering-neutral. A path absent from it was never returned by the
+    vector leg at all — that absence is itself the signal, and it must NOT be
+    read as cosine 0.0 (an FTS-only hit and a genuinely orthogonal doc are
+    different facts).
 
     Default (MVM_HYBRID=1) → RRF fusion of vector + FTS ("hybrid").
     MVM_HYBRID=0           → legacy path: vector first, FTS only as
@@ -434,7 +464,8 @@ def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | Non
         # caller's limit ⇒ identity). Held separate from `limit` on purpose:
         # the FTS leg is a keyword corroborator whose tail is keyword-bag noise,
         # so widening BOTH legs would confound the lever being measured.
-        vec = vec_search(index_db, query, kind, in_prefix, limit=max(limit, VEC_POOL))
+        vec = vec_search(index_db, query, kind, in_prefix, limit=max(limit, VEC_POOL),
+                         cos_out=cos_out)
         fts = fts_search(index_db, query, kind, in_prefix, limit=limit)
         # Navigation files (auto-generated INDEX.md / index.md) are keyword
         # bags — BM25 ranks them above the content they merely list, whenever
@@ -455,7 +486,7 @@ def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | Non
         if vec:
             return vec, "sem"
         return fts, "fts"
-    results = vec_search(index_db, query, kind, in_prefix, limit=limit)
+    results = vec_search(index_db, query, kind, in_prefix, limit=limit, cos_out=cos_out)
     if results:
         return results, "sem"
     return fts_search(index_db, query, kind, in_prefix, limit=limit), "fts"
@@ -499,8 +530,9 @@ def main(argv = None) -> int:
     graph_db = args.state / "graph.db"
 
     # Text signal: hybrid RRF fusion when MVM_HYBRID=1, else legacy vec-then-fts.
+    abs_cos: dict[str, float] = {}
     text_results, retriever = text_rank(index_db, args.query, args.kind, args.in_prefix,
-                                        limit=50, root=args.root)
+                                        limit=50, root=args.root, cos_out=abs_cos)
     if not text_results:
         if args.json:
             print(json.dumps({"query": args.query, "results": []}))
@@ -526,8 +558,14 @@ def main(argv = None) -> int:
         demoted = is_autogen_index(args.root, path)
         if demoted:
             total *= W_INDEX_DEMOTE
+        # `cos` is the ONLY absolute quantity published here: true cosine in
+        # [-1,1], never max-normalized, never rank-derived. `null` means the
+        # vector leg did not return this path (FTS-only hit) — that is "unknown",
+        # NOT "dissimilar", and a consumer that collapses the two is measuring
+        # pool membership while calling it similarity.
         scored.append((path, total, {
             "text": round(text_score, 4),
+            "cos": (round(abs_cos[path], 4) if path in abs_cos else None),
             "graph": round(graph_score, 4),
             "hier": round(hier_score, 4),
             "graph_dist": gd,
