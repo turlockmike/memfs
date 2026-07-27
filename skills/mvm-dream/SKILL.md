@@ -151,16 +151,42 @@ probes, `web` for web-grounded ones.)
      re-run the injected-verify gate. Extend the ban-list by adding rows to
      `canonical/catalysts.md` § "Confirmed PoE1-only" (the tool parses it live).
    **ALWAYS pass `--test-id` (ONE test); never run bare `mvm verify <doc>`
-   (full suite) — full-suite reliably TIMES OUT @200s on large docs
+   (full suite) — full-suite reliably TIMES OUT on large docs
    (poe2-crafting-codex, 0.5.0-patch-notes burned ~10min for 0 verdicts,
    dream-20260614-0431), and a timeout judges nothing → counts only as a
-   `transients` probe-noise entry, not signal. One id = one cheap verdict.
+   `transients` probe-noise entry, not signal.
+   ⚠ **"One id = one cheap verdict" is TRUE ON AVERAGE and FALSE IN THE TAIL —
+   budget for the tail (2026-07-27, measured).** One test id costs
+   `(retries+1) * 2 subprocesses * MVM_VERIFY_TIMEOUT` = **3 × 2 × 120 = 720 s
+   worst case**, because every attempt spawns a retriever AND a grader, and a
+   FAILing test burns all 3 attempts. A probe that PASSES on attempt 1 finishes
+   in **~50–75 s**; one that fails into retries blows past 200 s. **So wrap
+   single-id probes in `timeout 900`, never `timeout 200`.** The old 200 s
+   wrapper straddled exactly that boundary, which is why the resulting deaths
+   were intermittent and famously "did not reproduce" on retry.
+   **This one wrong number produced 9 of the last 10 cycles' `probe-noise`
+   transients** — a 9:1 ratio against 1 real `quality_repair`, which tripped the
+   step-0 "infrastructure degrading" rule every cycle while the retriever was
+   healthy the whole time. `mvm verify` now self-reports the bound: ask it with
+   `worst_case_wall_s` in any kill record, and do not re-derive it by hand.
    Log probe; stamp `dream-verify-pick record <doc> <PASS|FAIL> quality`.
    - Engine PASS → done.
    - Engine FAIL with an `error` field / retry-exhausted EMPTY stdout →
      classify as `transients` tagged **`probe-noise:`** (the retriever/CLI
      failed, the doc was never judged), NEVER a content defect or quality repair
      (auditor sign-off dream-20260610-0100, point 4).
+   - ⛔ **`error: killed_by_signal` (rc=124/143) is NOT probe-noise — it is a
+     CALLER-SIDE budget bug and it is YOURS to fix, not to log.** Since
+     2026-07-27 `mvm verify` installs SIGTERM/SIGINT/SIGHUP handlers that emit a
+     structured record (`judged:false`, `signal`, `elapsed_s`,
+     `worst_case_wall_s`, `hint`) on stdout in `--json` mode plus a human line on
+     stderr — so a killed probe can never again be silent. **Re-run it with a
+     budget above the reported `worst_case_wall_s`; only file a transient if it
+     dies for some OTHER reason.** Before that fix a SIGTERM produced **0 B on
+     stdout AND 0 B on stderr**, which is indistinguishable from a crash, an OOM
+     kill, or a hang — that ambiguity is what caused the misfiling. If you ever
+     again see a genuinely empty 0 B/0 B result, that means the handlers were
+     bypassed (SIGKILL, e.g. a real OOM) — check `oom-forensics`, do not assume.
    - Engine FAIL → cross-check with ONE orchestrator-graded cold-clone
      (inject doc, grade per doctrine: lenient on phrasing/enumeration
      completeness, strict on facts — the engine grader is measurably
