@@ -127,9 +127,27 @@ def graph_distances(graph_db: Path, seed: str, max_depth: int = 4) -> dict[str, 
 
 def vec_search(index_db: Path, query: str, kind: str | None, in_prefix: str | None,
                limit: int = 50) -> list[tuple[str, float]]:
-    """Vector cosine search via sqlite-vec. Returns [(path, normalized_score)] desc."""
+    """Vector cosine search via sqlite-vec. Returns [(path, normalized_score)] desc.
+
+    ⚠ `limit` is CLAMPED to VEC_K_MAX (4096). sqlite-vec rejects a knn `k` above
+    that with `OperationalError: k value in knn query too large`, and the
+    OperationalError handler below turns ANY query failure into `rows = []` —
+    which `text_rank` cannot distinguish from "the vector leg legitimately
+    matched nothing", so it silently degrades to an FTS-only retriever.
+    Measured 2026-07-26: k=4823 returned 0 docs while k=4000 returned 4000, with
+    nothing on any channel saying why. That is gate #47 again — the return value
+    asserts a fact about the CORPUS while reporting an event in the QUERY.
+    Unreachable before MVM_VEC_POOL existed (`limit` was hardcoded 50 at both
+    call sites); adding the knob made it reachable, so it is clamped and loud
+    here rather than left as a trap for whoever tunes the pool next.
+    """
     if not index_db.exists():
         return []
+    if limit > VEC_K_MAX:
+        print(f"mvm: vec pool {limit} exceeds sqlite-vec's k limit "
+              f"{VEC_K_MAX}; clamping (the vector leg stays alive)",
+              file=sys.stderr)
+        limit = VEC_K_MAX
     conn = sqlite3.connect(index_db)
     conn.enable_load_extension(True)
     try:
@@ -165,7 +183,15 @@ def vec_search(index_db: Path, query: str, kind: str | None, in_prefix: str | No
     try:
         cur.execute(sql, params)
         rows = cur.fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        # NEVER silently: an empty `rows` here becomes "the vector leg found
+        # nothing" one frame up, and text_rank then serves an FTS-only ranking
+        # under the label "hybrid". Degrading is acceptable; degrading quietly
+        # is how a retriever loses a whole leg for weeks without a single line
+        # of evidence anywhere.
+        print(f"mvm: vector leg FAILED ({e}) — ranking with the keyword leg "
+              f"ONLY; this is a degraded retrieval, not an empty corpus",
+              file=sys.stderr)
         rows = []
     conn.close()
     if not rows:
@@ -279,6 +305,56 @@ RRF_K = int(os.environ.get("MVM_RRF_K", "60"))
 # Satisfiable interval from the frozen probes: (~0.2, ~0.75); 0.5 = midpoint.
 RRF_W_FTS = float(os.environ.get("MVM_RRF_W_FTS", "0.5"))
 
+# Vector-leg candidate pool. Distinct lever from k/w_fts (both dead, see
+# rrf_fuse): k and w_fts move the head-to-head between two docs BOTH legs
+# already returned; VEC_POOL changes WHICH docs the vector leg returns at all.
+# The arithmetic that motivates it: an FTS-rank-1 doc contributes
+# 0.5/(60+1)=0.00820 == a vec-rank-61 contribution, into a 50-doc vector pool —
+# so a doc that is the single best exact-keyword match but absent from vec
+# top-50 cannot outrank ANY vector result. Widening is a strict SUPERSET of the
+# current candidate set (it can only add votes, never remove a candidate),
+# unlike the rejected reachability floor which FORCED a chosen doc into a slot.
+# ⚠ It is not free in the other direction: a vec-rank-51 doc with no keyword
+# vote scores 1/112=0.00893 > an FTS-rank-1-only doc's 0.00820, so widening can
+# also displace exact-keyword matches with weak semantic neighbours. Which
+# effect dominates is an empirical question — graded on `mvm-retrieval-sweep`.
+#
+# ⛔ DEAD LEVER — MEASURED AND REJECTED 2026-07-26. Do not re-derive.
+# Pre-registered bar: ship the smallest pool gaining >=+2.0pp recall@5 at a cost
+# of <=0.5pp top-1, on the 155-question held-out sweep. Measured, n=155 both:
+#     pool  50 (base): recall@5 78.7% (122/155) · top-1 51.0% (79/155) · 23.3s
+#     pool 100       : recall@5 79.4% (123/155) · top-1 50.3% (78/155) · 31.3s
+#     pool 200       : recall@5 79.4% (123/155) · top-1 50.3% (78/155) · 22.9s
+#     pool 400       : recall@5 79.4% (123/155) · top-1 50.3% (78/155) · 29.4s
+# ⇒ +0.6pp recall for -0.6pp top-1: ONE question gained, ONE lost. Fails BOTH
+# halves of the bar. Per-question diff: only 4 of 155 top-5 rankings move at all
+# (contrast the rejected reachability floor's 33), and 100->400 moves ZERO — the
+# lever SATURATES by pool 100 and every larger pool is pure latency.
+#
+# WHY it saturates, which is the durable part: a vec-rank-r doc carrying no
+# keyword vote scores 1/(61+r), which drops below an FTS-rank-1-only doc's
+# 0.5/61 == 1/122 once r > 61. So candidates past vec-rank ~61 can never win on
+# the vector vote alone; they can only ADD to a doc that already holds an FTS
+# vote, and the FTS pool is 50 docs. Widening therefore has a small, bounded
+# reachable set by construction — no pool value unlocks the tail.
+#
+# ⚠ AND IT IS NON-MONOTONIC — the trap for anyone who retries this. On the
+# known reproducer ("grasping mail breach modifier chaos spam") the target's
+# FUSED rank goes 51 (pool 50) -> 63 (pool 100) -> 13 (pool 200) -> 13 (400):
+# widening makes it WORSE until the target actually enters the pool (it sits at
+# vec-rank 120), because ranks 51-61 of the new candidates outscore it first.
+# A two-point pool comparison can therefore read "helps" or "hurts" at will.
+# NOTE the reproducer still fails at every pool (target lands rank 13, not top-8)
+# — so the pool is not the binding constraint on it either. The vector leg puts
+# the single best exact-keyword doc at rank 120 of 4,824; that is an EMBEDDING
+# failure ("...mail...spam" -> email spam), and the next rung is the embedding
+# model / query expansion, NOT the plumbing around it.
+VEC_POOL = int(os.environ.get("MVM_VEC_POOL", "50"))
+# sqlite-vec's hard ceiling on a knn `k`. Above it the query RAISES, and a
+# raise here is indistinguishable from an empty corpus downstream — see
+# vec_search's docstring.
+VEC_K_MAX = 4096
+
 
 def rrf_fuse(vec_results: list[tuple[str, float]], fts_results: list[tuple[str, float]],
              k: int = RRF_K, w_fts: float = RRF_W_FTS) -> list[tuple[str, float]]:
@@ -354,7 +430,11 @@ def text_rank(index_db: Path, query: str, kind: str | None, in_prefix: str | Non
     root = root or DEFAULT_ROOT
     hybrid = os.environ.get("MVM_HYBRID", "1") == "1"
     if hybrid:
-        vec = vec_search(index_db, query, kind, in_prefix, limit=limit)
+        # The vector leg gets its own pool size (VEC_POOL, default 50 == the
+        # caller's limit ⇒ identity). Held separate from `limit` on purpose:
+        # the FTS leg is a keyword corroborator whose tail is keyword-bag noise,
+        # so widening BOTH legs would confound the lever being measured.
+        vec = vec_search(index_db, query, kind, in_prefix, limit=max(limit, VEC_POOL))
         fts = fts_search(index_db, query, kind, in_prefix, limit=limit)
         # Navigation files (auto-generated INDEX.md / index.md) are keyword
         # bags — BM25 ranks them above the content they merely list, whenever
