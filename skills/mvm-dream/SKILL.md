@@ -15,6 +15,14 @@ rule here: `~/resources/mvm-incident-history.md`.
 `~/mvm/state/quality-verified.jsonl`; never-verified ranks epoch-0, tiebreak
 oldest-mtime). After each probe: `dream-verify-pick record <doc> <PASS|FAIL>
 <quality|staleness>` — this rotates the next cycle to fresh docs.
+**A doc that is correctly NOT verifiable** (a deliberate RETIRED tombstone, e.g.
+`resources/kalshi.md`) gets `dream-verify-pick skip <doc> --reason "<why>"`
+(added 2026-07-27). It advances rotation and records `result=SKIP, verified=false`
+plus the reason, because rotation used to advance only on `record` — so the
+honest action (don't verify a tombstone) and the ledger-advancing action
+(record a PASS) were in conflict, and the doc was re-picked top-of-list forever.
+A SKIP is **never** a pass, and the reason is mandatory (≥12 chars, refused
+otherwise) so it cannot become a laundering path for "didn't feel like it".
 
 **Probe logging:** every kb/web verification probe below is logged as you
 grade it (the fail-closed Stop hook requires ≥1 append when clones spawned):
@@ -226,6 +234,23 @@ probes, `web` for web-grounded ones.)
      (`mvm relations <old-doc> --rel superseded_by` must list the new doc —
      empty = dangling pointer, fix before moving on). Disconfirmed → transient
      tagged **`staleness-disconfirm:`** (mandatory tag — see step 3).
+   - ⛔ **A web-clone NOT-FOUND that cites blocking/403/402/"access-restricted" is
+     NOT evidence about the world and MUST NOT be logged as `probe-noise:` and left
+     there — re-run the URL yourself through the `web` ladder FIRST (added
+     2026-07-27, measured).** The clone has only WebSearch/WebFetch; it structurally
+     cannot reach the repaired `web` tier-ladder, so its reachability verdict is a
+     fact about the CLONE, never about the source. Measured this cycle: the clone
+     reported `poe2wiki.net/wiki/Perfect_Orb_of_Transmutation` as access-restricted
+     and returned NOT-FOUND; `web <same url>` returned **200 OK, 34,697 B, in 0.12 s
+     at `tier=minimal`** — the CHEAPEST rung, no escalation needed — and confirmed
+     the KB claim outright (Minimum Modifier Level 70; and 70/70 Transmute+Augment
+     vs 50/50/50 Exalt+Regal+Chaos across five pages). **This converted what would
+     have been a fourth consecutive cycle of "web leg blocked" probe-noise into a
+     CONFIRMED first-party corroboration.** The prior three cycles
+     (`dream-20260725-1832`, `-20260726-1238`, `-20260726-1843`) each logged this
+     same class as instrument-limited and moved on; the limitation was real but the
+     remedy was one command away the whole time. **Only after `web` ALSO fails may
+     you log `probe-noise:`, and then say which tiers were tried.**
 
 5. **Contested + gaps + cross-contradiction sweep:**
    ⚠ **EVERY cold clone spawned in THIS step gets a `recall-log add` append, same
@@ -277,11 +302,35 @@ probes, `web` for web-grounded ones.)
         with everything (measured: `research-queue-cold.md` ↔ `backlog.md` = **0.9805**
         cosine, *higher* than a real near-dup pair) and they are the single largest
         source of false fires.
-     **Done-test for this rung (grade it on the next live rotation, do not assume):**
-     the pair `areas/research-queue-cold.md` + `areas/backlog.md` must be REJECTED
-     (rule 4), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
+     **Done-test for this rung — apply rule 4 DIRECTLY to the named pair; do NOT wait
+     for a rotation to produce it** (repaired 2026-07-27, see below): the pair
+     `areas/research-queue-cold.md` + `areas/research-queue.md` must be REJECTED
+     (rule 4 — both live, both mirrored, both >40 KB, both match the `research-queue`
+     path pattern), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
      `poe2/0.4/mechanics/quality.md` must ALSO be rejected (rule 2 — different
      declared versions). If a rotation reports a fire, record which rule admitted it.
+     ⛔ **The original done-test named `areas/backlog.md` and was VACUOUS — it could
+     never run (measured 2026-07-27).** `~/areas/backlog.md` has been a **symlink →
+     `research-queue.md`** since 2026-07-23 15:33 (the consolidation), and symlinks are
+     not mirrored, so `~/mvm/knowledge/areas/backlog.md` **does not exist** and no
+     `mvm search` can ever return that path. A done-test whose input the engine cannot
+     emit is unfalsifiable — the same **gate #20 unreachable-threshold class this very
+     step already documents twice** (`score > 0.7` against a 0.600 ceiling). Two
+     independent instances of one class inside one rung is the signal: **when writing a
+     done-test, verify the named INPUT is producible before trusting the negative** —
+     `ls` the mirrored path, don't assume the live path implies it. Note also that the
+     0.9805 cosine cited in rule 4 was measured against the PRE-consolidation
+     `backlog.md`; the finding stands (aggregators pair with everything) but the exhibit
+     no longer exists as a distinct file, so cite it as history, not as a live check.
+     ⚠ **Rule 1 (`same kind`) is a near-no-op and must NOT be trusted as the rejecting
+     rule (measured 2026-07-27): 4,703 of 4,812 KB docs — 97.7% — declare NO `kind`.**
+     So ~95.5% of random pairs are both-`<NONE>` and PASS rule 1, while the only pairs it
+     rejects are the mixed case (one doc happens to carry a `kind:`, the other doesn't)
+     — i.e. it discriminates on **metadata hygiene, not semantics**. Both pairs that
+     cleared the 0.98 gate on 2026-07-27 were rejected by rule 1 incidentally; both were
+     ALSO correctly rejected on the merits by rules 2/3, which are the load-bearing ones.
+     **When recording which rule admitted or rejected a pair, name a rule OTHER than 1
+     wherever one applies** — attributing a rejection to rule 1 overstates the gate.
      ⚠ **VERSION-SPANNING PAIRS ARE THE DOMINANT FIRE CLASS AND ARE NOT TENSIONS**
      (measured on the gate's first live rotation, 2026-07-26). The very first fire
      paired `poe2/0.5/crafting/jewellery-quality-system.md` with
@@ -439,6 +488,25 @@ probes, `web` for web-grounded ones.)
    (`duration_ms:0` is a PLACEHOLDER — `dream-log-append` overwrites it with the
    real wall-clock ms diffed from the Step-0 `dream-cycle-begin` marker, then
    consumes the marker; auditor #48. Keep emitting `0`, don't hand-compute it.)
+
+   ⚠ **`escalations[].severity` encodes HOW URGENTLY ANOTHER DREAM CYCLE IS OWED —
+   NOT how important the item is in the world (2026-07-27, measured).** Each entry
+   must be a **dict with a `severity` key** (a bare string is refused: it crashes
+   `dream-recent-clean`), and `dream-recent-clean` treats `high`/`critical` in the
+   LATEST entry as *"a dirty lane demands the follow-up cycle"* — it blocks the
+   redundant-cluster skip. So a **high** severity is a claim that *more dream work
+   is owed and a follow-up cycle can do it*. An item **blocked on an external
+   party** (a Mike-actionable ask, an upstream fix, a scheduled delivery window)
+   fails that test by construction: no follow-up cycle can clear it, so scoring it
+   `high` pins the lane dirty until the outsider acts and **turns a health
+   indicator into a constant**. Score such items `medium` (or lower) and add
+   `blocked_on` + `surface` keys naming who owns it and where it will be
+   delivered; their real urgency rides the delivery queue (telegram, morning
+   brief), which is the correct surface for an external ask. World-importance and
+   cycle-urgency are different axes — this field is the second one.
+   *Found by tripping it: this cycle filed the WSL `memory=12GB` ask as `high`,
+   read back `recent but dirty`, and would have re-fired the lane every cycle
+   until Mike edited a Windows file.*
    S4 path pin: the s4-initiatives ledger is
    `~/.local/state/alfred/areas/s4-initiatives/` (NOT `~/areas/` — stubs only).
    Approximations go in string fields (`"count_7d_approx":"~11"`), never a
