@@ -289,6 +289,46 @@ def rrf_fuse(vec_results: list[tuple[str, float]], fts_results: list[tuple[str, 
     cosine sims put PoE2 noise at sem~1.000 on Kalshi queries while an
     exact-keyword doc sat FTS-rank-1 unseen (FTS only ran as a fallback).
     Output is max-normalized for display continuity only; ordering is pure RRF.
+
+    THE EXACT-MATCH REACHABILITY LIMIT — derived, then MEASURED AND REJECTED
+    -----------------------------------------------------------------------
+    ⛔ Read this before "fixing" the known reproducer. Two plausible repairs
+    are already dead; re-deriving them costs a session.
+
+    Reproducer: `mvm search "grasping mail breach modifier chaos spam"` returns
+    ZERO PoE2 docs in the top 8. Leg-split: FTS puts the correct doc at rank 1;
+    the vector leg reads "…mail … spam" as EMAIL SPAM and never returns it at
+    all (absent from its top-50 pool).
+
+    (a) LOWERING k CANNOT FIX IT. A doc's vote is w/(k+rank+1), so in a
+    head-to-head at EQUAL rank k CANCELS EXACTLY:
+
+        fts-rank-1  w/(k+1)      ratio = w for EVERY k
+        vec-rank-1  1/(k+1)                (0.5 here)
+
+    A doc carrying only the down-weighted leg's vote can never outrank a doc at
+    the same rank in the full-weight leg, at any k. In general an FTS-rank-1 doc
+    outranks vec-rank r only when r > k+2, so top-5 demands k<=2; measured
+    2026-07-26, only k=1 (degenerate RRF) surfaced it. ⇒ k and w_fts are NOT two
+    levers on this defect: k sets how far down the OTHER leg you can reach; only
+    w_fts moves the head-to-head, and w_fts is pinned by the derivation above.
+
+    (b) AN EXACT-MATCH REACHABILITY FLOOR was then built and REJECTED ON
+    EVIDENCE (2026-07-26): give the top FTS doc a guaranteed rank-5 slot when
+    the vector leg never saw it. It fixed the reproducer AND took the frozen
+    6-case eval 5/6 -> 6/6 (CD1 green) — and the 155-question held-out oracle
+    `mvm-retrieval-sweep` read a REGRESSION: recall@5 78.7% -> 77.4%, top-1 flat
+    at 51.0%. Per-question diff: the floor changed 33 of 155 rankings (NOT the
+    rare maximal-disagreement case its design assumed), gaining 1 and losing 3.
+    The losses name the cause: BM25 rank-1 is frequently a keyword-bag artifact,
+    which is the exact pathology w_fts=0.5 exists to suppress — so the floor was
+    a structural back door to the same overfit that tuning w_fts was rejected
+    for, and it displaced genuinely-correct rank-5 docs to install worse ones.
+
+    ⚠ NOTE WHAT BOTH REJECTED CHANGES SHARE: w_fts=1.0 and the floor each take
+    the 6-case eval 5/6 -> 6/6 while failing held-out. CD1 is an overfit magnet —
+    any change that boosts the FTS leg passes it. Grade ranker changes on
+    `mvm-retrieval-sweep` (n=155), never on the 6-case eval alone.
     """
     scores: dict[str, float] = {}
     for rank, (p, _) in enumerate(vec_results):
