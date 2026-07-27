@@ -227,7 +227,28 @@ def check_cold_decayed(root: Path, docs, ever, recent):
                          "recalls_last_%dd" % COLD_WINDOW_DAYS: 0})
     known = {str(p.relative_to(root)) for p, _ in docs}
     never = sorted(known - set(ever))
+    # Self-describe the lifetime floor actually applied (honesty rule 3), and
+    # ship the lifetime histogram so a consumer can never again ATTACH a floor
+    # this check did not apply.
+    #
+    # SCAR (dream-20260727-1300): DECAYED means "had retrieval heat" = >=1
+    # lifetime recall, per the module docstring. But the /dream SKILL routing
+    # table described this check as ">=2 lifetime" -- borrowing the neighbouring
+    # HOT_MIN_RECALLS threshold, which belongs to `untested_hot` and to nothing
+    # else. Because `untested_hot` emitted `hot_threshold_recalls` and this
+    # check emitted no floor at all, the wrong label had nothing to collide
+    # with, and FOUR consecutive dream entries transcribed it as measured
+    # ("cold_decayed = 74 docs (>=2 lifetime recalls, 0 in 30d)"). Measured at
+    # the time of the fix: 76 rows, of which 23 were >=2 and 53 were exactly 1
+    # -- the reported >=2 population was overstated ~3.3x. A threshold a tool
+    # does not publish is a threshold its consumers will invent.
+    by_life = Counter(str(r["recalls_ever"]) for r in rows)
     return {"rows": rows,
+            "lifetime_recall_floor": 1,
+            "rows_by_lifetime_recalls": dict(sorted(by_life.items(),
+                                                    key=lambda kv: int(kv[0]))),
+            "rows_at_or_above_hot_threshold": sum(
+                1 for r in rows if r["recalls_ever"] >= HOT_MIN_RECALLS),
             "never_retrieved_count": len(never),
             "never_retrieved_sample": never[:NEVER_SAMPLE],
             "note": ("never-retrieved is a COUNT, not a worklist: %d of %d docs. "
@@ -438,8 +459,11 @@ def render(result: dict, out=sys.stdout) -> None:
             print("      ? %s  (review_at %r)" % (row["path"], row["review_at_raw"]), file=out)
     if "cold_decayed" in c:
         r = c["cold_decayed"]
-        print("  cold_decayed    %4d had heat, zero recalls in %dd  |  never-retrieved: %d"
-              % (len(r["rows"]), COLD_WINDOW_DAYS, r["never_retrieved_count"]), file=out)
+        print("  cold_decayed    %4d had heat (>=%d lifetime; %d of them >=%d), "
+              "zero recalls in %dd  |  never-retrieved: %d"
+              % (len(r["rows"]), r["lifetime_recall_floor"],
+                 r["rows_at_or_above_hot_threshold"], HOT_MIN_RECALLS,
+                 COLD_WINDOW_DAYS, r["never_retrieved_count"]), file=out)
         for row in r["rows"][:10]:
             print("      %s  (%d recalls ever)" % (row["path"], row["recalls_ever"]), file=out)
     if "untested_hot" in c:
@@ -496,6 +520,10 @@ def _fixture(tmp: Path):
         "title: hs\nstatus: superseded\n"
         "superseded_by: resources/hot-tested.md")
     doc("resources/cold-decayed.md", "title: cd")                           # cold_decayed
+    # Exactly ONE lifetime recall, all of it outside the window. Pins the
+    # DECAYED floor at >=1: any "fix" that raises it to HOT_MIN_RECALLS (the
+    # >=2 the /dream SKILL wrongly claimed) drops this row and fails by name.
+    doc("resources/cold-once.md", "title: c1")                              # cold_decayed
     doc("resources/never.md", "title: nv")                                  # never-retrieved
     doc("areas/links.md", body="see [ok](../resources/never.md) and "
                                "[dead](./gone.md) and [web](https://x.com/a.md) "
@@ -518,6 +546,8 @@ def _fixture(tmp: Path):
     for _ in range(3):
         lines.append(json.dumps({"kind": "recall", "ts": old,
                                  "evidence_paths": ["resources/cold-decayed.md"]}))
+    lines.append(json.dumps({"kind": "recall", "ts": old,
+                             "evidence_paths": ["resources/cold-once.md"]}))
     for _ in range(3):
         lines.append(json.dumps({"kind": "recall", "ts": fresh,
                                  "evidence_paths": ["resources/hot-untested.md"]}))
@@ -604,6 +634,26 @@ def selftest() -> int:
               and "resources/never.md" not in cd)
         check("dream-probe entries do not manufacture heat",
               "resources/never.md" in c["cold_decayed"]["never_retrieved_sample"])
+
+        # --- DECAYED floor is >=1 and is PUBLISHED (dream-20260727-1300).
+        # The /dream SKILL described this check as ">=2 lifetime" -- borrowing
+        # `untested_hot`'s HOT_MIN_RECALLS -- and four dream entries transcribed
+        # that unmeasured qualifier as fact. These four lock both halves: the
+        # floor is 1, and the tool SAYS so, so a consumer never has to guess.
+        cdc = c["cold_decayed"]
+        check("cold_decayed floor is >=1: a ONE-recall decayed doc IS flagged",
+              "resources/cold-once.md" in cd)
+        check("cold_decayed PUBLISHES the lifetime floor it applied",
+              cdc.get("lifetime_recall_floor") == 1)
+        check("cold_decayed ships the lifetime histogram (>=2 is derivable, "
+              "never assumed)",
+              cdc["rows_by_lifetime_recalls"].get("1", 0) >= 1
+              and cdc["rows_by_lifetime_recalls"].get("3", 0) >= 1
+              and sum(cdc["rows_by_lifetime_recalls"].values()) == len(cdc["rows"]))
+        check("cold_decayed's >=hot-threshold subset EXCLUDES the 1-recall row",
+              cdc["rows_at_or_above_hot_threshold"] == sum(
+                  1 for r in cdc["rows"] if r["recalls_ever"] >= HOT_MIN_RECALLS)
+              and cdc["rows_at_or_above_hot_threshold"] < len(cdc["rows"]))
 
         uh = {r["path"] for r in c["untested_hot"]["rows"]}
         check("untested_hot finds the hot doc with no .tests.yaml",
