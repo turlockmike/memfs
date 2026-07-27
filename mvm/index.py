@@ -252,6 +252,7 @@ def init_db(state: Path) -> tuple[sqlite3.Connection, sqlite3.Connection]:
             path TEXT PRIMARY KEY, embedding float[384]
         );
     """)
+    _ensure_vec_state(idx)
 
     g = sqlite3.connect(state / "graph.db", timeout=30.0)
     g.executescript("""
@@ -277,6 +278,85 @@ def _doc_mtime(md: Path) -> float:
     if t.exists():
         m = max(m, t.stat().st_mtime)
     return m
+
+
+# ── vec_state: the doc-mtime a stored vector was BUILT FROM ──────────────────
+# 🔴 THE STALE-VECTOR TRAP — measured 2026-07-26 (10 of 12 sampled docs stale,
+# worst cosine 0.8518 vs a fresh embed of the same file). Do not undo.
+#
+# `mvm index --no-embed` (run by mvm-mirror, cron */5) rewrites the `files` row
+# of every edited doc — ADVANCING files.mtime — while deliberately keeping the
+# old files_vec row (see the comment at the `for rel in changed` loop). Every
+# later pass computes dirty as `_doc_mtime(p) != files.mtime`, which that run
+# already satisfied ⇒ the doc is never dirty again. And `--embed-only`'s
+# criterion was `files_vec.path IS NULL`, which a stale-BUT-PRESENT vector does
+# not satisfy ⇒ the 15-min heal skipped it too. Net effect: an edited doc was
+# searched under the embedding of its FIRST version, forever, and only `--full`
+# repaired it — measured >20 min wall-clock, killed at rc=124 under a 1200 s
+# budget on this box, i.e. the only repair path did not actually work.
+#
+# The fix is one extra fact: files.mtime says "when the doc last changed";
+# vec_state.mtime says "the doc-mtime the stored vector was built from". Their
+# disagreement IS staleness, so dirty-for-embed becomes
+#   vec_state MISSING  OR  vec_state.mtime != files.mtime
+# which the cheap incremental `--embed-only` heal can act on. --full is no
+# longer the only repair.
+_VEC_STATE_DDL = """
+    CREATE TABLE IF NOT EXISTS vec_state (
+        path TEXT PRIMARY KEY,
+        mtime REAL
+    );
+"""
+
+# Dirty-for-embed, the one definition both the heal and the ghost-check use.
+# `IS NOT` (not `!=`) because it is NULL-safe: a doc with no vec_state row must
+# read as dirty, and `NULL != x` is NULL, which a WHERE clause drops.
+_PENDING_EMBED_SQL = """
+    SELECT f.path FROM files f
+    LEFT JOIN files_vec v ON v.path = f.path
+    LEFT JOIN vec_state s ON s.path = f.path
+    WHERE v.path IS NULL OR s.path IS NULL OR s.mtime IS NOT f.mtime
+    ORDER BY f.mtime DESC, f.path
+"""
+# ORDER BY mtime DESC, not path: the heal is bounded (below), so a partially
+# converged corpus is the NORMAL state for hours after this lands. Recently
+# edited docs are exactly the ones a query is most likely to want and most
+# likely to find stale, so healing newest-first makes every intermediate state
+# maximally useful. Alphabetical order would spend the first ticks on `areas/`
+# and leave today's edits stale longest.
+
+# 🔴 PER-INVOCATION WORK BOUND — earned 2026-07-26, part of the fix, not a
+# follow-up. vec_state starts EMPTY on an existing index.db, so the first heal
+# after this lands sees the whole corpus (~4,800 docs) as dirty. That job is
+# multi-hour at measured embed throughput, and it runs from a */15 cron holding
+# a flock. Unbounded, that tick is killed mid-way EVERY time — a heal that never
+# converges while every guard log line reads CLEAN (the exact silent-decay class
+# this whole fix exists to kill). Bounded, each tick embeds what it can afford,
+# RECORDS it in vec_state, exits 0, and the heal converges across ticks.
+# 0 / negative = unlimited (for a deliberate, attended, foreground heal).
+_EMBED_BUDGET_S = float(os.environ.get("MVM_EMBED_BUDGET_S", "240"))
+_EMBED_MAX_DOCS = int(os.environ.get("MVM_EMBED_MAX_DOCS", "0"))
+
+
+def _ensure_vec_state(idx: sqlite3.Connection) -> None:
+    """Create vec_state if absent. CREATE TABLE IF NOT EXISTS only — this
+    migrates NOTHING: files / files_fts / files_vec are untouched, and an
+    index.db written before this change is valid, it just has an empty
+    vec_state (= 'every stored vector is of unknown provenance'), which the
+    bounded heal resolves over the following ticks."""
+    idx.executescript(_VEC_STATE_DDL)
+
+
+def _record_vec_state(idx: sqlite3.Connection, rel: str) -> None:
+    """Stamp the vector just written for `rel` with the doc-mtime it was built
+    from. Read from the `files` row rather than a fresh stat() on purpose: if
+    the doc changed on disk mid-run, the DB holds the OLDER mtime — the one
+    that actually matches the bytes just embedded — so the next pass still sees
+    the doc as dirty. Every ambiguity here fails toward re-embed, never toward
+    'looks fresh'."""
+    idx.execute(
+        "INSERT OR REPLACE INTO vec_state (path, mtime) "
+        "SELECT path, mtime FROM files WHERE path = ?", (rel,))
 
 
 def index_doc(idx: sqlite3.Connection, g: sqlite3.Connection,
@@ -401,34 +481,40 @@ def _verify_main(args) -> int:
 
 
 def _embed_only_main(args) -> int:
-    """Backfill embeddings on existing index.db files. Idempotent — only embeds docs
-    not already in files_vec. Doesn't touch FTS or graph."""
+    """Heal embeddings on existing index.db files. Idempotent — embeds docs whose
+    vector is MISSING or STALE (built from an older doc-mtime; see the vec_state
+    block above). Doesn't touch FTS or graph. Bounded per invocation so a cron
+    tick always terminates cleanly and the heal converges across ticks."""
+    t_start = time.time()
+    budget_s = getattr(args, "budget_seconds", _EMBED_BUDGET_S)
+    max_docs = getattr(args, "max_docs", _EMBED_MAX_DOCS)
     state = args.state
     idx = sqlite3.connect(state / "index.db", timeout=30.0)
     idx.enable_load_extension(True)
     import sqlite_vec
     sqlite_vec.load(idx)
     idx.enable_load_extension(False)
+    _ensure_vec_state(idx)
 
     cur = idx.cursor()
-    # Files in index but not yet embedded
-    cur.execute("""
-        SELECT f.path FROM files f
-        LEFT JOIN files_vec v ON v.path = f.path
-        WHERE v.path IS NULL
-    """)
-    pending = [row[0] for row in cur.fetchall()]
-    total = len(pending)
-    if total == 0:
+    # Files whose embedding is missing OR stale-by-mtime.
+    cur.execute(_PENDING_EMBED_SQL)
+    backlog = [row[0] for row in cur.fetchall()]
+    n_backlog = len(backlog)
+    if n_backlog == 0:
         if not args.quiet:
-            print("All files already embedded. Nothing to do.")
+            print("All files embedded and up to date. Nothing to do.")
         idx.close()
         return 0
+    pending = backlog[:max_docs] if max_docs and max_docs > 0 else list(backlog)
+    total = len(pending)
     if not args.quiet:
-        print(f"Backfilling embeddings for {total} files...", flush=True)
+        print(f"Healing embeddings for {total} of {n_backlog} file(s)...", flush=True)
 
     BATCH = 64
     done = 0
+    attempted = 0
+    out_of_budget = False
     # failed counts embeddings this run was ASKED to produce and did not. It must
     # reach the exit code: `mvm-verify-guard` reads ONLY rc to decide whether to
     # log EMBED_HEAL_FAIL/EMBED_HEAL_OOM, so a run whose every batch died used to
@@ -436,7 +522,15 @@ def _embed_only_main(args) -> int:
     # (2026-07-22; locked by tests/test_embed_only_exit_code.py.)
     failed = 0
     for i in range(0, total, BATCH):
+        # Budget check between batches (never mid-batch: a partial batch would
+        # waste the inference already paid for). Checked BEFORE starting a batch
+        # so the run ends cleanly under its budget instead of being SIGKILLed
+        # over it — rc=0 with an honest deferral beats rc=124 with none.
+        if budget_s and budget_s > 0 and (time.time() - t_start) >= budget_s:
+            out_of_budget = True
+            break
         chunk_paths = pending[i:i + BATCH]
+        attempted += len(chunk_paths)
         bodies = []
         valid = []
         for rel in chunk_paths:
@@ -456,7 +550,13 @@ def _embed_only_main(args) -> int:
             continue
         for rel, blob in zip(valid, blobs):
             try:
+                # Delete-just-before-insert: vec0 has no ON CONFLICT, and this
+                # path now re-embeds STALE rows (not only missing ones), so the
+                # old row must go or the INSERT raises UNIQUE and the doc stays
+                # stale forever while the run reports success.
+                idx.execute("DELETE FROM files_vec WHERE path = ?", (rel,))
                 idx.execute("INSERT INTO files_vec (path, embedding) VALUES (?, ?)", (rel, blob))
+                _record_vec_state(idx, rel)
             except Exception as e:
                 failed += 1
                 print(f"  warn: insert embed failed for {rel}: {e}", file=sys.stderr)
@@ -466,6 +566,17 @@ def _embed_only_main(args) -> int:
             print(f"  {done}/{total}", flush=True)
 
     idx.close()
+    # DEFERRED ≠ FAILED. A bounded run that stopped on budget did exactly what it
+    # was asked to; the remainder is the NEXT tick's work. But it must never be
+    # silent — an unreported deferral is indistinguishable from "corpus clean",
+    # which is how a non-converging heal hides. Always stderr, even under
+    # --quiet, for the same reason the failure line is.
+    deferred = n_backlog - (attempted - failed)
+    if deferred > 0:
+        why = "time budget" if out_of_budget else "--max-docs"
+        print(f"embed heal deferred {deferred}/{n_backlog} doc(s) to the next run "
+              f"({why}; {done} embedded in {time.time() - t_start:.1f}s)",
+              file=sys.stderr)
     if failed:
         # Always stderr, even under --quiet: the guard's log line is built from
         # this, and a silent partial heal is the failure mode being fixed.
@@ -473,7 +584,8 @@ def _embed_only_main(args) -> int:
               file=sys.stderr)
         return 1
     if not args.quiet:
-        print(f"Backfill complete: {done}/{total}.")
+        print(f"Heal complete: {done}/{total} embedded"
+              + (f", {deferred} deferred." if deferred > 0 else "."))
     return 0
 
 
@@ -548,7 +660,18 @@ def main(argv = None) -> int:
     parser.add_argument("--no-embed", action="store_true",
                         help="Skip vector embeddings (FTS+graph only). Useful for bulk migration; backfill later.")
     parser.add_argument("--embed-only", action="store_true",
-                        help="Backfill embeddings on existing files without rebuilding FTS/graph. Idempotent.")
+                        help="Heal embeddings on existing files without rebuilding FTS/graph. "
+                             "Idempotent. Embeds docs whose vector is missing OR stale "
+                             "(vec_state.mtime != files.mtime). Bounded per invocation — see "
+                             "--budget-seconds / --max-docs.")
+    parser.add_argument("--budget-seconds", type=float, default=_EMBED_BUDGET_S,
+                        help=f"With --embed-only: stop starting new batches after this many "
+                             f"seconds and report the deferral (default {_EMBED_BUDGET_S:g}, env "
+                             f"MVM_EMBED_BUDGET_S; 0 = unlimited). The heal converges across runs, "
+                             f"so a cron tick exits 0 instead of being killed mid-corpus.")
+    parser.add_argument("--max-docs", type=int, default=_EMBED_MAX_DOCS,
+                        help=f"With --embed-only: embed at most this many docs per invocation "
+                             f"(default {_EMBED_MAX_DOCS}, env MVM_EMBED_MAX_DOCS; 0 = no doc cap).")
     parser.add_argument("--verify", action="store_true",
                         help="Read-only structural integrity check of index.db: every file in `files` "
                              "must have a vector embedding, an FTS-matchable body, and n_tests matching "
@@ -615,6 +738,9 @@ def main(argv = None) -> int:
         # joins files_vec→files, so they never surface.
         if not args.no_embed:
             idx.execute("DELETE FROM files_vec")
+            # Same reason: a vec_state row surviving the wipe would claim
+            # provenance for a vector that no longer exists.
+            idx.execute("DELETE FROM vec_state")
         g.execute("DELETE FROM edges")
         to_index = md_files
     else:
@@ -647,6 +773,7 @@ def main(argv = None) -> int:
             idx.execute("DELETE FROM files WHERE path = ?", (rel,))
             idx.execute("DELETE FROM files_fts WHERE path = ?", (rel,))
             idx.execute("DELETE FROM files_vec WHERE path = ?", (rel,))
+            idx.execute("DELETE FROM vec_state WHERE path = ?", (rel,))
             g.execute("DELETE FROM edges WHERE src = ?", (rel,))
         for rel in changed:
             idx.execute("DELETE FROM files WHERE path = ?", (rel,))
@@ -703,6 +830,7 @@ def main(argv = None) -> int:
                         "INSERT INTO files_vec (path, embedding) VALUES (?, ?)",
                         (rel, blob),
                     )
+                    _record_vec_state(idx, rel)
                 except Exception as e:
                     print(f"  warn: insert embed failed for {rel}: {e}", file=sys.stderr)
             if not args.quiet:
