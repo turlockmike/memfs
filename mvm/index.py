@@ -511,7 +511,15 @@ def _embed_only_main(args) -> int:
     if not args.quiet:
         print(f"Healing embeddings for {total} of {n_backlog} file(s)...", flush=True)
 
-    BATCH = 64
+    # BATCH is the budget's GRANULARITY, not just a speed knob. The deadline is
+    # checked between batches (never mid-batch — a half-finished batch throws
+    # away inference already paid for), so the worst-case overshoot is exactly
+    # one batch. Measured on the live corpus 2026-07-26: a 64-doc batch runs for
+    # MINUTES, which made a 240 s budget behave like ~600 s. 16 docs keeps most
+    # of the batching speedup (the inference batch is bounded by
+    # _EMBED_CHUNK_BATCH anyway), tightens overshoot ~4×, and commits 4× more
+    # often — so a run that IS killed keeps proportionally more of its work.
+    BATCH = 16 if (budget_s and budget_s > 0) else 64
     done = 0
     attempted = 0
     out_of_budget = False
