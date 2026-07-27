@@ -4,6 +4,7 @@ We don't exercise the live `claude` subprocess (slow + nondeterministic).
 Subprocess-mocked tests live here; live integration is a separate manual run.
 """
 import json
+import signal
 import sys
 from pathlib import Path
 from unittest import mock
@@ -495,3 +496,70 @@ def test_real_world_doc_size_would_route_to_stdin():
     # The doc that exposed the bug was 140,822 bytes; anything that size must
     # route to stdin or the regression is back.
     assert 140_822 > verify.ARGV_PROMPT_MAX_BYTES
+
+
+# --- Killed-probe self-description (dream-20260727) -------------------------
+# ROOT CAUSE these lock: a caller-side `timeout` SIGTERM killed the process
+# with NO output on either stream (0 B stdout AND 0 B stderr). That silent
+# death was indistinguishable from a crash/OOM/hang, so 9 of the last 10 dream
+# cycles filed it as `probe-noise` — "the retriever is failing too often" —
+# when the real defect was a wrapper budget too small by construction.
+
+def test_worst_case_wall_exceeds_the_200s_budget_the_dream_doctrine_used():
+    # The /dream doctrine ran single-test probes under `timeout 200` believing
+    # one test id was cheap. One test id costs (retries+1) * 2 subprocesses *
+    # timeout = 3 * 2 * 120 = 720s worst case. 200s could never cover it.
+    assert verify.worst_case_wall_seconds(n_tests=1, retries=2, timeout=120) == 720
+    assert verify.worst_case_wall_seconds(n_tests=1, retries=2, timeout=120) > 200
+
+
+def test_worst_case_wall_counts_both_subprocesses_per_attempt():
+    # Each attempt spawns retriever AND grader. Counting only one halves the
+    # bound and reintroduces the under-budgeting.
+    assert verify.worst_case_wall_seconds(n_tests=1, retries=0, timeout=10) == 20
+
+
+def test_worst_case_wall_scales_with_suite_size():
+    assert verify.worst_case_wall_seconds(n_tests=12, retries=0, timeout=120) == 2880
+
+
+def test_kill_report_emits_json_on_stdout_when_json_mode(capsys):
+    verify._install_kill_handlers(
+        doc="d.md", test_id="5", n_tests=1, retries=2, timeout=120, json_mode=True
+    )
+    with pytest.raises(SystemExit) as exc:
+        # os._exit bypasses SystemExit, so patch it for the test.
+        import os as _os
+        real = _os._exit
+        _os._exit = lambda c: (_ for _ in ()).throw(SystemExit(c))
+        try:
+            verify._emit_kill_report(signal.SIGTERM, None)
+        finally:
+            _os._exit = real
+    assert exc.value.code == 128 + signal.SIGTERM
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    # The three facts a caller needs to NOT misfile this as probe-noise:
+    assert payload["error"] == "killed_by_signal"
+    assert payload["judged"] is False          # the doc was never judged
+    assert payload["signal"] == "SIGTERM"      # caller-side kill, not a crash
+    assert payload["worst_case_wall_s"] == 720 # and the budget it needed
+    # stderr always carries the human line too, even in json mode.
+    assert "Killed by SIGTERM" in out.err
+
+
+def test_kill_report_writes_stderr_even_without_json_mode(capsys):
+    verify._install_kill_handlers(
+        doc="d.md", test_id=None, n_tests=1, retries=2, timeout=120, json_mode=False
+    )
+    import os as _os
+    real = _os._exit
+    _os._exit = lambda c: (_ for _ in ()).throw(SystemExit(c))
+    try:
+        with pytest.raises(SystemExit):
+            verify._emit_kill_report(signal.SIGTERM, None)
+    finally:
+        _os._exit = real
+    out = capsys.readouterr()
+    assert out.out == ""                      # no JSON when not in json mode
+    assert "never judged" in out.err          # but NEVER silent

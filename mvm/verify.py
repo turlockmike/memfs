@@ -51,9 +51,11 @@ import argparse
 import json
 import os
 import random
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -407,6 +409,90 @@ def verify_test_retry(
     return last
 
 
+def worst_case_wall_seconds(n_tests: int, retries: int, timeout: int = None) -> int:
+    """Upper bound on wall-clock for a run, in seconds.
+
+    Each test attempt spawns TWO sequential subprocesses (retriever, then
+    grader), each capped at `timeout`. A FAILing test is retried up to
+    `retries` more times, so one test id costs up to
+    (retries + 1) * 2 * timeout. Callers wrap this tool in `timeout N`; if
+    N is below this bound the wrapper kills a HEALTHY probe mid-flight.
+    """
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT
+    return max(1, n_tests) * (max(0, retries) + 1) * 2 * timeout
+
+
+# Populated by _install_kill_handlers so the signal handler can describe what
+# died. Kept module-level because a handler takes only (signum, frame).
+_RUN_CONTEXT = {}
+
+
+def _emit_kill_report(signum, _frame):
+    """Make a killed probe SELF-DESCRIBING instead of silent.
+
+    A bare SIGTERM terminates Python immediately: no traceback, no output.
+    The result is 0 B on stdout AND 0 B on stderr, which is indistinguishable
+    from a hung tool, an OOM kill, or a crash — so a caller-side `timeout`
+    that fired on a perfectly healthy probe gets misfiled as "the retriever is
+    failing". That misclassification is the whole bug: it reads as
+    infrastructure decay when it is a budget that was too small by
+    construction. Emitting a structured record on the way out converts a
+    silent death into a diagnosable one.
+    """
+    ctx = _RUN_CONTEXT
+    name = signal.Signals(signum).name
+    elapsed = round(time.monotonic() - ctx.get("start", time.monotonic()), 1)
+    budget = ctx.get("worst_case_s")
+    hint = (
+        f"Killed by {name} after {elapsed}s. This is a CALLER-SIDE kill, not a "
+        f"verdict — the doc was never judged. Worst-case wall-clock for this "
+        f"invocation is {budget}s ({ctx.get('n_tests')} test(s) x "
+        f"{ctx.get('retries', 0) + 1} attempt(s) x 2 subprocesses x "
+        f"{ctx.get('timeout')}s). Raise the outer `timeout` above that bound, "
+        f"or lower it deliberately with --retries/MVM_VERIFY_TIMEOUT."
+    )
+    payload = {
+        "error": "killed_by_signal",
+        "signal": name,
+        "elapsed_s": elapsed,
+        "doc": ctx.get("doc"),
+        "test_id": ctx.get("test_id"),
+        "n_tests": ctx.get("n_tests"),
+        "retries": ctx.get("retries"),
+        "subprocess_timeout_s": ctx.get("timeout"),
+        "worst_case_wall_s": budget,
+        "judged": False,
+        "hint": hint,
+    }
+    try:
+        if ctx.get("json_mode"):
+            print(json.dumps(payload), flush=True)
+        print(f"ERROR: {hint}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    # 128 + signum is the conventional shell encoding of a signal death.
+    os._exit(128 + signum)
+
+
+def _install_kill_handlers(*, doc, test_id, n_tests, retries, timeout, json_mode) -> None:
+    _RUN_CONTEXT.update(
+        start=time.monotonic(),
+        doc=str(doc),
+        test_id=test_id,
+        n_tests=n_tests,
+        retries=retries,
+        timeout=timeout,
+        json_mode=json_mode,
+        worst_case_s=worst_case_wall_seconds(n_tests, retries, timeout),
+    )
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _emit_kill_report)
+        except (ValueError, OSError):
+            pass  # non-main thread or platform without the signal
+
+
 def main(argv = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cold-clone verify a markdown doc against locked Q/A tests.",
@@ -513,6 +599,17 @@ def main(argv = None) -> int:
                     "available_ids": available,
                 }))
             return 2
+
+    # Arm the kill-reporter before the first subprocess. From here on, every
+    # exit path — including a caller's `timeout` SIGTERM — produces output.
+    _install_kill_handlers(
+        doc=args.doc,
+        test_id=selected_id if selected_id is not None else args.test_id,
+        n_tests=len(tests_data),
+        retries=args.retries,
+        timeout=DEFAULT_TIMEOUT,
+        json_mode=args.json,
+    )
 
     if args.lift:
         # Naked baseline must NOT retry: retrying-to-pass would understate KB
