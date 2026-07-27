@@ -43,3 +43,7 @@ def main(argv=None) -> int:
     finally:
         conn.close()
     return 0
+
+
+if __name__ == "__main__":  # `python3 -m mvm.<mod>` must RUN, never silently exit 0
+    sys.exit(main())

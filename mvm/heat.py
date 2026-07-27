@@ -185,3 +185,8 @@ def main(argv=None) -> int:
             flag = "✓ tests" if r["tested"] else "✗ UNTESTED"
             print(f"  {r['recalls']:3d}  {flag:10s}  {r['path']}")
     return 0
+
+
+if __name__ == "__main__":  # `python3 -m mvm.<mod>` must RUN, never silently exit 0
+    import sys
+    sys.exit(main())

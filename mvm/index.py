@@ -359,6 +359,37 @@ def _record_vec_state(idx: sqlite3.Connection, rel: str) -> None:
         "SELECT path, mtime FROM files WHERE path = ?", (rel,))
 
 
+def _fm_retrieval_text(fm: dict) -> str:
+    """Flatten the frontmatter fields authored AS retrieval hooks (`title:`,
+    `keywords:`) into one searchable string.
+
+    Why this exists: 620 of 4,816 KB docs carry a `keywords:` line written
+    explicitly so a search would find them, and until 2026-07-27 the FTS row
+    was built from the POST-frontmatter body only — so every one of those hooks
+    computed nothing (decisive probe: a phrase occurring exactly once in the
+    corpus, inside a `keywords:` line, was absent from its own doc's top 30).
+
+    Accepts str / list / dict / scalar because the convention is not enforced:
+    `keywords:` is a YAML list in some docs and a comma-string in others. Any
+    unparseable shape degrades to str() rather than raising — an indexer that
+    dies on one odd frontmatter would take the whole corpus with it.
+    """
+    parts: list[str] = []
+    for key in ("title", "keywords"):
+        v = fm.get(key)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            parts.append(v)
+        elif isinstance(v, (list, tuple, set)):
+            parts.extend(str(x) for x in v if x is not None)
+        elif isinstance(v, dict):
+            parts.extend(str(x) for x in v.values() if x is not None)
+        else:
+            parts.append(str(v))
+    return " ".join(s for s in (p.strip() for p in parts) if s)
+
+
 def index_doc(idx: sqlite3.Connection, g: sqlite3.Connection,
               md: Path, root: Path) -> tuple[str, str, int]:
     """Parse one md file and insert its files + files_fts rows and edges.
@@ -373,7 +404,13 @@ def index_doc(idx: sqlite3.Connection, g: sqlite3.Connection,
          str(fm.get("ingested_at", "")), str(fm.get("last_modified_at", "")),
          _doc_mtime(md), count_tests(md), yaml.safe_dump(fm)),
     )
-    idx.execute("INSERT INTO files_fts (path, body) VALUES (?, ?)", (rel, body))
+    # FTS text = frontmatter retrieval hooks + body. The `body` RETURNED to the
+    # caller stays the true post-frontmatter body: it feeds the embedding pass,
+    # and this ship deliberately moves the FTS leg ONLY so the two legs stay
+    # attributable (pre-registered experiment, 2026-07-27).
+    fm_text = _fm_retrieval_text(fm)
+    fts_body = f"{fm_text}\n\n{body}" if fm_text else body
+    idx.execute("INSERT INTO files_fts (path, body) VALUES (?, ?)", (rel, fts_body))
     n_edges = 0
     for src, dst, etype in extract_edges(md, body, fm, root):
         try:
@@ -861,3 +898,5 @@ def main(argv = None) -> int:
     return 0
 
 
+if __name__ == "__main__":  # `python3 -m mvm.<mod>` must RUN, never silently exit 0
+    sys.exit(main())

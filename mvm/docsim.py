@@ -320,3 +320,7 @@ def selftest(cur) -> int:
 
     print(f"\n{'PASS' if not fails else 'FAIL'} — {len(fails)} failure(s)")
     return 0 if not fails else 1
+
+
+if __name__ == "__main__":  # `python3 -m mvm.<mod>` must RUN, never silently exit 0
+    sys.exit(main())
