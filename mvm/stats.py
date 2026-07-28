@@ -129,18 +129,38 @@ def render_text(stats: dict, window_label: str) -> str:
     sources = stats["sources"]
     out = [f"Recalls (last {window_label}): {n}", ""]
 
+    # Render EVERY observed bucket, not a hardcoded whitelist. WHY (2026-07-28
+    # audit): the writer's vocabulary ('mixed', 'engine') drifted away from this
+    # reader's four-value enum, so 45% of a 7d window was silently dropped from
+    # the display while `n` still counted it — a summary that cannot fail in the
+    # direction of an unknown value (gate #59). The accounting line below is the
+    # oracle: buckets must sum to n, and now do so by construction.
+    canonical = ("kb", "web", "weights", "none")
+    extra = sorted((s for s in sources if s not in canonical),
+                   key=lambda s: (-sources[s], s))
     out.append("Source mix:")
-    for src in ("kb", "web", "weights", "none"):
+    rendered = 0
+    for src in canonical:
         c = sources.get(src, 0)
+        rendered += c
         pct = (c / n * 100) if n else 0
         out.append(f"  {src:10s}  {c:4d}  ({pct:.0f}%)")
+    for src in extra:
+        c = sources[src]
+        rendered += c
+        pct = (c / n * 100) if n else 0
+        out.append(f"  {src:10s}  {c:4d}  ({pct:.0f}%)   [non-canonical bucket]")
+    if rendered == n:
+        out.append(f"  {'accounted':10s}  {rendered:4d}/{n}")
+    else:  # unreachable by construction; kept as a live invariant, not a comment
+        out.append(f"  ACCOUNTING GAP: rendered {rendered} of {n} entries")
     out.append("")
 
     out.append(f"Ingestions: {stats['ingested']} ({stats['ingest_rate']*100:.0f}% of recalls grew the KB)")
     out.append(f"Hard misses: {stats['hard_misses']}")
     out.append("")
 
-    out.append("Top web-fallback topics (substrate gaps — consider proactive /mvm-ingest):")
+    out.append("Top web-fallback topics (STRICT web-only decisions; 'mixed' not counted here):")
     fb = sorted(stats["topic_fallbacks"].items(), key=lambda kv: -kv[1])[:5]
     if not fb:
         out.append("  (none — KB covering all queried topics)")
@@ -162,7 +182,13 @@ def render_text(stats: dict, window_label: str) -> str:
     out.append("Decoherence signals (v0 — coverage only; quality/staleness/bloat in v0.1):")
     cov_rate = sources.get("web", 0) / n if n else 0
     cov_status = "OK" if cov_rate < 0.20 else "WARN" if cov_rate < 0.35 else "ALERT"
-    out.append(f"  Coverage:   web-fallback rate = {cov_rate*100:.0f}%  → {cov_status}")
+    out.append(f"  Coverage:   strict web-only rate = {cov_rate*100:.0f}%  → {cov_status}")
+    # Reported, deliberately NOT thresholded: 'mixed' = KB grounded + web/primary
+    # corroboration, which is the recall protocol working as designed, not a gap.
+    # Reusing the strict-web calibration on it would manufacture a false alarm.
+    insuff = (sources.get("web", 0) + sources.get("mixed", 0)) / n if n else 0
+    out.append(f"              KB-alone-insufficient (web+mixed) = {insuff*100:.0f}%  "
+               f"[informational — no calibrated threshold]")
     out.append("  Quality:    (not yet measured — needs periodic re-verify)")
     out.append("  Staleness:  (not yet measured — needs KB-vs-web contradiction count)")
     out.append("  Bloat:      (not yet measured — needs search-latency log)")

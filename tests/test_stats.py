@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timezone
 
-from mvm.stats import load_entries, aggregate, parse_window
+from mvm.stats import load_entries, aggregate, parse_window, render_text
 
 
 def test_parse_window_days():
@@ -76,3 +76,49 @@ def test_aggregate_counts_sources():
     assert stats["ingest_rate"] == 0.5
     assert stats["topic_fallbacks"]["poe2"] == 1
     assert stats["topic_fallbacks"]["anthropic"] == 1
+
+
+# --- source-mix accounting (2026-07-28 audit specimen) -----------------------
+# The live log writes decided_source values the renderer never knew about
+# ('mixed', 'engine'). Every pre-existing test above used only the four
+# canonical values, so the suite shared the renderer's blind spot and 45% of a
+# real 7d window vanished from the display while `n` still counted it.
+
+def _mix(text):
+    """Parse the 'Source mix:' block into {bucket: count}."""
+    lines = text.splitlines()
+    i = lines.index("Source mix:")
+    out = {}
+    for ln in lines[i + 1:]:
+        if not ln.strip():
+            break
+        parts = ln.split()
+        out[parts[0]] = int(parts[1].split("/")[0])
+    return out
+
+
+def test_render_shows_non_canonical_source_buckets():
+    entries = [{"decided_source": s} for s in
+               ("kb", "kb", "mixed", "mixed", "mixed", "engine", "web")]
+    mix = _mix(render_text(aggregate(entries), "7d"))
+    assert mix["mixed"] == 3, "non-canonical bucket must be rendered, not dropped"
+    assert mix["engine"] == 1
+
+
+def test_render_source_mix_accounts_for_every_entry():
+    """The oracle the renderer lacked: buckets must sum to n."""
+    entries = [{"decided_source": s} for s in
+               ("kb", "mixed", "engine", "web", "none", "weights", "surprise")]
+    text = render_text(aggregate(entries), "7d")
+    mix = _mix(text)
+    assert "ACCOUNTING GAP" not in text
+    assert mix["accounted"] == len(entries)
+    assert sum(v for k, v in mix.items() if k != "accounted") == len(entries)
+
+
+def test_kb_alone_insufficient_counts_mixed():
+    entries = [{"decided_source": s} for s in ("kb", "kb", "mixed", "web")]
+    text = render_text(aggregate(entries), "7d")
+    assert "KB-alone-insufficient (web+mixed) = 50%" in text
+    # ...and the strict signal keeps its original calibration untouched
+    assert "strict web-only rate = 25%" in text
