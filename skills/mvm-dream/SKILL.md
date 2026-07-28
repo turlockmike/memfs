@@ -39,14 +39,36 @@ probes, `web` for web-grounded ones.)
 
 0. **Meta-audit** — FIRST run `dream-cycle-begin` (stamps the cycle-start epoch
    so the final `dream-log-append` self-stamps a real `duration_ms`, reviving the
-   monotonic-rising branch below — auditor #48). Then read last 10 entries of
-   `~/mvm/state/dream-log.jsonl`:
+   monotonic-rising branch below — auditor #48). Then **run `dream-meta-audit`**
+   (rc=0 no rule fires · rc=1 ≥1 finding needs judgment · rc=2 instrument
+   failure, never read as all-clear). It owns the ENUMERATION of every rule
+   below — tag counts, chronic docs, stuck topics, contested questions, duration
+   trend — so only the dispositions cost model tokens. Same split as `mvm sweep`
+   (0.5), `dream-coverage-triage` (2), and `dream-pending-carry` (6). ⛔ Do NOT
+   hand-roll inline Python over `~/mvm/state/dream-log.jsonl` to re-derive these
+   counts; that is what the tool replaced (every cycle was writing its own
+   parser). Read the log directly only to judge a finding the tool surfaced.
    - Same canonical in `quality_repairs` ≥3 cycles → mark frontmatter
      `status: chronic_failure`; surface to user with history.
    - Same topic in `coverage_ingests` ≥3 cycles, fallback rate flat →
      escalate (suggest manual ingest of an authoritative source).
-   - **`probe-noise` transients** outpacing `quality_repairs` over the window →
+   - **`probe-noise` transients** outpacing `quality_repairs` over the window
+     **AND still occurring in the most recent `--recent-k` (default 3) cycles** →
      the retriever/CLI is failing too often; surface (infrastructure degrading).
+     ⚠ **THE RULE IS CONJUNCTIVE, and the recency half is load-bearing
+     (2026-07-28, measured).** Without it the rule fires on a HEALED defect for
+     a full window after the repair lands: this cycle counted **7 probe-noise vs
+     1 quality_repair** — rule fires — but all 7 are dated 2026-07-26 and **ZERO**
+     landed in the five 2026-07-27 cycles, because the causes were fixed
+     (mvm@672857b `web` tier-ladder repair, mvm@82098dd killed-probe self-report,
+     the timeout-900 correction). **An alarm that cannot be cleared by fixing the
+     thing it alarms about can only be cleared by waiting — so it is a CONSTANT,
+     and a constant carries no information.** Same class as gate #20 (a threshold
+     no real input can cross) and the 2026-07-27 escalation-severity finding (a
+     `high` on an externally-blocked item pins the lane dirty until an outsider
+     acts). `dream-meta-audit` reports `cycles_since_last_probe_noise` and prints
+     the explicit *"outpacing but NOT recent → the cause was fixed and the
+     evidence is aging out"* verdict; trust that line rather than re-deriving.
      ⚠ **Count the CAUSE TAG, never the raw `transients` bucket** (2026-07-25):
      `transients` holds three causes with OPPOSITE meanings, and only
      `probe-noise:` is infrastructure signal. `grader-strict:` entries are the
@@ -57,7 +79,11 @@ probes, `web` for web-grounded ones.)
      2026-07-25 (5 transients vs 3 repairs → discriminated: 4 grader-strict + 1
      timeout ⇒ healthy, no escalation). Tags are now **enforced at the write gate**
      (`dream-log-append` rc=2 on an untagged transient), so this count is
-     deterministic: grep the tag, don't re-read prose.
+     deterministic — and `dream-meta-audit` now performs it, reporting all four
+     buckets (`probe-noise` / `grader-strict` / `staleness-disconfirm` /
+     `UNTAGGED`) separately. It **never** folds `UNTAGGED` into `probe-noise`
+     (a mutant that does fails 3 selftest cases by name), because that would
+     re-create the exact bucket-vs-tag conflation this paragraph exists to kill.
    - `duration_ms` monotonically rising → schedule consolidation; surface.
    - Same question `still_split` ≥2 cycles → permanently contested; escalate,
      stop re-attempting.
@@ -86,7 +112,7 @@ probes, `web` for web-grounded ones.)
    | worklist check | feeds | what the model actually decides |
    |---|---|---|
    | `review_due` (+ `unparseable`) | step 4 | is the canonical still true? supersede / re-date / retire. **`unparseable` rows are a `review_at` field that is prose, not a date — fix the field, and do not count it as reviewed.** |
-   | `cold_decayed` | step 4 | zero retrieves in 30 d with ≥2 lifetime: genuinely dead weight, or seasonal (a lane that will wake)? **Decay ≠ delete** — prefer archive/merge; a doc that grounded real recalls once has earned a reason before removal. |
+   | `cold_decayed` | step 4 | zero retrieves in 30 d with **≥1 lifetime** recall: genuinely dead weight, or seasonal (a lane that will wake)? **Decay ≠ delete** — prefer archive/merge; a doc that grounded real recalls once has earned a reason before removal. ⚠ **This cell read "≥2 lifetime" until 2026-07-27 and that was WRONG — it borrowed `untested_hot`'s `HOT_MIN_RECALLS`, which belongs to that check and nothing else.** `check_cold_decayed` applies NO floor above 1 (sweep.py: DECAYED = "had retrieval heat"). Measured when caught: 76 rows, **23** at ≥2 and **53** at exactly 1 — so four consecutive dream entries that wrote "N docs (≥2 lifetime recalls)" overstated that population ~3.3×, by transcribing this cell instead of the data. The tool now **publishes** `lifetime_recall_floor` + `rows_by_lifetime_recalls` + `rows_at_or_above_hot_threshold`; **quote those fields, never a floor you inferred from prose.** |
    | `untested_hot` | step 3 | any doc crossing the ≥2-recall threshold must acquire locked tests **before its next dream pass** — this is the live maintenance oracle in `PLAN.md:51`. Currently **0**; keeping it at 0 IS the success condition. |
    | `broken_links` | step 3 | repair the target, or delete the link if the referent is genuinely gone. |
    | `index_drift` | step 5 | `INDEX.md`/`index.md` collisions — structural, usually mechanical. |
@@ -305,8 +331,13 @@ probes, `web` for web-grounded ones.)
      **Done-test for this rung — apply rule 4 DIRECTLY to the named pair; do NOT wait
      for a rotation to produce it** (repaired 2026-07-27, see below): the pair
      `areas/research-queue-cold.md` + `areas/research-queue.md` must be REJECTED
-     (rule 4 — both live, both mirrored, both >40 KB, both match the `research-queue`
-     path pattern), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
+     (rule 4 — both live, both mirrored, both match the `research-queue` path pattern
+     under `areas/`; the PATH-PATTERN clause is what rejects them, NOT the size clause.
+     ⚠ measured 2026-07-27: `research-queue-cold.md` is **342 B**, so an earlier version
+     of this line claiming "both >40 KB" was FALSE — `research-queue.md` is 74,425 B but
+     its partner is tiny. A done-test whose stated RATIONALE is wrong still passes for
+     the wrong reason, which is how a rule quietly stops meaning what it says; cite the
+     clause that actually fires), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
      `poe2/0.4/mechanics/quality.md` must ALSO be rejected (rule 2 — different
      declared versions). If a rotation reports a fire, record which rule admitted it.
      ⛔ **The original done-test named `areas/backlog.md` and was VACUOUS — it could
@@ -331,6 +362,20 @@ probes, `web` for web-grounded ones.)
      ALSO correctly rejected on the merits by rules 2/3, which are the load-bearing ones.
      **When recording which rule admitted or rejected a pair, name a rule OTHER than 1
      wherever one applies** — attributing a rejection to rule 1 overstates the gate.
+     ⚠ **RULE 3 IS AT RISK OF RULE 1's DEGENERATION — corpus-wide boilerplate must NOT
+     count as a "significant" shared term (observed 2026-07-27 on a live fire).** The
+     pair `0.4/mechanics/sanctified-flag.md` + `0.4/crafting/hinakoras-lock.md` (rank-2
+     text 0.9840) shares exactly three title terms: **`PoE2`, `0.4`, `mechanic`**. But
+     `PoE2` and `0.4` appear in the title of virtually every doc in this corpus's largest
+     domain, so counting them satisfies "≥2 shared significant title terms" for **any**
+     same-version PoE2 pair — the rule then measures DOMAIN MEMBERSHIP, not shared
+     subject, which is precisely how rule 1 degenerated into a metadata-hygiene check.
+     **Excluding the domain name and the version marker, that pair shares ONE term
+     (`mechanic`) and rule 3 would REJECT it.** The pair was admitted anyway (correctly —
+     the two docs genuinely cover the same fracture/Sanctification interaction, and they
+     were probed and DISSOLVED in full agreement), so treat this as a caveat, not a
+     repair: **when counting shared title terms, drop the domain token and the version
+     token first, and if what remains is <2, say so rather than reporting a rule-3 pass.**
      ⚠ **VERSION-SPANNING PAIRS ARE THE DOMINANT FIRE CLASS AND ARE NOT TENSIONS**
      (measured on the gate's first live rotation, 2026-07-26). The very first fire
      paired `poe2/0.5/crafting/jewellery-quality-system.md` with
