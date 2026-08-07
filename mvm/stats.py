@@ -180,8 +180,30 @@ def render_text(stats: dict, window_label: str) -> str:
     # Decoherence signal summary (v0 placeholder)
     out.append("")
     out.append("Decoherence signals (v0 — coverage only; quality/staleness/bloat in v0.1):")
+    # n-FLOOR (2026-08-07, auditor D180-1). A rate over a handful of recalls
+    # measures the WINDOW, not the corpus: this ALERT fired at n=5 / web-40%
+    # while the SAME corpus reads 20% at n=20, 16% at n=50 and 12% at n=200 —
+    # so the alarm was a statement about how few rows the window happened to
+    # hold. The auditor filed it against itself as a near-FP and killed it with
+    # one habit: check the denominator before believing the number.
+    #
+    # Convention ported verbatim from `kalshi-calibration`, where a kill floor
+    # of n>=20 with an explicit below-floor verdict is invented, proven and
+    # load-bearing on the trading surface — it is what let the tennis lane be
+    # retired on realized edge_r -0.11 instead of on a lucky short run. The
+    # memory instruments are the ones grading viability, so they earn the same
+    # discipline. Same doctrine as the `mixed` note directly below: never reuse
+    # a calibration on a quantity it cannot carry.
+    #
+    # Below the floor this reports WATCH n/20 and issues NO verdict. That is a
+    # deliberate refusal, not a default-to-OK: a suppressed alarm and a passing
+    # one must never print the same word.
+    COV_N_FLOOR = 20
     cov_rate = sources.get("web", 0) / n if n else 0
-    cov_status = "OK" if cov_rate < 0.20 else "WARN" if cov_rate < 0.35 else "ALERT"
+    if n < COV_N_FLOOR:
+        cov_status = f"WATCH {n}/{COV_N_FLOOR} — below n-floor, NO VERDICT"
+    else:
+        cov_status = "OK" if cov_rate < 0.20 else "WARN" if cov_rate < 0.35 else "ALERT"
     out.append(f"  Coverage:   strict web-only rate = {cov_rate*100:.0f}%  → {cov_status}")
     # Reported, deliberately NOT thresholded: 'mixed' = KB grounded + web/primary
     # corroboration, which is the recall protocol working as designed, not a gap.

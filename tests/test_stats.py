@@ -122,3 +122,46 @@ def test_kb_alone_insufficient_counts_mixed():
     assert "KB-alone-insufficient (web+mixed) = 50%" in text
     # ...and the strict signal keeps its original calibration untouched
     assert "strict web-only rate = 25%" in text
+
+
+# --- coverage n-floor (auditor D180-1, 2026-08-07) -------------------------
+# The live specimen: n=5 with 2 web recalls rendered "40% -> ALERT", while the
+# same corpus is 20% at n=20, 16% at n=50 and 12% at n=200. The alarm was
+# describing the window, not the KB. Floor convention ported from
+# kalshi-calibration (kill floor n>=20, explicit below-floor verdict).
+
+def _cov_line(text):
+    return next(l for l in text.splitlines() if "strict web-only rate" in l)
+
+
+def test_coverage_below_n_floor_issues_no_verdict():
+    """The exact D180-1 specimen: n=5, 2 web. Must NOT say ALERT."""
+    entries = [{"decided_source": s} for s in ("kb", "kb", "kb", "web", "web")]
+    line = _cov_line(render_text(aggregate(entries), "7d"))
+    assert "40%" in line, "the rate is still reported — only the verdict is withheld"
+    assert "WATCH 5/20" in line
+    assert "NO VERDICT" in line
+    # A suppressed alarm and a passing one must never print the same word.
+    for verdict in ("ALERT", "WARN", "OK"):
+        assert verdict not in line.split("→")[1].replace("WATCH", "")
+
+
+def test_coverage_at_n_floor_issues_a_verdict():
+    """At exactly n=20 the floor is satisfied and the calibration applies."""
+    entries = [{"decided_source": "web"}] * 8 + [{"decided_source": "kb"}] * 12
+    line = _cov_line(render_text(aggregate(entries), "7d"))
+    assert "40%" in line and "ALERT" in line and "WATCH" not in line
+
+
+def test_coverage_floor_does_not_swallow_a_healthy_verdict():
+    """Blast-radius half: an OK verdict above the floor stays OK."""
+    entries = [{"decided_source": "web"}] * 2 + [{"decided_source": "kb"}] * 23
+    line = _cov_line(render_text(aggregate(entries), "7d"))
+    assert "→ OK" in line and "WATCH" not in line
+
+
+def test_coverage_floor_is_not_a_default_to_ok():
+    """n=19 with a 100% web rate must still refuse a verdict, not pass."""
+    entries = [{"decided_source": "web"}] * 19
+    line = _cov_line(render_text(aggregate(entries), "7d"))
+    assert "WATCH 19/20" in line and "ALERT" not in line and "→ OK" not in line
