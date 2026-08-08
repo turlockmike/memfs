@@ -24,12 +24,28 @@ honest action (don't verify a tombstone) and the ledger-advancing action
 A SKIP is **never** a pass, and the reason is mandatory (≥12 chars, refused
 otherwise) so it cannot become a laundering path for "didn't feel like it".
 
-**Probe logging:** every kb/web verification probe below is logged as you
-grade it (the fail-closed Stop hook requires ≥1 append when clones spawned):
+**Probe logging — USE THE ATOMIC SUBCOMMAND, do NOT hand-chain the two calls
+(structural remedy shipped 2026-08-08, `dream-verify-pick selftest` 50/50):**
 ```bash
-echo '{"question":"<test q>","topic_hint":"dream-quality-verify",
- "decided_source":"kb","decided_answer":"<answer> — <doc> PASS/FAIL"}' | recall-log add
+dream-verify-pick probe <doc> <PASS|FAIL> <quality|staleness> \
+  --q "<the test question>" --a "<the graded answer>" [--source kb|web]
 ```
+One call. It appends the recall-log row FIRST and stamps the rotation ledger
+SECOND, so the ordering is code rather than something you re-remember each
+cycle. It refuses an empty `--q`/`--a`, a step naming neither axis, and a
+`--source` outside the `kb|web` enum — a probe with no evidence in it can never
+be laundered into a well-formed-looking row.
+⛔ **The old two-call shell chain is the record-before-probe failure and it fired
+SIX times** — 2026-07-25, 07-27, 07-28, 07-29, 08-08 00:50, and 08-08 03:02 — in
+this same rung, every time caught by `_probe_evidence_exists` (so no false PASS
+ever landed; the ORACLE was sound the whole time) and every time "fixed" with
+more prose. **A gate that fires every single cycle is not a gate working — it is
+a missing affordance being re-detected.** Prose plateaued; the subcommand is the
+fix. Hand-chaining `recall-log add && dream-verify-pick record` still works and
+is not forbidden, but it re-opens the exact degree of freedom that failed six
+times, so reach for it only when the probe genuinely has no doc (step-5 clone
+probes below, which log via `recall-log add` directly).
+
 (`topic_hint` dream-quality-verify | dream-staleness-verify; the CLI infers
 `kind:"dream-probe"` from it, so probes never pollute `mvm stats` — which
 defaults to `--kind recall`. Use the honest enum source: `kb` for doc-grounded
@@ -184,6 +200,21 @@ probes, `web` for web-grounded ones.)
      29 hits across ~10 docs. Each hit = fix the tested doc + its test, then
      re-run the injected-verify gate. Extend the ban-list by adding rows to
      `canonical/catalysts.md` § "Confirmed PoE1-only" (the tool parses it live).
+   🔧 **RUN `mvm-mirror` BETWEEN A REPAIR AND ITS RE-VERIFY — the gate reads the
+   `~/resources/` tree, and an Edit under `~/mvm/knowledge/` is NOT there until the
+   `*/5` mirror cron fires (measured 2026-08-05).** The failure is silent and
+   **inverted**, which is what makes it dangerous: the re-verify grades the *new*
+   doc against the *old* `.tests.yaml`, so a CORRECT repair reports `FAIL` with the
+   stale string in `expected` and the corrected string in `candidate` — it reads
+   exactly like the repair broke the doc, when in fact it worked and the ORACLE was
+   stale. A newly-added test id is worse: `mvm verify` returns
+   `error: no test with id=N` + `available_ids` from the pre-edit file, which looks
+   like a malformed edit. Measured on the ancient-infuser repair: the `.md` had
+   mirrored but the `.tests.yaml` had **not** (May-10 mtime, 8 ids vs 9), so the two
+   halves of one repair were graded against each other across a version skew.
+   ⚠ **Never "fix" a post-repair FAIL by reverting the doc** — first check
+   `ls -la` on BOTH trees, run `mvm-mirror` (rc=0, seconds), and re-verify. After the
+   mirror here, both ids passed on attempt 1.
    **ALWAYS pass `--test-id` (ONE test); never run bare `mvm verify <doc>`
    (full suite) — full-suite reliably TIMES OUT on large docs
    (poe2-crafting-codex, 0.5.0-patch-notes burned ~10min for 0 verdicts,
@@ -314,17 +345,66 @@ probes, `web` for web-grounded ones.)
      results #1 and #2. If it passes, ask both docs the same probing question via
      2 cold-clones; contradiction → flag both `status: cross-contested` +
      reciprocal `in_tension_with:` edges (root-relative), `mvm index`, surface.
-     **The pair test — ALL FOUR must hold (no similarity number anywhere):**
+     🔧 **RUN `dream-pair-test <doc_a> <doc_b>` — the four rules below are MECHANIZED
+     (shipped 2026-08-03, selftest 12/12). rc=0 REJECT (do not spend clones) · rc=1 ADMIT
+     · rc=2 instrument failure.** It applies rule 4 → rule 2 → rule 1 → rule 3 in that
+     order, with morphology folding and the explicit genre/domain token list (both repairs
+     below) built in, and it **names the rule that fired** so you never have to attribute a
+     rejection by hand. It deliberately STOPS at the family-sibling question — that one is
+     judgment — and returns `ADMIT-PENDING-SIBLING-CHECK` with the differing terms printed,
+     which is the only call you still make yourself.
+     **Why it exists:** this test degenerated FOUR times as hand-applied prose (rule 1 →
+     metadata hygiene; rule 3 → domain membership, then filename convention, then rarity),
+     plus a fifth opposite-direction defect (exact-token matching zeroed out a 0.9951 pair
+     sharing its whole subject). Every one is an ENUMERATION bug, and enumeration is exactly
+     what should not cost model tokens — same split as `mvm sweep` (0.5),
+     `dream-coverage-triage` (2), `dream-pending-carry` (6). The prose below is now the
+     DERIVATION and the regression suite; the tool is the executable. ⚠ If you change a rule
+     here, change it in the tool and add the exhibit to `CASES` — a rule that lives only in
+     prose is the failure this shipped to end.
+     **The pair test — ALL FOUR must hold (no similarity number anywhere), plus rule 2b
+     (time-series siblings, added 2026-08-08 — see the repair-8 block below):**
      1. **Same `kind`** (`metadata.kind` in the JSON) — a `recipe` and a `decision`
         cannot contradict; they answer different questions.
      2. **Same declared version, or both version-less.** A `0.4` doc and a `0.5`
         doc disagreeing is correct versioning, not tension — this was the dominant
         historical fire class (see below), so it is now a PRECONDITION, not an
         after-the-fact discriminator.
-     3. **≥2 shared significant title terms** (ignore stop-words + `index`/`notes`).
-        Cheap proxy for "these make claims about the same subject."
+     3. **≥2 shared significant title terms — OR SATURATION** (ignore stop-words +
+        `index`/`notes`). Cheap proxy for "these make claims about the same subject."
+        ✅ **COVERAGE-NOT-COUNT repair, shipped 2026-08-03 in `dream-pair-test`
+        (selftest 14/14) — this closes the standing false-negative row.** A raw ≥2
+        count **penalizes CONCISE titles**, and so suppresses exactly the
+        **canonical-vs-versioned** shape where a contradiction is most dangerous
+        (canonical is the authority other docs are graded against). Measured:
+        `0.4/crafting/essences.md` ↔ `canonical/essences.md` shares **one** term —
+        and that term is the ENTIRE subject of both docs. So rule 3 now passes on
+        `n_shared ≥ 2` **OR** on **saturation** (the shared set covering **100% of one
+        doc's** significant terms): essences → coverage **1.000** ⇒ ADMIT. ⛔ **Do NOT
+        instead lower the threshold to 1** — that re-admits the whole template family
+        and re-creates the rule-1 degeneration. Saturation does not, **by
+        construction**: family siblings differ precisely in the subject term, so they
+        cannot saturate (es-body-armour shares 2 of 6 = 0.33; evasion 2 of 4 = 0.50).
+        Verified on all **15** intra-family pairs of the 6-member
+        `*-profit-recipe-0.5.md` template: **0 saturated**. Both halves are locked
+        regression cases in the tool.
      4. **Neither doc is an AGGREGATOR** — ⛔ skip any path under `areas/` matching
-        `backlog|research-queue|dashboard`, or any file >40 KB. Grab-bag files pair
+        `backlog|research-queue|dashboard`, **any doc whose FILENAME is `index.md`/`INDEX.md`**,
+        or any file >40 KB.
+        🆕 **The index clause is repair 9 (2026-08-08, `d65f58f`, selftest 41/41) and it was the
+        single highest-yield change ever made to this rung.** An index **lists contents and
+        asserts no claim**, so no contradiction between two of them is expressible; they are also
+        **machine-generated** (`reindex` / `mvm index`), so a "tension" between two would be a
+        GENERATOR bug, not a knowledge defect — and cold clones structurally cannot find it.
+        Measured: **666 index docs corpus-wide, ZERO previously caught** by the path-pattern or
+        size clauses. On a 400-random-pair sample `rule4_aggregator` went **8 → 107** and
+        `ADMIT-PENDING-SIBLING-CHECK` went **3 → 0** — and all **3/3** pre-repair admissions were
+        verified to be `INDEX.md`↔`INDEX.md` pairs. ⚠ **So the discovery rung's ENTIRE admit
+        stream in a random sample was generated-index junk, at 2 cold clones apiece.** Every
+        earlier repair here argued about which *real* docs to admit; nobody had checked what the
+        admit stream was actually *made of*. **Measure the composition of a gate's output, not
+        just its rules.** Found only as the repair-8 residual: the 2 undated members of the
+        87-doc daily family were its own `index.md`/`INDEX.md`, leaving 173 pairs open. Grab-bag files pair
         with everything (measured: `research-queue-cold.md` ↔ `backlog.md` = **0.9805**
         cosine, *higher* than a real near-dup pair) and they are the single largest
         source of false fires.
@@ -333,11 +413,16 @@ probes, `web` for web-grounded ones.)
      `areas/research-queue-cold.md` + `areas/research-queue.md` must be REJECTED
      (rule 4 — both live, both mirrored, both match the `research-queue` path pattern
      under `areas/`; the PATH-PATTERN clause is what rejects them, NOT the size clause.
-     ⚠ measured 2026-07-27: `research-queue-cold.md` is **342 B**, so an earlier version
-     of this line claiming "both >40 KB" was FALSE — `research-queue.md` is 74,425 B but
-     its partner is tiny. A done-test whose stated RATIONALE is wrong still passes for
-     the wrong reason, which is how a rule quietly stops meaning what it says; cite the
-     clause that actually fires), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
+     ⚠ an earlier version of this line claiming "both >40 KB" was FALSE, and the 2026-07-27
+     repair that caught it cited `research-queue-cold.md` at **342 B** — which has ITSELF gone
+     stale: re-measured 2026-07-28 it is **30,328 B** (89× growth in ONE day, from cold-rotation
+     doing its job), against `research-queue.md` at **77,426 B**. Both are still under/over the
+     40 KB line in a way that leaves the size clause NON-firing for the cold file, so the
+     PATH-PATTERN clause remains the one that rejects the pair. **Lesson, now twice-earned: do
+     not pin a done-test's rationale to a measured SIZE — sizes drift fast enough to falsify the
+     prose within a day. Cite the CLAUSE that fires and re-measure at read-time.** A done-test
+     whose stated RATIONALE is wrong still passes for the wrong reason, which is how a rule
+     quietly stops meaning what it says), and the pair `poe2/0.5/crafting/jewellery-quality-system.md` +
      `poe2/0.4/mechanics/quality.md` must ALSO be rejected (rule 2 — different
      declared versions). If a rotation reports a fire, record which rule admitted it.
      ⛔ **The original done-test named `areas/backlog.md` and was VACUOUS — it could
@@ -353,6 +438,104 @@ probes, `web` for web-grounded ones.)
      0.9805 cosine cited in rule 4 was measured against the PRE-consolidation
      `backlog.md`; the finding stands (aggregators pair with everything) but the exhibit
      no longer exists as a distinct file, so cite it as history, not as a live check.
+     🔴 **RULES 1 AND 2 TREATED *ABSENCE* AS A VALUE — repaired 2026-08-04 in
+     `dream-pair-test` (repairs 5/6/7, selftest 24/24). Three coupled defects, one live
+     exhibit.** Found by feeding `kalshi/api-field-notes.md` ↔ `kalshi/orderbook-mechanics.md`
+     to the tool: it returned REJECT/rule2 as *"version-spanning (None vs 1.00)"* — and the
+     `1.00` was scraped out of the literal **`$1.00`** in *"YES + NO must sum to $1.00."*
+     - **(5) `declared_version` matched any `\d+\.\d+` in path+title+body[:400].** Measured
+       corpus-wide: 725 docs got a "version" and **307 (42.3%) came from free body prose** —
+       money (`$1.00`, `8.00`, `12.5`), arXiv ids (`2408.03314`), DOIs (`10.1016`). Extraction
+       is now priority-ordered and each tier needs an actual CLAIM: frontmatter `version:` →
+       a path segment that IS a version (`/0.4/`) → a cued mention (`PoE2 0.5`, `patch 0.4`) →
+       a bare `\d\.\d` guarded against `$`-prefix, `%`-suffix and longer numeric runs. Net
+       725 → 635; the 96 dropped are dominated by money/arXiv shapes, and only **6** genuine
+       0.4/0.5 docs are collateral — an acceptable trade because a MISSING version is now
+       harmless (falls through to rules 3/4) whereas a SPURIOUS one was a hard reject.
+     - **(6) Rule 2 rejected `None vs X`, which structurally foreclosed the
+       canonical-vs-versioned shape that rule 3's saturation repair (2026-08-03) shipped to
+       ADMIT.** Two rules in this rung contradicted each other, and the tool's own DONE-TEST
+       (`0.4/crafting/essences.md` ↔ `canonical/essences.md`) passed **only by accident** —
+       `canonical/essences.md` happened to scrape `0.4` out of its body under the broken
+       extractor. Fixing (5) alone flips that case to REJECT, which is how the coupling
+       surfaced. Rule 2 now rejects **only when BOTH docs declare a version and they differ**,
+       because *"correct versioning, not tension"* is an EXPLANATION and a version-less doc
+       offers no such explanation.
+     - **(7) Rule 1 rejected `kind: reference` vs no-frontmatter** — the same disease, and the
+       paragraph below already names it (*"metadata hygiene, not semantics"*). Rule 1 now also
+       requires both sides to declare. **ABSENCE IS NOT A VALUE**, in either rule.
+     With all three in, the exhibit pair is rejected by **rule 3 on the merits** (shares only
+     the domain token `kalshi`; coverage 0.33/0.20). ⚠ The verdict was REJECT all along — all
+     three *reasons* were wrong. **A gate that reaches the right answer for a wrong reason is
+     already broken; the next pair it meets is where you find out.**
+     ✅ **Repair 6 immediately paid: it made a REAL contradiction reachable.** Under the old
+     rule 2, `0.4/currency-items/vaal-orbs.md` (0.4) ↔ `currency-orbs/vaal-corruption.md`
+     (version-less) was auto-rejected. Admitted and probed this cycle, the two returned
+     **different Vaal Orb outcome tables**; adjudicated against `poe2wiki.net/wiki/Corrupted`
+     (first-party, via `web`), `vaal-corruption.md` was carrying **PoE1 behavior**
+     (implicit-reroll, rarity-downgrade "brick") — superseded in-cycle. That contradiction had
+     been structurally undiscoverable for the gate's entire life.
+     🆕 **RULE 2b — TIME-SERIES SIBLINGS. Shipped 2026-08-08 in `dream-pair-test` (repair 8,
+     selftest 36/36, commit `6c542d8`); it is the temporal analogue of rule 2 and lands for
+     rule 2's exact reason.** Live fire: `areas/health/daily/2026-05-13.md` ↔
+     `2026-05-19.md` returned ADMIT on `shared=['05','daily','rollup']`. Titles are literally
+     *"Daily rollup — 2026-05-13"*; the family has **88 members ⇒ 3,828 intra-family pairs,
+     every one guaranteed-null** (two different days cannot contradict — no contradiction is
+     even *expressible*). **Rule 1's degeneration for the SIXTH time — rule 3 measuring
+     filename convention, not shared subject — and the first instance found OUTSIDE the PoE2
+     corpus, which is the news: this rung's five prior repairs all read as PoE2-specific, so
+     the disease was mis-scoped as a domain quirk when it is a property of any template family.**
+     - **(8a) `VERSION_RE`'s `20\d{2}-\d{2}-\d{2}` alternative was DEAD CODE.** `tokenize_title`
+       splits on `[^A-Za-z0-9.]+`, so `2026-05-13` is already **three** tokens before VERSION_RE
+       is ever consulted. The YEAR dropped (via the `20\d{2}` branch) while **the MONTH and DAY
+       fragments survived and were counted as significant subject terms** — so repair (2)'s
+       "drop bare years/dates" was only half implemented. Same unreachable-branch class as
+       gate #20; the branch **read** as if it handled dates, so nobody re-checked it. ⚠ **A
+       regex alternative is not reachable just because it is written — check it against the
+       tokenizer that feeds it.**
+     - **(8b) `rollup` → `GENRE_TOKENS`** (a doc genre, like summary/overview). ⛔ **`daily` was
+       deliberately NOT added** — it makes a cadence claim and can be subject-bearing, and
+       dropping `rollup` alone suffices. Every prior rule-3 repair that over-dropped ate a
+       subject noun; take the smaller change.
+     - **(8c) THE LOAD-BEARING FIX, because 8a+8b ALONE MADE IT WORSE.** With the fragments and
+       `rollup` gone, **both titles reduce to the same single term `daily`**, so the SATURATION
+       clause admitted the pair at **coverage 1.000** — harder than before. 📐 **Stripping the
+       discriminator made the two docs look MORE alike: normalizing away noise can MANUFACTURE
+       a false match.** That is the trap under all four prior rule-3 tweaks, stated in one line.
+       So rule 2b **names the real discriminator (time)** instead of deleting more tokens: a
+       differing **date-of-scope EXPLAINS** a disagreement exactly as a differing version does.
+     **Scope is narrow by construction** (mirrors repair 5's *"each tier needs an actual CLAIM"*):
+     the date must be a **terminal PATH SEGMENT** (`.../2026-05-13.md`), which claims the doc IS
+     about that date. A title parenthetical (*"(poe2wiki, live 2026-06-11)"*) is **PROVENANCE** —
+     when it was observed, not what it is about — and is deliberately **not** read, which is what
+     keeps the locked `jewel-desecrate-forcing` ↔ `desecrate-reveal-mechanics` exhibit admitted.
+     **ABSENCE IS NOT A VALUE** (repairs 6/7): both sides must declare. Measured blast radius:
+     **86 path-dated docs corpus-wide, ALL in `areas/health/daily/`** ⇒ 3,655 null pairs rejected,
+     no other family touched; 400-random-pair impact sample = **0** rule2b fires, 0 verdict
+     regressions. Re-measure in one `find`, don't trust this count second-hand.
+     🆕 **RULE 2c — ENUMERATED SIBLINGS (repair 10, 2026-08-08, `5a908a3`, selftest 44/44): the
+     GENERAL shape, of which rule 2b's dates are one special case.** Found by hunting repair 8's
+     **signature** (`differing terms a=[] b=[]`) across other title-token-identical families
+     instead of waiting for a rotation to produce one — the 22-member
+     `substrate-authoring-gates-*` family yielded **66 null ADMITs**, because gates 01-10 and
+     11-20 are different gates exactly as 05-13 and 05-19 are different days. **Test:** strip
+     digits from both basenames; if the remainders are **identical** and the digit sequences
+     **differ**, the docs are consecutive members of one enumerated series and their whole
+     discriminator is a number ⇒ no contradiction expressible. ⛔ **Deliberately NOT
+     *"differing terms empty ⇒ reject"*, which is the tempting one-liner and is REFUTED by this
+     rung's own locked done-test:** `0.4/crafting/essences.md` ↔ `canonical/essences.md` also has
+     empty differing sets (both reduce to `essence`) yet must be ADMITTED, and it carried a real
+     contradiction. It survives because its basenames are identical with **no differing digits** —
+     distinguished by PATH (authority scope), not by an index. 📐 **ENUMERATION AND SCOPE LOOK
+     IDENTICAL TO A TOKEN COUNTER AND MEAN OPPOSITE THINGS**; both directions are locked guards.
+     Measured: gates family 231 pairs → rule2c 34, rule4 165, admits **66 → 32**. ⚠ The 32
+     survivors are a different shape (`derivations-NN` vs `index-NN`: same range, different doc
+     genre) and are left admitted **on purpose — recorded, not silently capped.**
+     📐 **Method note worth more than any single repair: repairs 9 and 10 were both found by
+     auditing the RESIDUAL of repair 8 and by hunting its signature, not by waiting for the next
+     live fire.** One fire, three defects. **When a gate defect is found, ask what else has that
+     shape before closing the cycle** — the rotation surfaces roughly one pair per cycle, so
+     waiting for it to find a family is orders of magnitude slower than querying for the family.
      ⚠ **Rule 1 (`same kind`) is a near-no-op and must NOT be trusted as the rejecting
      rule (measured 2026-07-27): 4,703 of 4,812 KB docs — 97.7% — declare NO `kind`.**
      So ~95.5% of random pairs are both-`<NONE>` and PASS rule 1, while the only pairs it
@@ -376,6 +559,153 @@ probes, `web` for web-grounded ones.)
      were probed and DISSOLVED in full agreement), so treat this as a caveat, not a
      repair: **when counting shared title terms, drop the domain token and the version
      token first, and if what remains is <2, say so rather than reporting a rule-3 pass.**
+     ⚠ **DOC-FAMILY TEMPLATE TERMS ARE THE THIRD DEGENERATION OF RULE 3 — and unlike the
+     domain/version case this one fires COMBINATORIALLY (measured 2026-07-29).** The fire
+     paired `0.5/crafting/es-body-armour-profit-recipe-0.5.md` with
+     `0.5/crafting/evasion-body-armour-profit-recipe-0.5.md` (rank-2 text **0.984**). All four
+     rules PASS honestly: rule 1 (**both `kind: canonical`** — a real same-kind pass, not the
+     usual both-`<NONE>` no-op), rule 2 (both 0.5), rule 3 (after dropping `poe2` + `0.5` the
+     titles still share `body`/`armour`/`profit`/`recipe`), rule 4 (5,780 B and 7,743 B, not
+     aggregators). Probed with 2 cold clones, it **DISSOLVED completely**: the ES doc is a Vile
+     Robe magic base finished with Greater Essence of Enchantment, the evasion doc an ilvl≥82
+     exceptional base finished with Fracture + chaos-spam + Greater Exalt. **Different subjects,
+     therefore different methods — no contradiction is even expressible.**
+     The structural problem: `*-profit-recipe-0.5.md` is a **naming TEMPLATE with 6 members**
+     (`breach-tablet-rolling`, `es-body-armour`, `es-helmet-caster-tiara`, `evasion-body-armour`,
+     `ms-boots`, `wand-caster` — measured by `find`). Every member shares `profit`+`recipe`+
+     version, so **all 15 intra-family pairs pass rule 3**, and every one of them must dissolve
+     **by construction**, because a recipe family is differentiated precisely by the term the
+     pair does NOT share. That is 15 guaranteed-null probes (2 clones each) available to the
+     rotation — the rule stops measuring shared subject and starts measuring **shared filename
+     convention**, exactly as rule 1 came to measure metadata hygiene.
+     **Discriminator to apply before probing — it is rule 1's own logic, one level down:**
+     rule 1 rejects a `recipe` vs a `decision` because *they answer different questions*. Two
+     `canonical` recipes **for different items answer different questions too.** So: after
+     dropping domain, version, AND any term that is corpus boilerplate (**threshold: a term in
+     ≥0.2% of titled docs — re-measure it, do NOT reuse a raw count**; see the calibration note
+     below), ask **what the DIFFERING title terms name**. If they
+     name the subject/base/item being crafted (`es` vs `evasion`, `boots` vs `wand`), the pair
+     is a **FAMILY SIBLING → reject, do not spend clones.** Only probe when the differing terms
+     are incidental and the SUBJECT genuinely coincides.
+     ✅ **The discriminator GENERALIZES beyond the family it was derived from — re-confirmed on a live
+     fire 2026-08-02.** That fire was `0.5/crafting/breach-tablet-rolling-profit-recipe-0.5.md` ↔
+     `0.5/crafting/irradiated-tablet-farming-and-rolling-recipe-0.5.md` (rank-2 text **0.9839**), which
+     sits in the WIDER `*-recipe-0.5.md` template family (**12 members**, so **66** intra-family pairs),
+     not the narrower `*-profit-recipe-0.5.md` family (**6** members / 15 pairs) the rule was written
+     from. Rules 1–4 all pass honestly — rule 1 a REAL same-kind pass (both `kind: canonical`), rule 2
+     both 0.5, rule 3 two surviving shared terms (`tablet`, `rolling`) after dropping `poe2`/`0.5` and
+     the ≥3-title boilerplate `recipe` (46 files), rule 4 neither an aggregator (7.5 KB / 11.6 KB) — so
+     **the family-sibling discriminator is the ONLY thing that rejects it.** Differing terms `breach` vs
+     `irradiated` name the tablet TYPE, i.e. the base being crafted ⇒ different questions ⇒ reject.
+     🔧 **CALIBRATION — the ≥3-title boilerplate cutoff was itself a degeneration, repaired 2026-08-02
+     (measured).** Written as a RAW COUNT with no corpus denominator, it was derived from `recipe` (34
+     titles) and then applied to everything. Measured over all **4,863 titled docs / 3,970 unique title
+     terms**: dropping every term in **≥3** titles removes **83.3% of all title-term occurrence mass**,
+     so rule 3's "≥2 shared significant terms" was being evaluated on the near-hapax 16.7% tail — two
+     docs sharing two terms that each appear in ≤2 titles corpus-wide is essentially a filename
+     near-duplicate. **That is rule 1's degeneration one more time: a clause that stops measuring shared
+     subject and starts measuring rarity.** Caught by a live pair it wrongly rejected —
+     `0.4/endgame/atlas-tower-system.md` ↔ `0.4/endgame/map-juicing.md` (rank-2 text **0.9955**), where
+     the dropped terms were `doctrine` (14 titles, genuine boilerplate) and **`juicing` (3 titles —
+     0.06% of the corpus, i.e. the single most subject-bearing word in both titles)**. Measured
+     separation at **≥10 titles (0.206%)**: DROPS `crafting` 107 · `tablet` 58 · `recipe` 34 · `profit`
+     15 · `doctrine` 14 · `system` 10; KEEPS `tower` 6 · `juicing` 3 — clean on both sides, and it
+     removes 59.2% of mass instead of 83.3%. **Use the FRACTION (≥0.2% of titled docs), not the integer**,
+     because the integer silently retightens as the corpus grows — which is exactly how this clause
+     broke. ⚠ Under the repaired threshold the 2026-08-02 `breach-tablet` fire above loses `tablet`
+     (58 titles ⇒ boilerplate) and keeps only `rolling` ⇒ **rule 3 now rejects it outright**, one rung
+     cheaper than the family-sibling discriminator did. That paragraph's verdict stands; its stated
+     "two surviving shared terms" reasoning is superseded by this note — recorded rather than silently
+     overwritten, because the verdict was right for a reason that no longer applies.
+     ✅ **The wrongly-rejected pair was then probed on the merits and DISSOLVED in full agreement**
+     (2 cold clones, 2026-08-02): both docs make TABLETS the primary juicing lever with towers merely
+     unlocking slots, and both independently state the same 3×3=9 geometry and the same tiered unlock
+     (0–2 mods → 1 slot, 3–5 → 2, 6 → 3). So the corpus is consistent here — the finding is about the
+     GATE, not the docs. **A rule that rejects for the wrong reason still needs fixing even when its
+     verdict happens to match**, because the next pair it mis-rejects will be a real contradiction.
+     🔴 **THE ≥0.2% FRACTION EATS THE DISCRIMINATOR THAT FOLLOWS IT — measured 2026-08-03, and this is
+     an INTERNAL CONTRADICTION, not a tuning nit.** Re-measured over **4,859 titled docs** (threshold =
+     **9.7 titles**), the fraction classifies as "boilerplate" **17 of 20 canonical PoE2 subject nouns**:
+     `omen` 136 · `atlas` 100 · `map` 97 · `essence` 68 · `tablet` 59 · `breach` 52 · `amulet` 40 ·
+     `shield` 40 · `ring` 38 · `jewel` 33 · `energy` 27 · `es` 20 · `desecrate` 19 · `gloves` 19 ·
+     `rune` 17 · `boots` 16 · `catalyst` 16 · `wand` 15 · `armour` 14 · `evasion` 14. Only `sceptre` 5 ·
+     `quarterstaff` 4 · `flask` 3 survive — **and they survive purely by being rare.** The decisive
+     consequence: the family-sibling discriminator directly above instructs you to drop boilerplate and
+     then ask what the **DIFFERING** terms name, citing `es` vs `evasion` and `boots` vs `wand` — **all
+     four of its own worked-example terms are dropped before it runs (20/14/16/15, every one ≥9.7), so
+     the discriminator cannot fire on a single one of its own examples.** A rule whose exhibits its own
+     preprocessing destroys is not calibrated; it is inoperative. This is rule 1's degeneration for the
+     **fourth** time — the clause has stopped measuring shared subject and now measures rarity, which is
+     the exact failure the 2026-08-02 repair was written to end (it moved the cut ≥3 → ≥10 and thereby
+     traded under-dropping for over-dropping; **both directions are the same disease**).
+     🔴 **SECOND, INDEPENDENT DEFECT — RULE 3 COUNTS EXACT TOKENS, SO MORPHOLOGY ALONE CAN ZERO OUT A
+     PAIR THAT SHARES ITS ENTIRE SUBJECT (measured 2026-08-03, live fire).** The fire was
+     `0.5/crafting/jewel-desecrate-forcing.md` ↔ `0.5/crafting/desecrate-reveal-mechanics.md` (rank-2
+     text **0.9951**). Titles: *"Jewel desecration & mod-forcing (PoE2 0.5)"* vs *"Desecrated modifier —
+     reveal mechanics (poe2wiki, live 2026-06-11)"*. Shared **exact** significant tokens: **ZERO** —
+     because `desecration` ≠ `desecrated` and `mod` ≠ `modifier`. Both are `kind: canonical`, both 0.5,
+     neither an aggregator (6,132 B / 4,612 B), and they are unmistakably about the same subject. **So
+     rule 3 rejects at 0 shared terms while the retriever scores them 0.9951 — the under-admitting
+     direction, which none of the three prior degenerations covered (all three were over-admitting).**
+     Note this defect is *upstream* of the threshold: no frequency cut can repair it, since the tokens
+     never match in the first place.
+     🔧 **REPAIR — apply BOTH, they address opposite failure directions:**
+     (1) **Fold morphology before comparing.** Lowercase and strip common inflections (`-s`, `-ed`,
+     `-ing`, `-ion`/`-ions`, `-tion`) and treat a token that is a prefix of another surviving token
+     (≥5 chars) as the same term, so `desecrate`/`desecration`/`desecrated` and `mod`/`modifier` count
+     ONCE. Under this, the pair above shares `desecrat*` + `mod*` = **2** ⇒ rule 3 correctly ADMITS.
+     (2) **Replace the frequency cut with an EXPLICIT GENRE/DOMAIN TOKEN LIST** — the domain name
+     (`poe2`, `poe`), the version marker (`0.4`, `0.5`, bare years/dates), and doc-genre words
+     (`crafting`, `recipe`, `doctrine`, `system`, `mechanic`, `mechanics`, `notes`, `index`, `overview`,
+     `summary`, `guide`, `spec`, `profit`). **A closed list is falsifiable, stays stable as the corpus
+     grows, and by construction never eats a subject noun** — whereas any fraction silently re-tightens
+     or re-loosens with corpus composition, which is how this clause has now broken twice in four days.
+     Regression-checked against every exhibit in this rung: `atlas-tower-system` ↔ `map-juicing` still
+     yields **1** shared term (`juicing`) ⇒ still rejected by rule 3, unchanged verdict; `es-body-armour`
+     ↔ `evasion-body-armour` keeps `body`/`armour` ⇒ admitted by rule 3 and then correctly rejected by
+     the family-sibling discriminator **which can now actually see `es` vs `evasion`**; `breach-tablet`
+     ↔ `irradiated-tablet` keeps `tablet`/`rolling` ⇒ admitted, then rejected on `breach` vs
+     `irradiated` naming the tablet TYPE. **That restores the family-sibling discriminator to being the
+     load-bearing rejecter — which is what this rung says it should be — instead of letting a rarity
+     proxy do that job invisibly and for the wrong reason.**
+     ✅ **The 0.9951 pair was probed on the merits anyway (2 cold clones, 2026-08-03) and DISSOLVED in
+     full agreement:** both docs state **3 offered modifiers, player chooses 1**, and both give Abyssal
+     Echoes as a **single** reroll of those 3. The apparent divergence — the reveal doc lists the Lich
+     omens (Blackblooded→Kurgal, Liege→Amanamu, Sovereign→Ulaman) while the forcing doc gives
+     Sinistral/Dextral Necromancy side-locking — is **complementary scope, not contradiction**, because
+     the jewel doc states outright that jewel desecrations *cannot* use Lich omens (incompatible pool).
+     Corpus consistent; the finding is about the GATE.
+     ⚠ **Verify the glob before "correcting" either count.** This cycle first read the family as 12 via a
+     loose `grep -c 'recipe-0.5.md'` and nearly rewrote the accurate "6 members" line; `ls
+     *-profit-recipe-0.5.md` is still exactly 6. **Two different families, two correct numbers** — the
+     stale-measurement reflex this rung warns about cuts both ways, and a "fix" applied to a correct
+     line is a regression. Re-measure with the SAME glob the prose names.
+     ⛔ **DERIVATIONAL MORPHOLOGY IS A KNOWN, MEASURED, AND DELIBERATELY-UNREPAIRED GAP IN
+     `_fold` — the obvious fix is REFUTED BY THE CORPUS, so do NOT ship it (2026-08-07, n=4,920
+     titled docs / 3,660 folded terms).** Repair (1) folds *inflectional* suffixes only
+     (`SUFFIXES = ations|ation|ions|ion|tion|ing|ed|es|s`) plus prefix-containment; it therefore
+     **cannot** merge a *derivational* pair whose stems diverge mid-word. Live exhibit found this
+     cycle: `resources/finances.md` ("Financial Profile") ↔ `areas/mike-finance-tooling.md`
+     ("Mike's Finance Tooling Inventory") reports **`0 shared significant terms: []`**, because
+     `financial` and `finance` neither fold (no `-ial` rule) nor prefix-contain (`finance` is not a
+     prefix of `financial` — they split at char 7).
+     **The tempting repair — "merge tokens sharing a ≥6-char prefix" — was measured and REJECTED.**
+     Over the corpus it would newly merge **159** term pairs, and the head of that list is
+     poisonous: **`currency`/`current`** (56 vs 7 titles — `currency` is one of the most
+     subject-bearing nouns in the PoE2 domain), `general`/`generator`, `general`/`generative`,
+     `identity`/`identical`, `identity`/`identify`, `convergence`/`convers*`, `sinister`/`sinistral`.
+     It buys true folds (`economic`/`economy`, `skeletal`/`skeleton`, `defense`/`defensive`,
+     `alchemist`/`alchemy`) at the price of collapsing distinct subjects — **which is rule 1's
+     degeneration for the fifth time, in the over-admitting direction.** A closed explicit list
+     (repair 2's doctrine) stays the only safe shape here, and nobody has yet paid for one.
+     ✅ **Scope the gap honestly: no verdict is known to be wrong because of it.** On the exhibit
+     pair, folding `financial`≈`finance` yields n_shared=1, coverage 0.50/0.25 ⇒ **still REJECT**.
+     So this is an under-stated *reason*, not a proven bad *verdict* — logged as a gap, not a
+     repair, precisely because this rung's own doctrine ("a gate that reaches the right answer for
+     a wrong reason is already broken") has to be weighed against its other doctrine (four prior
+     rule-3 tweaks each broke something). **Re-measure before ever revisiting: the 159-pair list is
+     regenerable in ~30 s from `read_doc`+`tokenize_title`; do not trust this count second-hand.**
+
      ⚠ **VERSION-SPANNING PAIRS ARE THE DOMINANT FIRE CLASS AND ARE NOT TENSIONS**
      (measured on the gate's first live rotation, 2026-07-26). The very first fire
      paired `poe2/0.5/crafting/jewellery-quality-system.md` with
@@ -405,6 +735,32 @@ probes, `web` for web-grounded ones.)
      pairs. **Lesson (gate #20 class): a threshold is only a test if some real input
      can cross it — check reachability against the metric's actual range before
      trusting a negative.**
+     🔴 **THE ≥0.98 GATE IS ITSELF NOW RETIRED — DELETED, NOT RE-TUNED (2026-08-04, measured
+     n=18). Take rank-1/rank-2 from each query and feed the pair STRAIGHT to `dream-pair-test`;
+     that tool is the gate. Do NOT apply any similarity threshold first.** The number was
+     re-measured against the structural tool over 18 queries spanning poe2 / kalshi / finance /
+     french, and it is **worse than no filter on both axes**:
+     - **Precision 2/7 (28.6%)** — of the 7 pairs that cleared ≥0.98, `dream-pair-test` rejected
+       5 outright (rules 2/3/4). The gate's "genuinely tight pairs" are mostly junk.
+     - **Recall 2/5 (40%)** — it **discarded 3 of the 5 structurally-admissible pairs**, i.e. the
+       gate threw away 60% of the real candidates.
+     What it discarded is the indictment: `canonical/essences.md` ↔ `0.4/crafting/essences.md`
+     at **0.9735** — *the exact canonical-vs-versioned pair the saturation repair shipped hours
+     earlier (2026-08-03) to admit.* So the repair was **unreachable through discovery**: rule 3
+     was fixed to admit a pair the upstream number never emitted. **And that pair carried a REAL
+     same-version contradiction** — the 0.4 doc asserted a *"Perfect/Corrupted Essence of the
+     Abyss"* while canonical lists Abyss as **Corrupted-only**; probed and repaired this cycle
+     against poe2db (tier-1: `Essence of the Body` renders Lesser/Greater/Perfect forms,
+     `the Abyss`/`Hysteria`/`Horror` render bare-name only). **The gate was not merely filtering
+     candidates — it was hiding a live defect for as long as it existed.**
+     **Why deletion is free, and why this is not a fourth number:** `dream-pair-test` is
+     deterministic and costs **zero model tokens**, so it can absorb every pair. Measured on the
+     same 18: it rejects **13/18 (72%)** mechanically and surfaces 5 for judgment. A numeric
+     pre-filter can therefore only ever *subtract* recall — it buys nothing the free tool
+     wasn't already going to do. This is the doctrine below carried to its conclusion: all three
+     similarity proxies are dead, and the honest successor to a dead number is **no number**,
+     not a fourth one. ⚠ Rank-2 `text` remains fine as a *display* value in the cycle log; it is
+     simply no longer permitted to reject anything.
      ⚠ **ALL THREE SIMILARITY PROXIES ARE NOW DEAD — do NOT propose a fourth number
      (2026-07-26 reflect, measured).** (1) `score > 0.7` was **unreachable** (ceiling
      0.600). (2) rank-2 `components.text ≥ 0.98` is **content-blind**: RRF is
