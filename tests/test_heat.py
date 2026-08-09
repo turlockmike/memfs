@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-from mvm.heat import heat_counts, has_tests, is_retired, main
+from mvm.heat import heat_counts, has_tests, is_retired, is_staging, main
 
 
 def _mk(root: Path, rel: str, text="# doc"):
@@ -110,3 +110,70 @@ def test_untested_worklist_excludes_retired_but_ranking_keeps_it(
     main(["--json", "--log", str(log), "--root", str(root)])
     ranked = [r["path"] for r in json.loads(capsys.readouterr().out)["rows"]]
     assert "resources/dead.md" in ranked
+
+
+def test_is_staging_matches_path_segment_only():
+    """MUST-FIRE and MUST-NOT-FIRE, both directions, by name.
+
+    `_unverified` is a directory convention. Matching it as a substring would
+    also swallow ordinary docs that merely mention the word in a filename —
+    the over-reach that /dream's rule-3 cousins have degenerated into five
+    separate times. Absence of the segment is not evidence of staging.
+    """
+    # must fire — a real staging path, at any depth
+    assert is_staging("resources/poe2/facts/_unverified/build-warrior/x.md")
+    assert is_staging("resources/_unverified/x.md")
+    assert is_staging("resources/poe2/opinions/_unverified/a/b/c.md")
+    # must NOT fire — substring lookalikes and ordinary docs
+    assert not is_staging("resources/poe2/facts/notes_unverified.md")
+    assert not is_staging("resources/poe2/_unverified-summary/x.md")
+    assert not is_staging("resources/poe2/canonical/essences.md")
+    # the segment must be a DIRECTORY, never the basename itself
+    assert not is_staging("resources/poe2/_unverified.md")
+
+
+def test_untested_worklist_excludes_staging_but_ranking_keeps_it(
+        tmp_path, capsys):
+    """A doc under `_unverified/` must never be nominated for test authoring.
+
+    Regression lock for the 2026-08-09 finding: 11 of 50 rows on the untested
+    worklist were self-declared staging docs, and the TOP nomination's own body
+    read "Canonical: (to be distilled)" + "[ ] Cross-check against poe2db.tw".
+    A locked test authored from such a doc is written from the same unverified
+    source as the doc, so it passes forever — laundering an unverified claim
+    into a green oracle. Strictly worse than the retired case above, which
+    merely wastes budget.
+    """
+    root = tmp_path / "knowledge"
+    _mk(root, "resources/facts/_unverified/staged.md", "raw claim, 1 video")
+    _mk(root, "resources/facts/distilled.md", "canonical body")
+    log = tmp_path / "rl.jsonl"
+    entries = [
+        # the staging doc is HOTTER, so absent the filter it sorts first
+        {"question": "q1", "decided_answer": "a", "kind": "recall",
+         "evidence_paths": ["resources/facts/_unverified/staged.md"]},
+        {"question": "q2", "decided_answer": "a", "kind": "recall",
+         "evidence_paths": ["resources/facts/_unverified/staged.md"]},
+        {"question": "q3", "decided_answer": "a", "kind": "recall",
+         "evidence_paths": ["resources/facts/distilled.md"]},
+    ]
+    log.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    main(["--untested", "--json", "--log", str(log), "--root", str(root)])
+    out = json.loads(capsys.readouterr().out)
+    paths = [r["path"] for r in out["rows"]]
+    assert "resources/facts/_unverified/staged.md" not in paths, \
+        "staging doc leaked into the test-authoring worklist"
+    # must-still-convict direction: the fix is an exclusion, never an amnesty —
+    # a legitimate untested doc must still be nominated.
+    assert "resources/facts/distilled.md" in paths
+    # exclusion is REPORTED, never silent
+    assert out["summary"]["staging_excluded"] == 1
+    assert out["summary"]["staging_excluded_paths"] == [
+        "resources/facts/_unverified/staged.md"]
+
+    # ...but the plain ranking still shows it: staging content that IS grounding
+    # recalls is itself a real signal, so it must not vanish from the ranking.
+    main(["--json", "--log", str(log), "--root", str(root)])
+    ranked = [r["path"] for r in json.loads(capsys.readouterr().out)["rows"]]
+    assert "resources/facts/_unverified/staged.md" in ranked

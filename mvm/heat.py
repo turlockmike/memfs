@@ -24,7 +24,7 @@ import json
 import os
 import re
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 DEFAULT_LOG = Path(os.environ.get(
     "MVM_RECALL_LOG", str(Path.home() / "mvm" / "state" / "recall-log.jsonl")))
@@ -130,6 +130,43 @@ def is_retired(relpath: str, root: Path) -> bool:
     return False
 
 
+# Staging-tree exclusion — the SAME defect as _RETIRED_STATUS above, in the
+# opposite polarity (2026-08-09, dream cycle).
+# WHY: `--untested` is the worklist /dream step-5 reads to pick a doc to author
+# LOCKED TESTS for. A doc under `_unverified/` is self-declared staging: it has
+# not been distilled or cross-checked, and 1,240 of the 2,445 such docs still
+# carry a literal "Verification TODO" section telling you so. Authoring a locked
+# test against one does not merely waste budget the way a retired doc does — it
+# is actively harmful, because the test would be written from the SAME
+# unverified single-source claim as the doc, so it PASSES FOREVER and launders
+# an unverified claim into a green oracle. That is exactly the class
+# `contamination-scan` exists to catch ("a doc self-consistent with its OWN
+# tests but contradicting a canonical allowlist"), manufactured on purpose.
+# Measured when added: 11 of the 50 rows on the untested worklist were staging
+# docs, and the single top-ranked nomination
+# (facts/_unverified/build-warrior/amulet-melee-skills-rolls.md) had a body
+# reading "Canonical: (to be distilled)" + "[ ] Cross-check top consensus value
+# against poe2db.tw" — i.e. the tool was pointing verification budget at a doc
+# whose own text says it is not yet verifiable.
+# Scope is deliberately narrow, matching is_retired(): staging docs stay in the
+# plain heat RANKING, because heat on unverified content is itself a real signal
+# (staging material is reaching retrieval and grounding recalls) — it is only
+# barred from the test-AUTHORING worklist, and it is REPORTED, never dropped
+# silently.
+_STAGING_SEGMENT = "_unverified"
+
+
+def is_staging(relpath: str) -> bool:
+    """True if the doc lives under an `_unverified/` staging directory.
+
+    Matches a whole PATH SEGMENT, never a substring: `notes_unverified.md` and
+    `_unverified-summary.md` are ordinary docs that merely mention the word, and
+    excluding them would be the same over-reach this module's rule-3 cousins in
+    /dream have degenerated into repeatedly.
+    """
+    return _STAGING_SEGMENT in PurePosixPath(relpath).parts[:-1]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Retrieval-heat ranking + hot-doc test coverage.")
@@ -152,6 +189,10 @@ def main(argv=None) -> int:
         retired_skipped = [r["path"] for r in rows
                            if is_retired(r["path"], args.root)]
         rows = [r for r in rows if r["path"] not in set(retired_skipped)]
+        # Never nominate self-declared staging content for test authoring; a
+        # test authored from an unverified doc launders it into a green oracle.
+        staging_skipped = [r["path"] for r in rows if is_staging(r["path"])]
+        rows = [r for r in rows if r["path"] not in set(staging_skipped)]
     rows = rows[:args.top]
 
     hot_all = [{"path": p, "tested": has_tests(p, args.root)}
@@ -167,6 +208,8 @@ def main(argv=None) -> int:
     if args.untested:
         summary["retired_excluded"] = len(retired_skipped)
         summary["retired_excluded_paths"] = retired_skipped
+        summary["staging_excluded"] = len(staging_skipped)
+        summary["staging_excluded_paths"] = staging_skipped
 
     if args.json:
         print(json.dumps({"summary": summary, "rows": rows}, indent=1))
@@ -179,6 +222,12 @@ def main(argv=None) -> int:
                   f"from the test-authoring worklist "
                   f"(matches mvm sweep untested_hot):")
             for p in retired_skipped:
+                print(f"    - {p}")
+        if args.untested and staging_skipped:
+            print(f"Excluded {len(staging_skipped)} _unverified/ staging doc(s) "
+                  f"from the test-authoring worklist (a locked test authored "
+                  f"from an unverified doc passes forever and launders it):")
+            for p in staging_skipped:
                 print(f"    - {p}")
         print()
         for r in rows:
