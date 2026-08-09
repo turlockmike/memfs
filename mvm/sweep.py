@@ -47,7 +47,7 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 DEFAULT_ROOT = Path(os.environ.get(
     "MVM_KNOWLEDGE_ROOT", str(Path.home() / "mvm" / "knowledge")))
@@ -274,6 +274,25 @@ def _is_retired(root: Path, relpath: str) -> bool:
     return frontmatter(text).get("status", "").lower() in _RETIRED_STATUS
 
 
+# Kept in lockstep with heat.py's is_staging() for the same reason
+# _RETIRED_STATUS is kept in lockstep with its is_retired(): these two tools
+# publish the SAME test-authoring worklist at two thresholds, so a doc excluded
+# by one and nominated by the other makes them look like they contradict each
+# other (exactly the 2026-07-25 confusion). Added 2026-08-09 with heat.py's
+# copy: a `_unverified/` doc is self-declared staging, and a locked test
+# authored from one is written from the same unverified source as the doc, so
+# it passes forever and launders an unverified claim into a green oracle.
+# This filter is DORMANT today (no staging doc has yet crossed HOT_MIN_RECALLS,
+# so untested_hot reports 0 rows either way) — it is here so the defect cannot
+# wake up silently the first time one does.
+_STAGING_SEGMENT = "_unverified"
+
+
+def _is_staging(relpath: str) -> bool:
+    """Whole-path-segment match only — see heat.is_staging for the rationale."""
+    return _STAGING_SEGMENT in PurePosixPath(relpath).parts[:-1]
+
+
 def check_untested_hot(root: Path, ever):
     rows = []
     for path, n in ever.most_common():
@@ -285,6 +304,8 @@ def check_untested_hot(root: Path, ever):
             continue
         if _is_retired(root, path):
             continue
+        if _is_staging(path):
+            continue
         rows.append({"path": path, "recalls_ever": n})
     # State what the threshold HIDES. A "0 untested hot docs" headline is only
     # honest next to the count just below the bar — otherwise the threshold is
@@ -292,10 +313,21 @@ def check_untested_hot(root: Path, ever):
     below = sum(1 for p, n in ever.items()
                 if n < HOT_MIN_RECALLS and (root / p).is_file()
                 and not (root / p.replace(".md", ".tests.yaml")).is_file()
-                and not _is_retired(root, p))
+                and not _is_retired(root, p)
+                and not _is_staging(p))
+    # Report what the staging filter withheld, at BOTH the hot and below-bar
+    # populations — an exclusion that shrinks a worklist silently reads as
+    # "nothing to do", which is the failure this whole check exists to prevent.
+    staging_excluded = sum(1 for p, n in ever.items()
+                           if (root / p).is_file()
+                           and not (root / p.replace(".md",
+                                                     ".tests.yaml")).is_file()
+                           and not _is_retired(root, p)
+                           and _is_staging(p))
     return {"rows": rows,
             "hot_threshold_recalls": HOT_MIN_RECALLS,
             "untested_below_threshold": below,
+            "staging_excluded": staging_excluded,
             "docs_with_any_heat": len(ever)}
 
 
@@ -519,6 +551,14 @@ def _fixture(tmp: Path):
     doc("resources/hot-superseded.md",
         "title: hs\nstatus: superseded\n"
         "superseded_by: resources/hot-tested.md")
+    # hot + no tests BUT under `_unverified/` staging -> must NOT be flagged.
+    # A locked test authored from an unverified doc is written from the same
+    # unverified source, so it passes forever and launders the claim.
+    doc("resources/facts/_unverified/hot-staged.md", "title: hstg")
+    # LOOKALIKE that must STILL be flagged: `_unverified` appears in the
+    # BASENAME, not as a directory segment. Pins the segment match against the
+    # substring over-reach that would swallow ordinary docs.
+    doc("resources/facts/notes_unverified.md", "title: nu")
     doc("resources/cold-decayed.md", "title: cd")                           # cold_decayed
     # Exactly ONE lifetime recall, all of it outside the window. Pins the
     # DECAYED floor at >=1: any "fix" that raises it to HOT_MIN_RECALLS (the
@@ -554,6 +594,14 @@ def _fixture(tmp: Path):
     for _ in range(2):
         lines.append(json.dumps({"kind": "recall", "ts": fresh,
                                  "evidence_paths": ["resources/hot-tested.md"]}))
+    for _ in range(3):
+        lines.append(json.dumps({
+            "kind": "recall", "ts": fresh,
+            "evidence_paths": ["resources/facts/_unverified/hot-staged.md"]}))
+    for _ in range(3):
+        lines.append(json.dumps({
+            "kind": "recall", "ts": fresh,
+            "evidence_paths": ["resources/facts/notes_unverified.md"]}))
     for _ in range(2):
         lines.append(json.dumps({"kind": "recall", "ts": fresh,
                                  "evidence_paths": ["resources/hot-superseded.md"]}))
@@ -664,6 +712,14 @@ def selftest() -> int:
               "resources/never.md" not in uh)
         check("untested_hot does NOT flag a hot doc RETIRED via status: superseded",
               "resources/hot-superseded.md" not in uh)
+        check("untested_hot does NOT flag a hot doc under _unverified/ staging",
+              "resources/facts/_unverified/hot-staged.md" not in uh)
+        # must-still-convict: the filter is a segment match, not a substring —
+        # a doc merely NAMED *_unverified.md is ordinary and stays nominated.
+        check("untested_hot STILL flags a lookalike (_unverified in basename)",
+              "resources/facts/notes_unverified.md" in uh)
+        check("untested_hot reports what the staging filter withheld",
+              c["untested_hot"]["staging_excluded"] == 1)
 
         bl = {(r["path"], r["link"]) for r in c["broken_links"]["rows"]}
         check("broken_links finds the dead relative link",
