@@ -65,6 +65,45 @@ def _normalized_tokens(text: str) -> set[str]:
     return set(tokens[:500])  # cap for speed
 
 
+# Trees that are byte-identical mirrors of a primary tree. `mvm-mirror` (cron
+# */5) keeps ~/resources <-> ~/mvm/knowledge/resources in sync, so the SAME
+# logical note is indexed under two Node paths. Left unhandled, one logical
+# pair (X,Y) emits up to FOUR link candidates -- (X,Y), (mX,Y), (X,mY),
+# (mX,mY) -- all with an identical jaccard score.
+#
+# Measured 2026-08-08 (auditor #188 REC 1): the 2026-08-08T00:30 autolink run
+# applied 49 raw edges covering only 14 distinct logical pairs -- a 3.50x
+# inflation of the connectivity number the consolidation arm grades itself on,
+# while 11,010 orphans went untouched. 43 of the 49 scored exactly 0.545,
+# the signature of one score smeared across mirror spellings.
+_MIRROR_PREFIXES = ("mvm/knowledge/",)
+
+
+def _canonical_path(path: str) -> str:
+    """Collapse a mirror spelling to its primary-tree spelling.
+
+    Pure string operation on the indexed relative path -- no filesystem
+    access -- so it is safe to call inside the pair loop.
+    """
+    for pfx in _MIRROR_PREFIXES:
+        if path.startswith(pfx):
+            return path[len(pfx):]
+    return path
+
+
+def _mirror_rank(pair: tuple[str, str]) -> tuple[int, str, str]:
+    """Deterministic preference key among spellings of one logical pair.
+
+    Prefers the spelling with the FEWEST mirror-prefixed paths (i.e. the
+    primary tree), tie-broken lexicographically. Determinism matters across
+    runs: if run N applies the edge under spelling A and run N+1 emits
+    spelling B, the already-linked check misses and the pair is re-applied
+    forever. Same key every run => converges after one application.
+    """
+    mirrored = sum(1 for p in pair if p != _canonical_path(p))
+    return (mirrored, pair[0], pair[1])
+
+
 # ----- individual candidate finders -----
 
 def find_orphans(graph, orphan_days: int = 30) -> list[dict]:
@@ -408,15 +447,43 @@ def find_content_similar_unlinked(
                     continue
                 pair_scores[(a, b)] = score
 
+    # --- collapse mirror twins BEFORE the limit is spent -------------------
+    # Order matters and is the whole point: deduping AFTER the cap would make
+    # the ratio honest by *shrinking* coverage (50 raw -> ~14 real). Deduping
+    # BEFORE the cap spends all `limit` slots on distinct logical pairs.
+    spellings_by_canon: dict[str, list[str]] = defaultdict(list)
+    for p in tokens_by_path:
+        spellings_by_canon[_canonical_path(p)].append(p)
+
+    logical: dict[tuple[str, str], tuple[tuple[str, str], float]] = {}
+    for (a, b), score in pair_scores.items():
+        ca, cb = _canonical_path(a), _canonical_path(b)
+        if ca == cb:
+            continue  # a node paired with its own mirror is not a link
+        key = (ca, cb) if ca < cb else (cb, ca)
+        prev = logical.get(key)
+        # Keep the highest score; on ties keep the preferred (primary-tree)
+        # spelling so the choice is stable across runs.
+        if prev is None or score > prev[1] or (
+            score == prev[1] and _mirror_rank((a, b)) < _mirror_rank(prev[0])
+        ):
+            logical[key] = ((a, b), score)
+
     # Highest score first. Oversample then filter already-linked pairs.
     out: list[dict] = []
-    for (a, b), score in sorted(pair_scores.items(), key=lambda x: -x[1]):
+    for (ca, cb), ((a, b), score) in sorted(
+        logical.items(), key=lambda x: (-x[1][1], x[0])
+    ):
         if len(out) >= limit:
             break
+        # Already-linked test is asked in LOGICAL space: an edge recorded
+        # under any mirror spelling means this pair is connected. Asking it
+        # per-spelling is what let the same pair be re-applied 4x.
         existing = graph.run_scalar(
-            """MATCH (x:Node {path: $a}),(y:Node {path: $b})
-               RETURN EXISTS( (x)-[:LINK]-(y) ) AS has""",
-            a=a, b=b,
+            """MATCH (x:Node)-[:LINK]-(y:Node)
+               WHERE x.path IN $pa AND y.path IN $pb
+               RETURN count(*) > 0 AS has""",
+            pa=spellings_by_canon[ca], pb=spellings_by_canon[cb],
         )
         if existing:
             continue

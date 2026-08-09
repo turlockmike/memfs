@@ -49,11 +49,21 @@ def _disable_semantic_contradiction():
     os.environ["MEMFS_CONTRADICTION_SKIP_SEMANTIC"] = "1"
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def _ensure_schema():
     """Create schema once per session; tests wipe data each run.
 
     Two-layer production guard — see module docstring.
+
+    2026-08-08: this was `autouse=True`, which skipped the ENTIRE suite
+    whenever no test Neo4j was up — including tests that never touch a
+    graph at all. Net effect on a box with only a production instance
+    (the normal state here): memfs had zero runnable oracles, so pure-
+    logic regressions could not be caught by anything. It is now
+    demand-driven — requested by the `graph` fixture, which is the only
+    thing that wipes. BOTH guards are unchanged and still gate every
+    destructive path; graph-free tests simply no longer pay for a
+    protection they don't need.
     """
     # GUARD 1: explicit opt-in
     if os.environ.get("MEMFS_TEST_ALLOW_WIPE") != "1":
@@ -101,7 +111,7 @@ def _ensure_schema():
 
 
 @pytest.fixture
-def graph():
+def graph(_ensure_schema):
     """Fresh graph for each test. Wipes all Node/Query/Claim/Access/edges
     before yield.
 
