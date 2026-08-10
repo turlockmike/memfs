@@ -30,7 +30,7 @@ def _edges_for(body: str, fm: dict, root: Path):
 
 def test_gap0_tilde_resources_target_normalizes_to_root_relative():
     """`~/resources/.../B.md` must store as root-relative `resources/.../B.md`."""
-    root = Path("/home/mike/mvm/knowledge")
+    root = Path.home() / "mvm" / "knowledge"
     edges = _edges_for("# A\n", {"superseded_by": "~/resources/poe2/B.md"}, root)
     supers = [e for e in edges if e[2] == "frontmatter_superseded_by"]
     assert supers, "superseded_by edge must be emitted"
@@ -41,7 +41,7 @@ def test_gap0_tilde_resources_target_normalizes_to_root_relative():
 
 def test_gap0_mirror_knowledge_path_normalizes():
     """`~/mvm/knowledge/resources/B.md` also normalizes to `resources/B.md`."""
-    root = Path("/home/mike/mvm/knowledge")
+    root = Path.home() / "mvm" / "knowledge"
     edges = _edges_for("# A\n", {"superseded_by": "~/mvm/knowledge/resources/B.md"}, root)
     supers = [e for e in edges if e[2] == "frontmatter_superseded_by"]
     assert supers and supers[0][1] == "resources/B.md", supers
@@ -49,7 +49,7 @@ def test_gap0_mirror_knowledge_path_normalizes():
 
 def test_gap0_already_relative_target_unchanged():
     """An already root-relative target is preserved verbatim (no double-mangling)."""
-    root = Path("/home/mike/mvm/knowledge")
+    root = Path.home() / "mvm" / "knowledge"
     edges = _edges_for("# A\n", {"superseded_by": "resources/poe2/B.md"}, root)
     supers = [e for e in edges if e[2] == "frontmatter_superseded_by"]
     assert supers and supers[0][1] == "resources/poe2/B.md", supers
@@ -57,7 +57,7 @@ def test_gap0_already_relative_target_unchanged():
 
 def test_gap1_new_relation_keys_emit_typed_edges():
     """supersedes / in_tension_with / derived_from must now emit typed edges."""
-    root = Path("/home/mike/mvm/knowledge")
+    root = Path.home() / "mvm" / "knowledge"
     fm = {
         "supersedes": "resources/old.md",
         "in_tension_with": ["resources/x.md", "resources/y.md"],

@@ -55,7 +55,8 @@ DEFAULT_LOG = Path(os.environ.get(
     "MVM_RECALL_LOG", str(Path.home() / "mvm" / "state" / "recall-log.jsonl")))
 DEFAULT_WORKLIST = Path(os.environ.get(
     "MVM_SWEEP_WORKLIST",
-    str(Path.home() / ".local" / "state" / "alfred" / "mvm-sweep" / "worklist.json")))
+    str(Path(os.environ.get("MVM_STATE", str(Path.home() / "mvm" / "state")))
+        / "mvm-sweep" / "worklist.json")))
 
 COLD_WINDOW_DAYS = 30
 HOT_MIN_RECALLS = 2          # "hot" = grounded >=2 real recalls, ever

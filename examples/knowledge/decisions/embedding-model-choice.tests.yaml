@@ -1,0 +1,20 @@
+# Example locked tests for embedding-model-choice.md
+# Demonstrates the test-quality gates from /mvm-ingest:
+#   - naked-unanswerable: a naked clone cannot know THIS project's decision
+#   - scope: each expected answer answers its question and nothing more
+#   - transfer (id 3): answer stated nowhere verbatim; derivable from the principle
+#   - oracle-independence: in a real ingest, >=1 expected answer is confirmed
+#     against a source the doc's author did not use (name it in a comment here)
+- id: 1
+  q: "Which embedding approach does this project use for semantic search, and via what library?"
+  a: "A local ONNX embedding model via fastembed"
+- id: 2
+  q: "What is the top-ranked reason this project avoids a hosted embedding API?"
+  a: "Ingest-time coupling: every KB write triggers a re-embed, and the write path should not depend on network or billing state"
+- id: 3
+  # TRANSFER item: not stated verbatim anywhere in the doc.
+  q: "By this project's own decision principle, would a cloud-hosted spell-checker that runs on every KB write be acceptable?"
+  a: "No — it sits on the write path, so it should be the dependency with the fewest external failure modes (local), since a write-path outage silently becomes knowledge loss"
+- id: 4
+  q: "Name one concrete trigger that would cause this embedding decision to be revisited."
+  a: "Corpus outgrows sub-minute local re-embeds, or retrieval quality measurably lags a hosted embedder on a frozen-question A/B"

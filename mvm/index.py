@@ -60,7 +60,7 @@ def _embed_model():
 # bge-small-en-v1.5 silently truncates input at 512 tokens (~400 words). A single
 # whole-doc embedding therefore represents ONLY the head of any long doc — the tail
 # is invisible to semantic search (proven 2026-06-24: cos(embed(full), embed(head400))
-# == 1.0 for a 2400-word doc; finances.md's Compassion/Zelle/Monarch content lived past
+# == 1.0 for a 2400-word doc; a personal-finance doc's tail content lived past
 # the window and returned from NO query). Fix: split each doc into <=512-token chunks,
 # embed every chunk, mean-pool into one renormalized 384-dim vector. Schema unchanged
 # (still one vector per path). Short docs (<=350 words) are a single chunk → identical

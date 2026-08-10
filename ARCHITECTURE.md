@@ -26,24 +26,33 @@ These hold across the entire system. Every component honors them.
 ## Component map
 
 ```
-~/.claude/skills/                  ← agent-invoked protocols
-├── mvm-ingest/SKILL.md            (~70 lines, write side)
-├── mvm-recall/SKILL.md            (~50 lines, read side)
-└── mvm-dream/SKILL.md             (~70 lines, offline integration + meta-audit)
+skills/ → ~/.claude/skills/        ← agent-invoked protocols (install by copy)
+├── mvm-ingest/SKILL.md             write side: locked tests → cold-clone exam → commit or refuse
+├── mvm-recall/SKILL.md             read side: naked/KB/web probes, reconciled + logged
+└── mvm-dream/SKILL.md              offline integration + meta-audit
 
-~/mvm/bin/                         ← CLI primitives (PATH-resident via symlink)
-├── mvm verify                        cold-clone subprocess (out-of-session fallback)
-├── mvm index                          FTS5 + graph adjacency rebuild
+agents/ → ~/.claude/agents/        ← cold-clone instruments the skills spawn (install by copy)
+├── mvm-naked-clone.md              weight-prior probe (tools: [])
+├── mvm-kb-clone.md                 KB-only probe (mvm search + Read/Grep)
+└── mvm-web-clone.md                web-only probe (WebSearch/WebFetch)
+
+bin/mvm + mvm/*.py                 ← CLI primitives (PATH-resident via symlink)
+├── mvm verify                        cold-clone subprocess (out-of-session fallback); --lift differential
+├── mvm index                         FTS5 + vectors + graph adjacency rebuild; --verify integrity gate
 ├── mvm search                        tri-mode retrieval (text + graph + hierarchy)
-└── mvm stats                          decoherence dashboard
+├── mvm stats                         decoherence dashboard over the recall log
+├── mvm sweep                         deterministic curation worklist (zero-token enumeration)
+├── mvm heat                          retrieval-heat ranking (verification budget follows usage)
+├── mvm relations / backlinks         graph edges: superseded_by, in_tension_with, links
+└── mvm log                           recall/dream log reader
 
-~/mvm/state/                       ← runtime state
+~/mvm/state/                       ← runtime state (created on first use)
 ├── recall-log.jsonl                one entry per recall
 ├── dream-log.jsonl                 one entry per dream cycle
-├── index.db                        SQLite + FTS5
+├── index.db                        SQLite FTS5 + vectors
 └── graph.db                        adjacency table
 
-~/mvm/knowledge/                   ← user-curated KB
+~/mvm/knowledge/                   ← user-curated KB (yours; see examples/knowledge/)
 ├── <topic>.md                      canonical content + frontmatter
 └── <topic>.tests.yaml              locked Q/A test cases
 ```
@@ -129,7 +138,7 @@ Default: **KB > web > weights**.
 - KB and web silent + weights grounded → return naked, flag "from prior, not in KB", no ingest (general knowledge — KB shouldn't have it)
 - All silent → hard miss, refuse, log gap
 
-**Curated-domain override:** declared domains (e.g. PoE2 mechanics, finance, kalshi) always prefer KB even at lower confidence. The substrate is canonical for those topics by user contract.
+**Curated-domain override:** domains the user declares as curated (their game knowledge, their finances, their trading data — whatever they maintain deliberately) always prefer KB even at lower confidence. The substrate is canonical for those topics by user contract.
 
 **Superseding override:** if web has a clearly fresher source (date markers, "as of", "updated") and contradicts KB, web wins; old canonical is marked `superseded` and a fresh canonical is ingested.
 
@@ -163,7 +172,7 @@ Per dream cycle: depends on activity; bounded at 3 ingestions per cycle. Typical
 | Confidence score field on probe output | Yes | LLM self-reported confidence is poorly calibrated. Rationale field carries the real signal (provenance) |
 | `DONT-KNOW` as expected answer for negative tests | Yes | Throws away useful signal. Better: every test has a real expected; hallucination = high-rationale-confidence + wrong answer |
 | Random sampling in /dream's quality and staleness checks | Yes | Oldest-mtime-first is a better priority. Random was the dumb default |
-| Custom subagent definitions (mvm-retriever.md, mvm-grader.md) | Yes | Mike: skills only, no agent definitions. Prompt-level tool restriction works empirically (15/15 compliance on haiku) |
+| Custom retriever/grader subagent definitions | Partly | Original design decision: skills only — prompt-level tool restriction works empirically (15/15 compliance on haiku). Later revised: the three clone probes (`agents/mvm-*.md`) earn their definitions by enforcing tool restriction STRUCTURALLY (`tools: []`), which a prompt cannot |
 | Separate sink files (quality-failures.jsonl, staleness-flags.jsonl, contested.jsonl) | Yes | Sinks = leaks. Anomalies resolve in-cycle via cross-check + action; transient ones are recorded in dream-log |
 | Sequential Phase 0 / Phase 1 / Phase 2 in /mvm-recall | Yes | Parallel-3 probes is ~300× cheaper than opus and gives differential signal on every recall |
 | Heavy + light ingest modes | Yes | Light mode skipped source extraction; "thorough always" is the right default. Recall-derived Q+A is a seed, not a shortcut |

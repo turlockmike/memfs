@@ -15,7 +15,7 @@ Every proxy it has used measured a DIFFERENT quantity than the one it named:
                                     a ratio of rank-reciprocals. MEASURED over 11
                                     unrelated queries (2026-07-26): the value 0.9841
                                     occurs on THREE of them — `catalyst quality
-                                    amulet`, `budget monarch categories`, `french
+                                    amulet`, `budget app categories`, `french
                                     lesson subjunctive` — i.e. the metric reports
                                     them as IDENTICAL, while their absolute cosines
                                     spread 0.7820 / 0.6425 / 0.6855. It also fired on

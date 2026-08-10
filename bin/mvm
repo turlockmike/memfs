@@ -21,7 +21,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-# --- Auto-load ~/.config/mvm/env (Mike-provided secrets) -------------------
+# --- Auto-load ~/.config/mvm/env (user-provided secrets) -------------------
 _env_file = Path.home() / ".config" / "mvm" / "env"
 if _env_file.exists():
     for line in _env_file.read_text().splitlines():

@@ -17,7 +17,7 @@ ISOLATION (OAuth-compatible — default path, 2026-05-10 rewrite)
 Cold-clones run in a redirected $HOME (a per-call tempdir) with the OAuth
 credentials file symlinked through. This severs every $HOME-rooted source of
 ambient context — `~/.claude/CLAUDE.md` (user memory), `~/.claude/settings.json`
-(hooks, agent= alfred, plugins), `~/.claude/agents/*.md` (agent personas) —
+(hooks, agent persona, plugins), `~/.claude/agents/*.md` (agent personas) —
 while preserving authentication. The subprocess also runs with cwd inside the
 tempdir so the project-CLAUDE.md auto-discovery walk finds no ancestors.
 

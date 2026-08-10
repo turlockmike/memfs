@@ -47,8 +47,9 @@ def _entry_kind(e: dict) -> str:
 def _normalize(p: str, root: Path) -> str | None:
     """Map a mentioned path to a knowledge-root-relative path if it exists."""
     p = p.strip().lstrip("~").lstrip("/")
-    # strip leading home-ish prefixes
-    for pre in ("home/mike/", "mvm/knowledge/", "knowledge/"):
+    # strip leading home-ish prefixes (home dir derived, not hardcoded)
+    home_pre = str(Path.home()).lstrip("/") + "/"
+    for pre in (home_pre, "mvm/knowledge/", "knowledge/"):
         if p.startswith(pre):
             p = p[len(pre):]
     if p.endswith("INDEX.md") or p.endswith("index.md"):

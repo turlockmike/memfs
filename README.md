@@ -14,24 +14,28 @@ Below this floor, you have a write-only log (no retrieval check) or hopeful retr
 
 `mvm` is the smallest thing that does all three honestly.
 
-## What's in v0
+## What's in the box
 
 ```
-~/mvm/
-├── README.md
-├── knowledge/                # the user-curated KB
-└── state/                    # tool-managed indexes
-    ├── index.db              # SQLite + FTS5 over content
-    └── graph.db              # adjacency from md-links + frontmatter refs
+mvm/                          # this repo
+├── README.md                 # you are here
+├── ARCHITECTURE.md           # invariants + component map
+├── bin/mvm                   # single CLI entry point
+├── mvm/                      # the engine (index, search, verify, sweep, heat, …)
+├── skills/                   # Claude Code skills (the orchestrating protocols)
+│   ├── mvm-ingest/SKILL.md   #   closed-loop write: locked tests → cold-clone exam → commit or refuse
+│   ├── mvm-recall/SKILL.md   #   grounded retrieval: naked/KB/web probes, reconciled + logged
+│   └── mvm-dream/SKILL.md    #   offline integration: gaps, staleness, contradictions — resolved per cycle
+├── agents/                   # cold-clone agent definitions the skills spawn
+│   ├── mvm-naked-clone.md    #   weight-prior instrument (no tools)
+│   ├── mvm-kb-clone.md       #   KB-only instrument
+│   └── mvm-web-clone.md      #   web-only instrument
+├── examples/knowledge/       # an example doc + locked-tests pair
+└── tests/                    # engine unit tests
 
-~/.local/bin/                 # CLI primitives (PATH-resident)
-├── mvm verify                  # cold-clone subprocess; the load-bearing measurement
-├── mvm index                    # rebuild graph + FTS
-└── mvm search                # tri-mode retrieval (text + graph + hierarchy)
-
-~/.claude/skills/             # Claude Code skills (orchestrators)
-├── mvm-ingest/SKILL.md       # closed-loop write
-└── mvm-recall/SKILL.md       # grounded retrieval with refusal
+# created at runtime (not tracked):
+~/mvm/knowledge/              # YOUR curated KB — <topic>.md + <topic>.tests.yaml pairs
+~/mvm/state/                  # indexes (SQLite FTS5 + vectors + graph), recall/dream logs
 ```
 
 ## The cold-clone primitive — two paths
@@ -90,7 +94,7 @@ mvm search "calguran" --kind canonical               # frontmatter filter
 
 The filesystem is treated as a graph database — folder hierarchy carries semantic information (`logs/` vs `wiki/` vs `canonical/`), markdown links are explicit edges, and external URLs are first-class destinations.
 
-> **Caveat — `mvm search` is RANKED retrieval, not a literal-string finder.** BM25 + graph + hierarchy always returns nearest-neighbours (scores cluster ~0.6) whether or not the exact string exists in the corpus. For **literal contamination/residue hunts** ("does the byte-string `+6 amulet` / `Ulaman stacks` still appear anywhere?") use `grep` over BOTH recall surfaces (`~/mvm/knowledge/resources/poe2/` + `~/resources/poe2/`), not `mvm search` — a semantic hit is not evidence the string is present, and a semantic miss is not evidence it is absent. (G6 contamination sweep, 2026-06-14.)
+> **Caveat — `mvm search` is RANKED retrieval, not a literal-string finder.** BM25 + graph + hierarchy always returns nearest-neighbours (scores cluster ~0.6) whether or not the exact string exists in the corpus. For **literal contamination/residue hunts** ("does this exact byte-string still appear anywhere?") use `grep` over the knowledge tree, not `mvm search` — a semantic hit is not evidence the string is present, and a semantic miss is not evidence it is absent.
 
 ## File conventions
 
@@ -125,6 +129,9 @@ Tests:
 ## Install
 
 ```bash
+# 0. Clone to ~/mvm (the default the tools assume; override with MVM_* env vars)
+git clone https://github.com/turlockmike/memfs ~/mvm
+
 # 1. Make sure ~/.local/bin is on PATH
 echo $PATH | grep -q "$HOME/.local/bin" || echo 'add ~/.local/bin to PATH'
 
@@ -134,13 +141,24 @@ pip install --break-system-packages pyyaml fastembed sqlite-vec pytest
 # 3. Symlink the single mvm CLI
 ln -sf ~/mvm/bin/mvm ~/.local/bin/mvm
 
-# 4. Verify the install
+# 4. Verify the engine
 mvm --help
-cd ~/mvm && python3 -m pytest tests/  # 31 tests, ~0.2s
+cd ~/mvm && python3 -m pytest tests/
 
-# 5. Skills are in place at ~/.claude/skills/mvm-{ingest,recall,dream}
-#    They auto-load in any new Claude Code session.
+# 5. Install the skills + cold-clone agents into Claude Code
+mkdir -p ~/.claude/skills ~/.claude/agents
+cp -r ~/mvm/skills/mvm-ingest ~/mvm/skills/mvm-recall ~/mvm/skills/mvm-dream ~/.claude/skills/
+cp ~/mvm/agents/mvm-*.md ~/.claude/agents/
+# They auto-load in any new Claude Code session.
+
+# 6. Seed the KB (start from the example, or empty)
+mkdir -p ~/mvm/knowledge
+cp -r ~/mvm/examples/knowledge/decisions ~/mvm/knowledge/
+mvm index
 ```
+
+Environment overrides if you want different locations: `MVM_KNOWLEDGE_ROOT`,
+`MVM_STATE`, `MVM_RECALL_LOG`, `MVM_SWEEP_WORKLIST`.
 
 ## Usage
 
@@ -169,6 +187,19 @@ mvm search "leech cap"
 mvm verify knowledge/<top-result>.md
 ```
 
+### Maintain (the offline pass)
+
+```
+/mvm-dream
+```
+
+Run it on a cron or whenever the corpus feels stale. It reads the recall log +
+`mvm sweep`'s worklist, then: ingests what kept falling back to web (coverage),
+re-verifies least-recently-verified docs (quality), cross-checks old docs
+against the live web (staleness → supersede), and probes near-duplicate pairs
+for contradictions (tension discovery). Every anomaly resolves in-cycle —
+dissolved, fixed, or escalated. Recall misses become curriculum.
+
 ### Diagnostics
 
 ```bash
@@ -191,21 +222,17 @@ If those four steps work end-to-end, the system is viable. Everything else is ha
 
 ## Roadmap
 
-**v0 (this version):** the closed loop. SQLite FTS5 for text. Markdown link parsing for the graph. Cold-clone via subprocess. Differential KB-lift framework.
+**Shipped:** the closed loop (ingest → recall → verify). Local vector
+embeddings (fastembed + sqlite-vec) with FTS5 fallback. Markdown link parsing
+for the graph. Cold-clone via Agent tool (in-session) or subprocess (CLI).
+Differential KB-lift framework. `/mvm-dream` offline pass with deterministic
+`mvm sweep` worklists, retrieval-heat-weighted verification (`mvm heat`), and
+supersession edges (`mvm relations`).
 
-**v0.1 (planned):**
-- Vector embeddings (Voyage AI) replacing FTS5 for semantic search
-- `--bare` strict isolation mode (requires `ANTHROPIC_API_KEY`)
+**Planned:**
 - Two test cohorts (source-derived + blind)
 - Free-recall grader mode (Tulving's recognition-vs-recall fix)
-- Recency penalty + decay timestamps (Hassabis's stale-but-confident defense)
-
-**v0.2 (planned):**
-- `/mvm-dream` — offline pass: replay, consolidate, status-tag (current/superseded/archived)
 - Calibration monitoring + algedonic alarm on inversion
-- Cohort regeneration during dream
-
-**v0.3 (planned):**
 - Reconstruction-mode verify (canonical → source claims, entailment-graded)
 - Hooks for auto-fire on curated domains
 - Pressure-index dashboard
