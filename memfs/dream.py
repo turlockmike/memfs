@@ -469,10 +469,40 @@ def find_content_similar_unlinked(
         ):
             logical[key] = ((a, b), score)
 
-    # Highest score first. Oversample then filter already-linked pairs.
+    # --- orphan-preferring tie-break (D190-1 rec 3, 2026-08-10) ------------
+    # `limit` caps how many of the (possibly hundreds of) equal/near-equal-
+    # score logical pairs actually get emitted, and until now ties broke on
+    # path string alone -- pure alphabetical luck, blind to which pairs would
+    # actually shrink `orphans_remaining` if applied. Motivated by auditor
+    # D190-1 (2026-08-09): orphans_remaining kept RISING (11,011 -> 11,033)
+    # across three days of autolink runs that DID apply ~50 edges/day.
+    # Fetching the live orphan set once and preferring pairs that touch one
+    # is free (one extra query) and, when a real tie exists, steers the
+    # capped selection toward the pairs that actually shrink the count.
+    # ⚠ measured 2026-08-10: on the CURRENT corpus (~75% of all 14,596 nodes
+    # are orphans by this definition) a live A/B on production data showed
+    # NO delta in the top-50 selection either way (48/50 touched an orphan
+    # before AND after) -- the pool is so orphan-saturated that ties rarely
+    # decide anything yet. Unit-level test proves the mechanism fires
+    # correctly on a constructed tie (see tests/); whether it moves the
+    # real orphans_remaining trend needs a fresh read after this ships and
+    # the corpus's orphan ratio has room to move -- do not claim it "worked"
+    # off this one wake's snapshot.
+    orphan_paths = {r["path"] for r in graph_mod.get_orphans(graph)}
+
+    def _touches_orphan(canon_pair: tuple[str, str]) -> bool:
+        ca, cb = canon_pair
+        return any(
+            p in orphan_paths
+            for p in spellings_by_canon[ca] + spellings_by_canon[cb]
+        )
+
+    # Highest score first; on ties, orphan-touching pairs win; then path for
+    # determinism. Oversample then filter already-linked pairs.
     out: list[dict] = []
     for (ca, cb), ((a, b), score) in sorted(
-        logical.items(), key=lambda x: (-x[1][1], x[0])
+        logical.items(),
+        key=lambda x: (-x[1][1], 0 if _touches_orphan(x[0]) else 1, x[0]),
     ):
         if len(out) >= limit:
             break
