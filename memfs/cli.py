@@ -686,10 +686,19 @@ def cmd_link_suggest(args):
     authored [[wikilinks]] are sparse and SEARCH traffic is too low for
     co-search-based candidates). Emits NDJSON link candidates — the same
     shape the dream briefing emits, so downstream tooling is uniform.
+
+    ``--census`` switches to reporting the true uncapped pool size instead
+    (D190-1 rec 1) — see that flag's help for why this exists.
     """
-    from memfs.dream import find_content_similar_unlinked
+    from memfs.dream import count_content_similarity_pool, find_content_similar_unlinked
     graph = _connect_or_die()
     try:
+        if args.census:
+            pool_size = count_content_similarity_pool(
+                graph, min_score=args.min_score, max_score=args.max_score,
+            )
+            out({"pool_size": pool_size})
+            return
         candidates = find_content_similar_unlinked(
             graph,
             limit=args.limit,
@@ -1116,6 +1125,15 @@ def main():
     p_ls.add_argument("--max-score", type=float, default=0.55,
                       help="Score at/above this is a merge candidate, not a "
                            "link candidate (default 0.55)")
+    p_ls.add_argument("--census", action="store_true",
+                      help="Report the TRUE candidate pool size (uncapped, "
+                           "mirror-deduped, before the already-linked filter) "
+                           "as {\"pool_size\": N} instead of emitting "
+                           "candidates. D190-1 rec 1 (2026-08-10): --limit's "
+                           "default of 50 was being read as ~100% coverage "
+                           "when the real pool is >=300 -- this is the honest "
+                           "denominator, cheap enough to run every pass "
+                           "(one node scan, no extra graph queries).")
 
     p_la = sub.add_parser("link-apply",
                           help="Materialize LINK edge(s). Single pair or NDJSON on stdin.")

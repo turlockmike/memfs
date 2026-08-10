@@ -373,29 +373,36 @@ def find_dirs_missing_index(mem_home: str, min_files: int = 10) -> list[dict]:
     return out
 
 
-def find_content_similar_unlinked(
+def _content_similarity_pool(
     graph,
     *,
-    limit: int = 50,
     min_score: float = 0.12,
     max_score: float = 0.55,
-) -> list[dict]:
-    """Pairs of nodes with overlapping content tokens but no LINK edge.
+) -> tuple[dict[tuple[str, str], tuple[tuple[str, str], float]], dict[str, list[str]]]:
+    """Shared pair-building pass for content-similarity link candidates.
 
-    Complements ``find_cosearched_unlinked`` for corpora that don't yet have
-    enough query traffic to surface SEARCH-based link candidates. Uses the
-    same token-overlap machinery as ``find_near_duplicates`` but with a lower
-    threshold (``min_score``); pairs at or above ``max_score`` are rejected
-    because those are handled as ``merge`` candidates elsewhere, not links.
+    Extracted from ``find_content_similar_unlinked`` (D190-1 rec 1,
+    2026-08-10) so the TRUE candidate pool — before any ``limit`` cap and
+    before the per-pair already-linked graph filter — can be measured
+    without duplicating the tokenize/score/dedupe logic in a second place
+    where it could drift out of sync.
 
-    Bootstraps the juxtaposition surface when authored ``[[wikilinks]]`` are
-    sparse — which is the empirical starting condition (observed 2026-04-17:
-    197 indexed nodes, 0 real LINK edges).
+    Returns ``(logical, spellings_by_canon)``:
+      - ``logical``: canonical-pair-key -> ((spelling_a, spelling_b), score)
+        for every distinct logical pair with ``min_score <= score <
+        max_score``, mirror-twins already collapsed. This is the honest
+        denominator: a positive control (``memfs link-suggest --limit 300``)
+        measured >=300 real logical pairs on 2026-08-06, so the previous
+        wrapper-script denominator (whatever ``find_content_similar_unlinked``
+        emitted at its default ``limit=50``) was reading as ~100% coverage
+        at <=17% true coverage.
+      - ``spellings_by_canon``: canonical path -> every mirror spelling seen
+        in this corpus scan, needed by callers that dedupe already-linked
+        pairs in logical space.
 
-    Exclusions:
-    - ``sessions/`` paths (time-series transcripts, not semantic notes).
-    - Near-duplicates at or above ``max_score`` (those go to merge).
-    - Pairs that already have a LINK edge in either direction.
+    No graph mutation, no already-linked filtering, no ``limit`` — pure
+    census. Callers that need emittable candidates (vs. just a pool size)
+    do that filtering themselves; see ``find_content_similar_unlinked``.
     """
     rows = graph.run(
         "MATCH (n:Node) "
@@ -404,7 +411,7 @@ def find_content_similar_unlinked(
     )
     nodes = [r for r in rows if not (r.get("path") or "").startswith("sessions/")]
     if len(nodes) < 2:
-        return []
+        return {}, {}
 
     # Tokenize combined title + description + content head
     tokens_by_path: dict[str, set[str]] = {}
@@ -468,6 +475,58 @@ def find_content_similar_unlinked(
             score == prev[1] and _mirror_rank((a, b)) < _mirror_rank(prev[0])
         ):
             logical[key] = ((a, b), score)
+
+    return logical, spellings_by_canon
+
+
+def count_content_similarity_pool(
+    graph,
+    *,
+    min_score: float = 0.12,
+    max_score: float = 0.55,
+) -> int:
+    """True size of the content-similarity candidate pool (D190-1 rec 1).
+
+    Uncapped, mirror-deduped, BEFORE the already-linked filter — the honest
+    denominator for ``link_candidates_total``-style reporting.
+    ``find_content_similar_unlinked``'s ``limit`` (default 50) caps how many
+    of these get emitted; this answers "out of how many?" without paying for
+    the already-linked check on every pair (one node scan, no extra graph
+    queries — cheap enough to run on every autolink pass).
+    """
+    logical, _ = _content_similarity_pool(graph, min_score=min_score, max_score=max_score)
+    return len(logical)
+
+
+def find_content_similar_unlinked(
+    graph,
+    *,
+    limit: int = 50,
+    min_score: float = 0.12,
+    max_score: float = 0.55,
+) -> list[dict]:
+    """Pairs of nodes with overlapping content tokens but no LINK edge.
+
+    Complements ``find_cosearched_unlinked`` for corpora that don't yet have
+    enough query traffic to surface SEARCH-based link candidates. Uses the
+    same token-overlap machinery as ``find_near_duplicates`` but with a lower
+    threshold (``min_score``); pairs at or above ``max_score`` are rejected
+    because those are handled as ``merge`` candidates elsewhere, not links.
+
+    Bootstraps the juxtaposition surface when authored ``[[wikilinks]]`` are
+    sparse — which is the empirical starting condition (observed 2026-04-17:
+    197 indexed nodes, 0 real LINK edges).
+
+    Exclusions:
+    - ``sessions/`` paths (time-series transcripts, not semantic notes).
+    - Near-duplicates at or above ``max_score`` (those go to merge).
+    - Pairs that already have a LINK edge in either direction.
+    """
+    logical, spellings_by_canon = _content_similarity_pool(
+        graph, min_score=min_score, max_score=max_score,
+    )
+    if not logical:
+        return []
 
     # --- orphan-preferring tie-break (D190-1 rec 3, 2026-08-10) ------------
     # `limit` caps how many of the (possibly hundreds of) equal/near-equal-
