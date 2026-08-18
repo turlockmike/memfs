@@ -221,11 +221,37 @@ def check_review_due(root: Path, docs, now: datetime):
 
 
 def check_cold_decayed(root: Path, docs, ever, recent):
+    # STAGING/RETIRED EXCLUSION (dream-20260818-0300): `_unverified` docs and
+    # already-retired (superseded/archived/retired/deprecated) docs are NOT
+    # "decayed canonical material awaiting a keep/archive judgment" — they are
+    # on a DIFFERENT lifecycle (staging awaits distillation; retired is already
+    # dispositioned elsewhere) and reviewing them here is the exact
+    # "cost with no retrieval on the other side" anti-pattern `never_retrieved`
+    # already guards against. Mirrors `check_untested_hot`'s identical filter
+    # (both `_is_retired`/`_is_staging` guards, added 2026-08-09 for that check)
+    # — kept in lockstep for the same reason those two are kept in lockstep
+    # with each other. Found via the `dream-decay-pick tally` WATCH THRESHOLD
+    # (28 consecutive KEPT-OTHER, >=15): measured 12/108 (11%) of the live
+    # cold_decayed worklist were `_unverified` staging stubs (0 were
+    # already-retired at measurement time, but the guard costs nothing and
+    # prevents future drift). Excluding them doesn't fully explain a 28x
+    # streak — most of the remainder are genuinely foundational-but-quiet
+    # canonical docs, a signal-quality question about the check that this
+    # fix narrows but does not close — but it removes a real, structural,
+    # zero-judgment source of wasted review cycles.
     rows = []
+    staging_excluded = retired_excluded = 0
     for path, n in ever.most_common():
-        if recent.get(path, 0) == 0 and (root / path).is_file():
-            rows.append({"path": path, "recalls_ever": n,
-                         "recalls_last_%dd" % COLD_WINDOW_DAYS: 0})
+        if recent.get(path, 0) != 0 or not (root / path).is_file():
+            continue
+        if _is_staging(path):
+            staging_excluded += 1
+            continue
+        if _is_retired(root, path):
+            retired_excluded += 1
+            continue
+        rows.append({"path": path, "recalls_ever": n,
+                     "recalls_last_%dd" % COLD_WINDOW_DAYS: 0})
     known = {str(p.relative_to(root)) for p, _ in docs}
     never = sorted(known - set(ever))
     # Self-describe the lifetime floor actually applied (honesty rule 3), and
@@ -250,6 +276,12 @@ def check_cold_decayed(root: Path, docs, ever, recent):
                                                     key=lambda kv: int(kv[0]))),
             "rows_at_or_above_hot_threshold": sum(
                 1 for r in rows if r["recalls_ever"] >= HOT_MIN_RECALLS),
+            # Transparency for the staging/retired exclusion above — same
+            # doctrine as `untested_hot`'s `staging_excluded`: an exclusion
+            # that shrinks a worklist silently reads as "nothing to do",
+            # which is the failure this count exists to prevent.
+            "staging_excluded": staging_excluded,
+            "retired_excluded": retired_excluded,
             "never_retrieved_count": len(never),
             "never_retrieved_sample": never[:NEVER_SAMPLE],
             "note": ("never-retrieved is a COUNT, not a worklist: %d of %d docs. "
@@ -493,10 +525,13 @@ def render(result: dict, out=sys.stdout) -> None:
     if "cold_decayed" in c:
         r = c["cold_decayed"]
         print("  cold_decayed    %4d had heat (>=%d lifetime; %d of them >=%d), "
-              "zero recalls in %dd  |  never-retrieved: %d"
+              "zero recalls in %dd  |  never-retrieved: %d  "
+              "(excluded: %d staging, %d retired)"
               % (len(r["rows"]), r["lifetime_recall_floor"],
                  r["rows_at_or_above_hot_threshold"], HOT_MIN_RECALLS,
-                 COLD_WINDOW_DAYS, r["never_retrieved_count"]), file=out)
+                 COLD_WINDOW_DAYS, r["never_retrieved_count"],
+                 r.get("staging_excluded", 0), r.get("retired_excluded", 0)),
+              file=out)
         for row in r["rows"][:10]:
             print("      %s  (%d recalls ever)" % (row["path"], row["recalls_ever"]), file=out)
     if "untested_hot" in c:
@@ -565,6 +600,16 @@ def _fixture(tmp: Path):
     # DECAYED floor at >=1: any "fix" that raises it to HOT_MIN_RECALLS (the
     # >=2 the /dream SKILL wrongly claimed) drops this row and fails by name.
     doc("resources/cold-once.md", "title: c1")                              # cold_decayed
+    # cold + `_unverified` staging -> must NOT be flagged cold_decayed
+    # (dream-20260818-0300: the tally's 28x-consecutive-KEPT-OTHER watch
+    # threshold surfaced 12/108 live cold_decayed rows were staging stubs on
+    # a different lifecycle — awaiting distillation, not decay judgment).
+    doc("resources/facts/_unverified/cold-staged.md", "title: cstg")
+    # cold + already-retired via status -> must NOT be flagged cold_decayed
+    # (already dispositioned elsewhere; re-reviewing it here is wasted work).
+    doc("resources/cold-superseded.md",
+        "title: cs\nstatus: superseded\n"
+        "superseded_by: resources/cold-decayed.md")
     doc("resources/never.md", "title: nv")                                  # never-retrieved
     doc("areas/links.md", body="see [ok](../resources/never.md) and "
                                "[dead](./gone.md) and [web](https://x.com/a.md) "
@@ -589,6 +634,14 @@ def _fixture(tmp: Path):
                                  "evidence_paths": ["resources/cold-decayed.md"]}))
     lines.append(json.dumps({"kind": "recall", "ts": old,
                              "evidence_paths": ["resources/cold-once.md"]}))
+    for _ in range(2):
+        lines.append(json.dumps({
+            "kind": "recall", "ts": old,
+            "evidence_paths": ["resources/facts/_unverified/cold-staged.md"]}))
+    for _ in range(2):
+        lines.append(json.dumps({
+            "kind": "recall", "ts": old,
+            "evidence_paths": ["resources/cold-superseded.md"]}))
     for _ in range(3):
         lines.append(json.dumps({"kind": "recall", "ts": fresh,
                                  "evidence_paths": ["resources/hot-untested.md"]}))
@@ -684,6 +737,18 @@ def selftest() -> int:
         check("dream-probe entries do not manufacture heat",
               "resources/never.md" in c["cold_decayed"]["never_retrieved_sample"])
 
+        # --- staging/retired exclusion (dream-20260818-0300): a cold doc on a
+        # different lifecycle (unpromoted staging stub, already-dispositioned
+        # retired doc) must not be re-surfaced as a decay judgment call.
+        check("cold_decayed does NOT flag a cold `_unverified` staging doc",
+              "resources/facts/_unverified/cold-staged.md" not in cd)
+        check("cold_decayed does NOT flag a cold already-retired doc",
+              "resources/cold-superseded.md" not in cd)
+        check("cold_decayed PUBLISHES what the staging filter withheld",
+              c["cold_decayed"].get("staging_excluded", 0) >= 1)
+        check("cold_decayed PUBLISHES what the retired filter withheld",
+              c["cold_decayed"].get("retired_excluded", 0) >= 1)
+
         # --- DECAYED floor is >=1 and is PUBLISHED (dream-20260727-1300).
         # The /dream SKILL described this check as ">=2 lifetime" -- borrowing
         # `untested_hot`'s HOT_MIN_RECALLS -- and four dream entries transcribed
@@ -719,8 +784,13 @@ def selftest() -> int:
         # a doc merely NAMED *_unverified.md is ordinary and stays nominated.
         check("untested_hot STILL flags a lookalike (_unverified in basename)",
               "resources/facts/notes_unverified.md" in uh)
+        # 2, not 1: `hot-staged.md` (hot) + `cold-staged.md` (added
+        # 2026-08-18 for the cold_decayed staging-exclusion fixture below) —
+        # `untested_hot`'s staging_excluded counts ANY staging doc with heat
+        # and no tests, regardless of hot/cold, so the new cold fixture
+        # legitimately bumps this count.
         check("untested_hot reports what the staging filter withheld",
-              c["untested_hot"]["staging_excluded"] == 1)
+              c["untested_hot"]["staging_excluded"] == 2)
 
         bl = {(r["path"], r["link"]) for r in c["broken_links"]["rows"]}
         check("broken_links finds the dead relative link",
