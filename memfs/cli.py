@@ -719,7 +719,7 @@ def cmd_link_apply(args):
     other candidate types (merge/split/orphan/...) are skipped so that a
     full dream-briefing stream can be piped in without filtering upstream.
     """
-    from memfs.graph import upsert_link_edge
+    from memfs.graph import upsert_link_edge, resolve_node_root_id
     graph = _connect_or_die()
     applied = 0
     skipped = 0
@@ -748,8 +748,16 @@ def cmd_link_apply(args):
                 # Carry the candidate's source label onto the edge so that
                 # clear_link_edges_from (file re-index) doesn't wipe it.
                 edge_source = c.get("source") or "dream"
+                # Resolve each path to its REAL existing root_id (2026-08-21
+                # fix) -- candidate NDJSON carries bare paths with no
+                # root_id, and merging against an unresolved default used to
+                # create a phantom duplicate Node disconnected from the real
+                # corpus. See resolve_node_root_id's docstring.
+                src_root = resolve_node_root_id(graph, a)
+                tgt_root = resolve_node_root_id(graph, b)
                 upsert_link_edge(graph, a, b, strength=args.strength,
-                                 source=edge_source)
+                                 source=edge_source,
+                                 src_root_id=src_root, tgt_root_id=tgt_root)
                 applied += 1
                 out({"applied": [a, b], "strength": args.strength,
                      "source": edge_source,
@@ -760,9 +768,12 @@ def cmd_link_apply(args):
                 err({"error": "source_and_target_required",
                      "hint": "memfs link-apply <src> <tgt> OR --from-stdin"})
                 sys.exit(2)
+            src_root = resolve_node_root_id(graph, args.source)
+            tgt_root = resolve_node_root_id(graph, args.target)
             upsert_link_edge(graph, args.source, args.target,
                              strength=args.strength,
-                             source=args.link_source)
+                             source=args.link_source,
+                             src_root_id=src_root, tgt_root_id=tgt_root)
             applied += 1
             out({"applied": [args.source, args.target],
                  "strength": args.strength,
@@ -1231,6 +1242,16 @@ def main():
                          dest="dead_weight_min_layer",
                          help="Minimum layer for dead_weight candidates "
                               "(default 3).")
+    p_dream.add_argument("--content-link-limit", type=int, default=50,
+                         dest="content_link_limit",
+                         help="Emission cap for find_content_similar_unlinked "
+                              "'link' candidates (default 50, historical). "
+                              "Measured 2026-08-21: cost is dominated by the "
+                              "fixed content-similarity pool scan, not this "
+                              "limit (28.5s@50 / 31.1s@300 / 45.0s@2000 on "
+                              "the live corpus) -- callers chasing "
+                              "orphans_remaining down should raise this well "
+                              "above 50.")
 
     # Dream-pass output logging (Apr 19 — close the loop on nightly consolidation)
     p_dlog = sub.add_parser(

@@ -79,7 +79,7 @@ def test_orphan_touching_pair_wins_a_score_tie(monkeypatch):
 
     monkeypatch.setattr(
         dream_mod.graph_mod, "get_orphans",
-        lambda graph: [{"path": "n4", "title": "n4", "search_count": 0}],
+        lambda graph, orphan_days=None: [{"path": "n4", "title": "n4", "search_count": 0}],
     )
     out = find_content_similar_unlinked(FakeGraph(_tied_corpus()), limit=1)
 
@@ -95,13 +95,38 @@ def test_alphabetical_fallback_when_neither_side_is_an_orphan(monkeypatch):
     proving the tie-break only changes behavior when it has a real signal."""
     import memfs.dream as dream_mod
 
-    monkeypatch.setattr(dream_mod.graph_mod, "get_orphans", lambda graph: [])
+    monkeypatch.setattr(dream_mod.graph_mod, "get_orphans", lambda graph, orphan_days=None: [])
     out = find_content_similar_unlinked(FakeGraph(_tied_corpus()), limit=1)
 
     assert len(out) == 1
     assert set(out[0]["nodes"]) == {"n1", "n2"}, (
         "with no orphans in play the original alphabetical tie order must "
         f"hold (n1,n2 first), got {out[0]['nodes']}"
+    )
+
+
+def test_orphan_days_threaded_to_get_orphans(monkeypatch):
+    """2026-08-21 fix (alfred-alert memfs-orphan-backlog-threshold): the
+    tie-break must ask get_orphans() for the SAME age-gated population
+    find_orphans() counts into orphans_remaining, not the unfiltered set --
+    else it spends limit slots on freshly-created nodes that were never
+    counted as orphans in the alerted metric to begin with (measured
+    2026-08-21: 4,000 edges applied under the old unfiltered call moved
+    orphans_remaining by 0)."""
+    import memfs.dream as dream_mod
+
+    seen_orphan_days = []
+
+    def fake_get_orphans(graph, orphan_days=None):
+        seen_orphan_days.append(orphan_days)
+        return [{"path": "n4", "title": "n4", "search_count": 0}]
+
+    monkeypatch.setattr(dream_mod.graph_mod, "get_orphans", fake_get_orphans)
+    find_content_similar_unlinked(FakeGraph(_tied_corpus()), limit=1, orphan_days=17)
+
+    assert seen_orphan_days == [17], (
+        f"expected find_content_similar_unlinked to pass its orphan_days "
+        f"through to get_orphans unchanged, saw {seen_orphan_days}"
     )
 
 

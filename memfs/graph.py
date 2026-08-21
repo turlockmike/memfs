@@ -32,7 +32,7 @@ Design note:
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from neo4j import Driver, GraphDatabase
@@ -385,6 +385,40 @@ def clear_link_edges_from(
     )
 
 
+def resolve_node_root_id(graph: Graph, path: str, fallback: str = DEFAULT_ROOT_ID) -> str:
+    """Look up the ``root_id`` of an EXISTING Node with this exact path.
+
+    Returns ``fallback`` (DEFAULT_ROOT_ID by default) only when no Node with
+    this path exists yet under ANY root -- i.e. a genuinely new node, safe
+    to place in the fallback root.
+
+    Added 2026-08-21 (alfred-alert memfs-orphan-backlog-threshold root
+    cause): ``(root_id, path)`` is the real Node identity (see the unique
+    constraint below), but candidate NDJSON from ``dream-briefing`` /
+    ``link-suggest`` carries bare ``path`` strings with no ``root_id``.
+    Callers that then MERGE a new edge using an unresolved default root_id
+    (as ``cmd_link_apply`` used to) silently create a PHANTOM duplicate Node
+    under that default root instead of attaching to the real, already-
+    indexed Node -- which keeps looking orphaned forever while the edge
+    count climbs on a disconnected shadow copy. Measured on the live graph
+    the day this was found: 5,724 Node rows under root_id='default', 5,678
+    of them exact-path duplicates of a real node under another root, 7,480
+    LINK edges attached only to the phantom copy (7,050 of them
+    'content_similarity' -- i.e. every autolink cron run for as long as
+    this bug has existed). This lookup is the fix for NEW writes; the
+    existing phantom population still needs a one-off migration (tracked
+    separately -- do not assume this function alone repairs already-
+    corrupted data).
+    """
+    rows = graph.run(
+        "MATCH (n:Node {path: $p}) RETURN n.root_id AS root_id LIMIT 1",
+        p=path,
+    )
+    if rows:
+        return rows[0]["root_id"]
+    return fallback
+
+
 def upsert_link_edge(
     graph: Graph,
     source_path: str,
@@ -670,16 +704,49 @@ def get_meta(graph: Graph, key: str) -> str | None:
 
 # -------- Orphan detection --------
 
-def get_orphans(graph: Graph) -> list[dict]:
-    """Nodes with no incoming or outgoing LINK edges and search_count = 0."""
+def get_orphans(graph: Graph, orphan_days: int | None = None) -> list[dict]:
+    """Nodes with no incoming or outgoing LINK edges and search_count = 0.
+
+    ``orphan_days``, when given, additionally requires ``modified_at`` be
+    older than that many days -- matching ``dream.find_orphans``'s stricter
+    definition. Default None preserves the original unfiltered behavior for
+    existing callers (the CLI ``orphans`` report, ``test_neighborhood.py``).
+
+    Added 2026-08-21 (alfred-alert memfs-orphan-backlog-threshold): the
+    orphan-preferring tie-break in ``find_content_similar_unlinked`` was
+    calling this WITHOUT the age filter, so it steered the (limited) link
+    slots toward *any* no-link/no-search node -- dominated in practice by
+    freshly-created content (new PoE2 fact files with high jaccard scores
+    from shared templating), not the age-gated population that
+    ``find_orphans`` actually counts into the alerted ``orphans_remaining``
+    metric. Measured 2026-08-21: two full autolink runs applied 4,000 link
+    edges total (link_edges 3558->7558, true pool 68,101->62,548) while
+    orphans_remaining moved from 12,430->12,434->12,434 -- essentially flat.
+    The mismatch, not the emission cap, was the real reason more volume
+    didn't move the metric.
+    """
+    if orphan_days is None:
+        rows = graph.run(
+            """MATCH (n:Node)
+               WHERE NOT (n)-[:LINK]-()
+                 AND NOT ()-[:LINK]->(n)
+                 AND coalesce(n.search_count, 0) = 0
+               RETURN n.path AS path, n.title AS title,
+                      coalesce(n.search_count, 0) AS search_count
+               ORDER BY n.path"""
+        )
+        return rows
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=orphan_days)).isoformat()
     rows = graph.run(
         """MATCH (n:Node)
            WHERE NOT (n)-[:LINK]-()
              AND NOT ()-[:LINK]->(n)
              AND coalesce(n.search_count, 0) = 0
+             AND coalesce(n.modified_at, '') < $cutoff
            RETURN n.path AS path, n.title AS title,
                   coalesce(n.search_count, 0) AS search_count
-           ORDER BY n.path"""
+           ORDER BY n.path""",
+        cutoff=cutoff,
     )
     return rows
 

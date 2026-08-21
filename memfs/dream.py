@@ -504,6 +504,7 @@ def find_content_similar_unlinked(
     limit: int = 50,
     min_score: float = 0.12,
     max_score: float = 0.55,
+    orphan_days: int = 30,
 ) -> list[dict]:
     """Pairs of nodes with overlapping content tokens but no LINK edge.
 
@@ -547,7 +548,22 @@ def find_content_similar_unlinked(
     # real orphans_remaining trend needs a fresh read after this ships and
     # the corpus's orphan ratio has room to move -- do not claim it "worked"
     # off this one wake's snapshot.
-    orphan_paths = {r["path"] for r in graph_mod.get_orphans(graph)}
+    #
+    # ⚠ CORRECTED 2026-08-21 (alfred-alert memfs-orphan-backlog-threshold):
+    # that snapshot's "worked" claim was never actually validated, and a
+    # real measurement now shows it didn't -- this call used to be
+    # `graph_mod.get_orphans(graph)` with NO age filter, a looser set than
+    # `find_orphans()`'s (the function that actually produces the alerted
+    # orphans_remaining count, which also requires modified_at older than
+    # `orphan_days`). The looser set is dominated by freshly-created,
+    # not-yet-linked content (new templated fact files score high on
+    # jaccard), so the tie-break was steering scarce `limit` slots toward
+    # nodes that were never counted as orphans in the first place. Two full
+    # production runs applying 4,000 edges under the OLD (unfiltered) call
+    # moved orphans_remaining by 0 (12,430->12,434->12,434). Passing
+    # `orphan_days` here aligns the tie-break's orphan set with the metric
+    # it's meant to shrink.
+    orphan_paths = {r["path"] for r in graph_mod.get_orphans(graph, orphan_days=orphan_days)}
 
     def _touches_orphan(canon_pair: tuple[str, str]) -> bool:
         ca, cb = canon_pair
@@ -733,6 +749,23 @@ def run_briefing(graph, *, mem_home: str, args) -> list[dict]:
     bloat_bytes = getattr(args, "bloat_bytes", 10240)
     dead_weight_days = getattr(args, "dead_weight_days", 60)
     dead_weight_min_layer = getattr(args, "dead_weight_min_layer", 3)
+    # content_link_limit: emission cap for find_content_similar_unlinked.
+    # Kept at the historical default (50) here so any OTHER caller of
+    # dream-briefing that doesn't pass this flag keeps its old behavior.
+    # research-queue.md "memfs-autolink orphans_remaining" item (filed
+    # 2026-08-11, still open at the 2026-08-21 alfred-alert
+    # memfs-orphan-backlog-threshold crossing, 12,430 >= 12,000) named this
+    # cap -- not the orphan-preferring tie-break (D190-1 rec 3, already
+    # shipped 2026-08-10) -- as the real bottleneck: true pool measured
+    # 68,101 (`memfs link-suggest --census`, 2026-08-21) against a 50/day
+    # emission cap. The backlog item's open question ("check runtime cost
+    # first") is now measured, not estimated: `memfs link-suggest --limit N`
+    # timed 28.5s@50 / 31.1s@300 / 45.0s@2000 -- cost is dominated by the
+    # fixed pool scan, not the limit, so raising it is cheap. The autolink
+    # cron (memfs-dream-autolink.sh) now passes --content-link-limit
+    # explicitly at a much higher value; this getattr default stays
+    # conservative for any other/future caller.
+    content_link_limit = getattr(args, "content_link_limit", 50)
 
     candidates: list[dict] = []
     candidates.extend(find_orphans(graph, orphan_days=orphan_days))
@@ -740,7 +773,7 @@ def run_briefing(graph, *, mem_home: str, args) -> list[dict]:
     candidates.extend(find_bloated_files(mem_home, bloat_lines=bloat_lines, bloat_bytes=bloat_bytes))
     candidates.extend(find_dirs_missing_index(mem_home))
     candidates.extend(find_cosearched_unlinked(graph))
-    candidates.extend(find_content_similar_unlinked(graph))
+    candidates.extend(find_content_similar_unlinked(graph, limit=content_link_limit, orphan_days=orphan_days))
     candidates.extend(find_stale_facts(graph))
     candidates.extend(find_dead_weight(
         graph,
