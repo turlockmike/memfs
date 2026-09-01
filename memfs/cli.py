@@ -480,12 +480,31 @@ def cmd_check_indexes(args):
     two commands sharing one resolver is the regression guard for the
     2026-05-03 divergence (status reported drift_findings: 0 while
     check-indexes reported 702 on the same substrate).
+
+    ``by_root`` (added 2026-08-31): per-root_id drifted_dirs/drift_findings,
+    COUNTED AND PRINTED on every run rather than left as a one-off manual
+    `details`-key-prefix analysis. WHY: architecture.md invariant 11 already
+    documents a 2026-07-29 finding that runtime-state churn (root_id
+    `alfred-state`) was 59% of the flat total and drowned the ~126 findings
+    that actually cost retrieval (root_id `alfred-home`, under
+    `resources*`) — "the alarm was not blind, it was DEAFENING". That
+    breakdown was hand-computed once from `details` key prefixes and never
+    became a standing field, so every run since re-presented one flat
+    number and the same wallpaper risk (gate #72(b): a wall that becomes
+    wallpaper). `by_root` makes the split load-bearing: any reader (this
+    CLI's human caller, `worklist-digest`, a future dashboard wiring) gets
+    the per-root_id counts without re-deriving them from `details`.
+    ⛔ Do NOT use this to silently exclude a root from `drifted_dirs`/
+    `drift_findings` — those stay the true flat totals; `by_root` is an
+    additional, never a replacement, view (the printed-not-silent rule this
+    was filed to satisfy).
     """
     from memfs.index_render import check_all, render_all
 
     scopes, explicit_dir = _resolve_index_scopes(args)
     aggregated_drift: dict[str, list[str]] = {}
     aggregated_fixed: dict[str, int] = {}
+    by_root: dict[str, dict[str, int]] = {}
     do_fix = getattr(args, "fix", False)
     graph = _connect_or_die()
     try:
@@ -497,6 +516,13 @@ def cmd_check_indexes(args):
                     aggregated_fixed[k] = aggregated_fixed.get(k, 0) + v
             else:
                 drift_map = check_all(graph, mem_home, root_id=root_id)
+            root_bucket = by_root.setdefault(
+                root_id, {"drifted_dirs": 0, "drift_findings": 0}
+            )
+            root_bucket["drifted_dirs"] += len(drift_map)
+            root_bucket["drift_findings"] += sum(
+                len(v) for v in drift_map.values()
+            )
             for d, findings in drift_map.items():
                 key = d if explicit_dir else f"{root_id}:{d}"
                 aggregated_drift[key] = findings
@@ -508,6 +534,7 @@ def cmd_check_indexes(args):
         "scopes": [{"root_id": rid, "mem_home": mh} for rid, mh in scopes],
         "drifted_dirs": len(aggregated_drift),
         "drift_findings": sum(len(v) for v in aggregated_drift.values()),
+        "by_root": by_root,
         "details": aggregated_drift,
     }
     if do_fix:

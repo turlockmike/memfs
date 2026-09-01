@@ -204,6 +204,78 @@ class TestStatusCli:
         ]
 
 
+class TestCheckIndexesByRoot:
+    def test_by_root_breakdown_is_counted_and_printed_per_root(
+        self, tmp_path, graph
+    ):
+        """check-indexes must print a per-root_id drift breakdown (`by_root`),
+        not just the flat aggregate.
+
+        WHY: architecture.md invariant 11 documents a 2026-07-29 finding
+        that one root_id's runtime-state churn was 59% of the flat total
+        and drowned the findings that actually cost retrieval — a
+        one-off hand computation from `details` key prefixes that never
+        became a standing field. This regression-guards the fix: `by_root`
+        must (a) exist, (b) sum back to the flat totals (never a silent
+        exclusion — the printed-not-silent rule this was filed to
+        satisfy), and (c) actually distinguish two roots with different
+        drift counts, not just echo the same number twice.
+        """
+        from memfs.indexer import index_directory
+
+        home = tmp_path / "fakehome"
+        home.mkdir()
+        root_a = tmp_path / "root_a"  # 1 drifted dir
+        root_b = tmp_path / "root_b"  # 2 drifted dirs
+        root_a.mkdir()
+        root_b.mkdir()
+        (root_b / "sub").mkdir()
+        config_dir = home / ".config" / "memfs"
+        config_dir.mkdir(parents=True)
+        (config_dir / "roots.json").write_text(json.dumps({
+            "roots": [
+                {"id": "root-a", "path": str(root_a)},
+                {"id": "root-b", "path": str(root_b)},
+            ]
+        }))
+
+        (root_a / "real_a.md").write_text("# Real A\n")
+        (root_a / "index.md").write_text(
+            "# Root A index\n\n- [missing-a.md](missing-a.md)\n"
+        )
+        (root_b / "real_b.md").write_text("# Real B\n")
+        (root_b / "index.md").write_text(
+            "# Root B index\n\n- [missing-b.md](missing-b.md)\n"
+        )
+        (root_b / "sub" / "real_c.md").write_text("# Real C\n")
+        (root_b / "sub" / "index.md").write_text(
+            "# Root B sub index\n\n- [missing-c.md](missing-c.md)\n"
+        )
+
+        index_directory(graph, str(root_a), root_id="root-a")
+        index_directory(graph, str(root_b), root_id="root-b")
+
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env.pop("MEM_HOME", None)
+
+        cmd = [sys.executable, "-m", "memfs.cli", "check-indexes"]
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        payload = json.loads(result.stdout.strip())
+
+        assert "by_root" in payload
+        assert set(payload["by_root"]) == {"root-a", "root-b"}
+        assert payload["by_root"]["root-a"]["drifted_dirs"] == 1
+        assert payload["by_root"]["root-b"]["drifted_dirs"] == 2
+        # Never a silent exclusion: by_root must sum back to the flat totals.
+        assert sum(
+            r["drifted_dirs"] for r in payload["by_root"].values()
+        ) == payload["drifted_dirs"]
+        assert sum(
+            r["drift_findings"] for r in payload["by_root"].values()
+        ) == payload["drift_findings"]
+
+
 class TestReindexCli:
     def test_reindex_rebuilds(self, tmp_path):
         (tmp_path / "a.md").write_text("# A")
