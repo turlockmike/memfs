@@ -475,6 +475,21 @@ def cmd_check_indexes(args):
     With --fix, auto-render any drifted non-handcrafted indexes.
     Exit code: 0 if clean, 1 if any drift remains after optional --fix.
 
+    ⚠ KNOWN DEFECT, confirmed 2026-09-01 (see
+    ~/resources/memfs-check-indexes-fix-graph-staleness-defect.md): --fix
+    renders each index.md from the Neo4j GRAPH's view of a directory, never
+    from a live os.listdir() of disk. When the graph has drifted from disk
+    (files moved/deleted outside the watcher, or never ingested), --fix
+    faithfully writes the graph's STALE view — confirmed 5/5 wrong on the
+    one at-scale run attempted (34 dirs): phantom entries for files that
+    don't exist, and real on-disk content silently dropped from 2 already-
+    committed indexes. Do not trust this at scale on its self-report alone
+    ("wrote: N" is not "wrote correctly") — diff every touched index.md
+    against a live directory listing before accepting the result, or run
+    reindex first to refresh the graph. The real fix (reconcile graph vs
+    disk before rendering, or refuse --fix on a stale scope) is filed in
+    ~/areas/research-queue.md, unresolved as of this comment.
+
     Scope resolution (single-scope vs multi-root iteration) is delegated to
     ``_resolve_index_scopes`` — same helper ``cmd_status`` uses. Keeping the
     two commands sharing one resolver is the regression guard for the
@@ -1080,7 +1095,10 @@ def main():
         help="Check per-directory index.md files for drift against graph view",
     )
     p_check.add_argument("--fix", action="store_true",
-                         help="Auto-render any drifted (non-handcrafted) indexes")
+                         help="Auto-render any drifted (non-handcrafted) indexes. "
+                              "⚠ KNOWN DEFECT: renders from graph, not live disk — "
+                              "can corrupt committed indexes on a stale graph. "
+                              "Diff output before trusting; see cmd_check_indexes docstring.")
     p_check.add_argument("--dir", default=None,
                          help="Scope to a single root path (overrides multi-root walk)")
 
