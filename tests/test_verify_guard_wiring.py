@@ -100,3 +100,44 @@ def test_guard_surfaces_unhealable_inconsistency(dirs):
     # And it must have written the ledger record for the sweep.
     ledger = guard_state / "mvm-verify-guard.jsonl"
     assert ledger.exists() and "alpha.md" in ledger.read_text()
+
+
+def test_embed_only_skips_cleanly_when_index_locked(dirs):
+    """Regression (2026-09-07, mvm-verify-guard lock-contention finding —
+    7 fires 2026-07-22..09-07): `mvm index --embed-only` used to connect
+    straight to sqlite with no lock check, so a concurrent full `mvm index`
+    holding a write transaction past the 30s busy_timeout made the connect
+    itself raise `sqlite3.OperationalError: database is locked`, logged by
+    the guard as a scary EMBED_HEAL_FAIL traceback for a race that always
+    self-healed by the next tick anyway. --embed-only now checks
+    `.index.lock` non-blocking first, same as the default full-rebuild path,
+    and exits 3 with the same clean "already running" message instead.
+    """
+    root, state = dirs[0], dirs[1]
+    _build(root, state)
+    import fcntl
+    lock_fp = open(state / ".index.lock", "w")
+    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+    try:
+        rc = index.main(["--state", str(state), "--embed-only", "--quiet"])
+    finally:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        lock_fp.close()
+    assert rc == 3, f"expected clean lock-contention exit 3, got {rc}"
+
+
+def test_guard_logs_skip_not_fail_when_index_locked(dirs):
+    root, state, guard_state = dirs
+    _build(root, state)
+    import fcntl
+    lock_fp = open(state / ".index.lock", "w")
+    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+    try:
+        r = _run_guard(root, state, guard_state)
+    finally:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        lock_fp.close()
+    log = (guard_state / "mvm-verify-guard.log").read_text()
+    assert "EMBED_HEAL_SKIP" in log, f"expected a non-alarming skip line; log:\n{log}"
+    assert "EMBED_HEAL_FAIL" not in log, f"lock contention must not log as FAIL; log:\n{log}"
+    assert "OperationalError" not in log, f"raw sqlite traceback leaked into the log:\n{log}"

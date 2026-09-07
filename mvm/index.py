@@ -526,6 +526,32 @@ def _embed_only_main(args) -> int:
     budget_s = getattr(args, "budget_seconds", _EMBED_BUDGET_S)
     max_docs = getattr(args, "max_docs", _EMBED_MAX_DOCS)
     state = args.state
+
+    # LOCK CHECK (added 2026-09-07, mvm-verify-guard lock-contention finding —
+    # 7 fires 2026-07-22..09-07, all self-healing on the next cron tick but each
+    # dumping a raw `sqlite3.OperationalError: database is locked` traceback
+    # into the log). Root cause: unlike the default full-rebuild path (below,
+    # in main()), --embed-only never checked `.index.lock` before connecting —
+    # it relied purely on sqlite's busy_timeout=30s, so a concurrent full
+    # `mvm index` holding a write transaction longer than 30s (a multi-minute
+    # reindex) makes the connect itself raise instead of waiting it out.
+    # Same non-blocking flock as main()'s single-writer lock, check-only (this
+    # path is read-heavy/idempotent, so it doesn't need to itself hold the
+    # lock for its duration — it only needs to avoid racing a run in progress).
+    import fcntl
+    state.mkdir(parents=True, exist_ok=True)
+    lock_path = state / ".index.lock"
+    lock_fp = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+    except BlockingIOError:
+        print(f"ERROR: another `mvm index` is already running (lock at {lock_path}). "
+              f"Wait for it to finish, or remove the lock if stale.", file=sys.stderr)
+        return 3
+    finally:
+        lock_fp.close()
+
     idx = sqlite3.connect(state / "index.db", timeout=30.0)
     idx.enable_load_extension(True)
     import sqlite_vec
