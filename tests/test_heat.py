@@ -72,6 +72,26 @@ def test_is_retired_reads_frontmatter_status(tmp_path):
     assert not is_retired("resources/ghost.md", root)   # missing file != retired
 
 
+def test_is_retired_reads_frontmatter_behind_strata_stamp(tmp_path):
+    """Regression lock (2026-09-07): a strata metadata stamp (the
+    `<!--strata\\n{...}\\n-->` comment the terminology-cutover started
+    prepending 2026-08-26) sits at byte 0 ahead of the doc's own YAML.
+    Before this fix `is_retired()` tested `text.startswith("---")` directly
+    and always returned False for a stamped doc, so an already-dispositioned
+    (status: superseded) doc kept re-surfacing on the untested-hot worklist
+    as if it were still live -- same root cause as sweep.py's `frontmatter()`
+    fix, locked here for heat.py's independent copy of the check."""
+    root = tmp_path / "knowledge"
+    _mk(root, "resources/stamped-sup.md",
+        '<!--strata\n{"stamped": "2026-08-26", "tier": "t2"}\n-->\n'
+        '---\ntitle: x\nstatus: superseded\n---\nbody')
+    _mk(root, "resources/stamped-live.md",
+        '<!--strata\n{"stamped": "2026-08-26", "tier": "t2"}\n-->\n'
+        '---\ntitle: x\nstatus: current\n---\nbody')
+    assert is_retired("resources/stamped-sup.md", root)
+    assert not is_retired("resources/stamped-live.md", root)
+
+
 def test_untested_worklist_excludes_retired_but_ranking_keeps_it(
         tmp_path, capsys):
     """A superseded doc must never be nominated for test authoring.

@@ -71,6 +71,41 @@ _NONE_RE = re.compile(r"(?i)^(?:none|n/a|never)\b(?P<reason>.*)$", re.S)
 _LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+?)(?:\s+\"[^\"]*\")?\)")
 _INDEX_LINK_RE = re.compile(r"\]\(([^)\s]+\.md)\)")
 
+# The strata terminology-cutover (2026-08-26) started prepending a metadata
+# stamp -- an HTML comment holding one JSON object, `~/.local/bin/strata`'s
+# own `MARK_OPEN`/`MARK_CLOSE` convention (its `parse_frontmatter()`) -- to
+# byte 0 of any doc it touches. `_FM_RE` above is anchored at `\A` (true
+# start of file), so on a stamped doc it never reaches the doc's OWN YAML
+# frontmatter a few lines further down: `frontmatter()` silently returned
+# `{}` for every stamped doc, which fed straight into `_is_retired()` below.
+# FOUND 2026-09-07 (research-queue `check_cold_decayed` review, dream cycle
+# 73e1f4b7's 25x-consecutive-KEPT-OTHER watch line): measured 367 stamped
+# docs in the live tree, 13 with a hidden `status: superseded/archived` and
+# 3 with a hidden `review_at:` -- among them, TWO docs already dispositioned
+# ARCHIVED by a prior /dream cycle (`resources/poe2/crafting/market/
+# dusk-ring-market-survey.md`, `resources/poe2/0.4/crafting/videos/
+# qLgIKdMdt5Q-keyson-boot-crafting.md`) kept RE-surfacing in cold_decayed and
+# got re-archived a SECOND time -- exactly the "cost with no retrieval on the
+# other side" waste this exclusion filter exists to prevent, just blind to
+# its own trigger. `_is_staging()` is path-only and unaffected.
+_STAMP_OPEN = "<!--strata"
+_STAMP_CLOSE = "-->"
+
+
+def _strip_stamp(text: str) -> str:
+    """Drop a leading strata metadata stamp so frontmatter() below can reach
+    the doc's real YAML block. Mirrors strata's own parse_frontmatter():
+    string-search for the close marker, never a regex assuming well-formed
+    JSON (sweep must not crash on a stamp it can't parse -- it should just
+    fail to strip and leave `frontmatter()` looking at the unstripped text,
+    same as before this fix, never worse)."""
+    if not text.startswith(_STAMP_OPEN):
+        return text
+    end = text.find(_STAMP_CLOSE)
+    if end == -1:
+        return text
+    return text[end + len(_STAMP_CLOSE):].lstrip("\n")
+
 
 # ------------------------------------------------------------------ helpers --
 def iter_docs(root: Path):
@@ -85,6 +120,7 @@ def frontmatter(text: str) -> dict:
     """Minimal top-level YAML scalar parse. Deliberately NOT a YAML engine:
     sweep must never fail closed on a doc with exotic YAML, and every field it
     reads is a flat scalar."""
+    text = _strip_stamp(text)
     m = _FM_RE.match(text)
     if not m:
         return {}
@@ -610,6 +646,17 @@ def _fixture(tmp: Path):
     doc("resources/cold-superseded.md",
         "title: cs\nstatus: superseded\n"
         "superseded_by: resources/cold-decayed.md")
+    # cold + already-retired via status, but the doc is STAMPED (a strata
+    # metadata comment sits at byte 0, ahead of the YAML block) -> must
+    # STILL not be flagged. Regression lock for the 2026-09-07 fix: before
+    # it, `frontmatter()`'s `\A`-anchored regex never reached this doc's
+    # `status: superseded` line, so `_is_retired()` returned False and this
+    # row re-surfaced every sweep despite already being dispositioned.
+    (root / "resources" / "cold-superseded-stamped.md").write_text(
+        _STAMP_OPEN + '\n{"stamped": "2026-08-26", "tier": "t2"}\n'
+        + _STAMP_CLOSE + "\n"
+        "---\ntitle: css\nstatus: superseded\n"
+        "superseded_by: resources/cold-decayed.md\n---\n\nbody\n")
     doc("resources/never.md", "title: nv")                                  # never-retrieved
     doc("areas/links.md", body="see [ok](../resources/never.md) and "
                                "[dead](./gone.md) and [web](https://x.com/a.md) "
@@ -642,6 +689,10 @@ def _fixture(tmp: Path):
         lines.append(json.dumps({
             "kind": "recall", "ts": old,
             "evidence_paths": ["resources/cold-superseded.md"]}))
+    for _ in range(2):
+        lines.append(json.dumps({
+            "kind": "recall", "ts": old,
+            "evidence_paths": ["resources/cold-superseded-stamped.md"]}))
     for _ in range(3):
         lines.append(json.dumps({"kind": "recall", "ts": fresh,
                                  "evidence_paths": ["resources/hot-untested.md"]}))
@@ -744,6 +795,9 @@ def selftest() -> int:
               "resources/facts/_unverified/cold-staged.md" not in cd)
         check("cold_decayed does NOT flag a cold already-retired doc",
               "resources/cold-superseded.md" not in cd)
+        check("cold_decayed does NOT flag a cold already-retired doc "
+              "whose YAML sits BEHIND a strata metadata stamp",
+              "resources/cold-superseded-stamped.md" not in cd)
         check("cold_decayed PUBLISHES what the staging filter withheld",
               c["cold_decayed"].get("staging_excluded", 0) >= 1)
         check("cold_decayed PUBLISHES what the retired filter withheld",

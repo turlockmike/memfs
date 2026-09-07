@@ -114,12 +114,34 @@ def has_tests(relpath: str, root: Path) -> bool:
 # supersede didn't reach retrieval). Only the test-authoring worklist is filtered.
 _RETIRED_STATUS = {"superseded", "archived", "retired", "deprecated"}
 
+# Kept in lockstep with sweep.py's identical `_STAMP_OPEN`/`_STAMP_CLOSE`/
+# `_strip_stamp()` fix (2026-09-07, same finding, same root cause): the
+# strata terminology-cutover (2026-08-26) prepends a metadata stamp -- an
+# HTML comment holding one JSON object, `~/.local/bin/strata`'s own
+# `MARK_OPEN`/`MARK_CLOSE` convention -- to byte 0 of any doc it touches.
+# `is_retired()` below tested `text.startswith("---")` directly, so on a
+# stamped doc (text starts with `<!--strata`, not `---`) it always returned
+# False even when the doc's OWN YAML frontmatter a few lines down declared
+# `status: superseded`. Same defect as sweep.py's `frontmatter()`, same fix.
+_STAMP_OPEN = "<!--strata"
+_STAMP_CLOSE = "-->"
+
+
+def _strip_stamp(text: str) -> str:
+    if not text.startswith(_STAMP_OPEN):
+        return text
+    end = text.find(_STAMP_CLOSE)
+    if end == -1:
+        return text
+    return text[end + len(_STAMP_CLOSE):].lstrip("\n")
+
 
 def is_retired(relpath: str, root: Path) -> bool:
     try:
         text = (root / relpath).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
+    text = _strip_stamp(text)
     if not text.startswith("---"):
         return False
     end = text.find("\n---", 3)
