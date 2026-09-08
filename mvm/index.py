@@ -522,35 +522,55 @@ def _embed_only_main(args) -> int:
     vector is MISSING or STALE (built from an older doc-mtime; see the vec_state
     block above). Doesn't touch FTS or graph. Bounded per invocation so a cron
     tick always terminates cleanly and the heal converges across ticks."""
-    t_start = time.time()
-    budget_s = getattr(args, "budget_seconds", _EMBED_BUDGET_S)
-    max_docs = getattr(args, "max_docs", _EMBED_MAX_DOCS)
     state = args.state
 
-    # LOCK CHECK (added 2026-09-07, mvm-verify-guard lock-contention finding —
-    # 7 fires 2026-07-22..09-07, all self-healing on the next cron tick but each
-    # dumping a raw `sqlite3.OperationalError: database is locked` traceback
-    # into the log). Root cause: unlike the default full-rebuild path (below,
-    # in main()), --embed-only never checked `.index.lock` before connecting —
-    # it relied purely on sqlite's busy_timeout=30s, so a concurrent full
-    # `mvm index` holding a write transaction longer than 30s (a multi-minute
-    # reindex) makes the connect itself raise instead of waiting it out.
-    # Same non-blocking flock as main()'s single-writer lock, check-only (this
-    # path is read-heavy/idempotent, so it doesn't need to itself hold the
-    # lock for its duration — it only needs to avoid racing a run in progress).
+    # LOCK — HELD FOR DURATION (fixed 2026-09-08, superseding the 2026-09-07
+    # check-then-release version below). That version fixed 7 fires of the
+    # obvious case (embed-only racing a multi-minute FULL reindex) but reproduced
+    # AGAIN 2026-09-08 12:0x CDT against a DIFFERENT racer: `mvm-mirror`'s */5
+    # cron calls `mvm index --no-embed` (the main() path), which acquires
+    # `.index.lock` and HOLDS it for its duration. Check-then-release let this
+    # embed-only pass see the lock free at the instant of its check, release it,
+    # and only THEN start writing (`_ensure_vec_state`'s executescript, the
+    # files_vec INSERTs) — a window wide enough for mvm-mirror's `mvm index` to
+    # acquire the now-free lock and start its own writes in between, so both
+    # processes ended up mutating index.db concurrently and sqlite raised
+    # `database is locked` (busy_timeout=30s doesn't cover DDL-under-contention
+    # reliably; see comment history above). The 2026-09-07 fix's own reasoning
+    # ("read-heavy/idempotent, doesn't need to hold the lock for its duration")
+    # was the bug: this path DOES write (files_vec, vec_state), so it needs the
+    # same single-writer exclusion main() already gives itself. Holding for the
+    # duration makes embed-only and any `mvm index` invocation (embed-only or
+    # full) mutually exclusive, matching main()'s own single-writer contract —
+    # a concurrent run now gets a clean rc=3 immediately (mvm-mirror already
+    # handles rc=3 as a graceful deferral, lines ~737-766 of mvm-mirror) instead
+    # of a mid-write collision. lock_fp is closed (which releases the flock) in
+    # the `finally` at the bottom of this function, not here.
     import fcntl
     state.mkdir(parents=True, exist_ok=True)
     lock_path = state / ".index.lock"
     lock_fp = open(lock_path, "w")
     try:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
     except BlockingIOError:
         print(f"ERROR: another `mvm index` is already running (lock at {lock_path}). "
               f"Wait for it to finish, or remove the lock if stale.", file=sys.stderr)
+        lock_fp.close()
         return 3
+
+    try:
+        return _embed_only_body(args, state)
     finally:
         lock_fp.close()
+
+
+def _embed_only_body(args, state) -> int:
+    """The actual embed-heal work, run while `_embed_only_main` holds
+    `.index.lock` for the duration. Split out so the lock's `finally` in the
+    caller covers every return path without re-indenting this whole block."""
+    t_start = time.time()
+    budget_s = getattr(args, "budget_seconds", _EMBED_BUDGET_S)
+    max_docs = getattr(args, "max_docs", _EMBED_MAX_DOCS)
 
     idx = sqlite3.connect(state / "index.db", timeout=30.0)
     idx.enable_load_extension(True)
